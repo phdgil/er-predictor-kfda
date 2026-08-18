@@ -124,3 +124,13 @@ This amendment supersedes earlier UI/release scope where it conflicts. The FDA t
 4. **Workbook guidance:** make `Guide` the first worksheet and explain `Predictions`, `Input`, and `Metadata`; include totals and reason counts. Preserve exact machine-readable headers on data sheets. Add filters, frozen headers, widths, wrapped text, and yellow/red outcome highlighting.
 5. **Compatibility:** preserve ERTA behavior, ERalpha model/preprocessing/AD calculations, input precedence, row order, passthrough identifiers, atomic publication, read-only install boundaries, and immutable old ERTA package.
 6. **Validation:** run unit/integration tests, exercise the FDA-provided 504-row workbook, verify progress reaches 100% or a terminal failure, build twice, publish, install to a clean directory, run packaged ERTA/ERalpha QA, uninstall, and re-audit all 10,280 old ERTA files.
+
+## FDA usability amendment: batch controls and path consistency
+
+This amendment is applied before the corresponding code changes.
+
+1. ERTA and ERalpha batch pages use the same compact control hierarchy: `Input xlsx`, `Output directory`, `Download template`, and a normal-sized `Run batch` button.
+2. `Download template` appears immediately above `Run batch` with the notice that the `CAS` column is the required batch input; direct SMILES remains supported where the workbook contract permits it.
+3. Both pages display determinate progress and a terminal success/failure state.
+4. The output directory shown beside the selector, the directory captured when the run starts, and the directory reported in the result/status areas are one canonical path. Input/output selectors and template actions are disabled for the duration of a batch so the displayed path cannot diverge from the running snapshot.
+5. The result box reports the exact atomically published file path returned by the exporter. Tests cover changed-directory snapshots, control locking, template generation, and path equality.

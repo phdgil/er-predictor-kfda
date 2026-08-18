@@ -734,22 +734,33 @@ class ErbaTab(ttk.Frame):
         controls = ttk.LabelFrame(self.batch_tab, text="Input")
         controls.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
         controls.columnconfigure(1, weight=1)
-        ttk.Button(controls, text="Input xlsx", command=self._choose_batch_input).grid(
+        self.batch_input_button = ttk.Button(controls, text="Input xlsx", command=self._choose_batch_input)
+        self.batch_input_button.grid(
             row=0, column=0, padx=6, pady=5
         )
         ttk.Label(controls, textvariable=self.batch_input_var, anchor="w").grid(
             row=0, column=1, columnspan=3, sticky="ew", padx=6, pady=5
         )
-        ttk.Button(controls, text="Output directory", command=self._choose_output_dir).grid(
+        self.batch_output_button = ttk.Button(
+            controls, text="Output directory", command=self._choose_output_dir
+        )
+        self.batch_output_button.grid(
             row=1, column=0, padx=6, pady=5
         )
         ttk.Label(controls, textvariable=self.batch_output_var, anchor="w").grid(
-            row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=5
+            row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=5
         )
+        ttk.Label(controls, text="Enter CAS numbers in the required CAS column.").grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2)
+        )
+        self.batch_template_button = ttk.Button(
+            controls, text="Download template", command=self._download_batch_template
+        )
+        self.batch_template_button.grid(row=3, column=0, padx=6, pady=5, sticky="w")
         self.batch_button = ttk.Button(controls, text="Run batch", command=self.batch_predict_clicked)
-        self.batch_button.grid(row=1, column=3, padx=6, pady=5)
+        self.batch_button.grid(row=4, column=0, padx=6, pady=5, sticky="w")
         self.batch_route_reason = ttk.Label(controls, foreground="#b42318", wraplength=700)
-        self.batch_route_reason.grid(row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 5))
+        self.batch_route_reason.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 5))
         progress = ttk.Frame(self.batch_tab)
         progress.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
         progress.columnconfigure(0, weight=1)
@@ -808,6 +819,10 @@ class ErbaTab(ttk.Frame):
                 self.batch_route_reason.configure(text=reason)
                 state = "disabled" if self._active_batch_request_id is not None else ("normal" if ok else "disabled")
                 self.batch_button.configure(state=state)
+                if self._active_batch_request_id is None:
+                    self.batch_input_button.configure(state="normal")
+                    self.batch_output_button.configure(state="normal")
+                    self.batch_template_button.configure(state="normal")
 
     def _configure_single_result_task(self, task):
         probability_frame = getattr(self, "single_probability_frame", None)
@@ -1135,6 +1150,23 @@ class ErbaTab(ttk.Frame):
         if path:
             self.batch_input_var.set(path)
 
+    def _download_batch_template(self):
+        path = filedialog.asksaveasfilename(
+            title="Save ERalpha batch template",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile="ERalpha_batch_template.xlsx",
+        )
+        if not path:
+            return
+        destination = Path(path)
+        try:
+            pd.DataFrame(columns=["CAS"]).to_excel(destination, index=False)
+        except Exception as error:
+            messagebox.showerror("Template download failed", str(error))
+            return
+        self.batch_input_var.set(str(destination))
+
     def _choose_output_dir(self):
         path = filedialog.askdirectory(title="Select ERBA output directory")
         if not path:
@@ -1145,6 +1177,16 @@ class ErbaTab(ttk.Frame):
             messagebox.showerror("Invalid output directory", str(error))
             return
         self.batch_output_var.set(str(validated))
+
+    def _set_batch_controls_running(self, running: bool):
+        state = "disabled" if running else "normal"
+        for widget in (
+            self.batch_input_button,
+            self.batch_output_button,
+            self.batch_template_button,
+            self.batch_button,
+        ):
+            widget.configure(state=state)
 
     @staticmethod
     def _column_lookup(frame, aliases):
@@ -1172,7 +1214,8 @@ class ErbaTab(ttk.Frame):
             self.batch_status_var.set(str(error))
             self._started_at.pop(request_id, None)
             return
-        self.batch_button.configure(state="disabled")
+        self.batch_output_var.set(output_dir)
+        self._set_batch_controls_running(True)
         self._active_batch_request_id = request_id
         self._set_batch_progress(request_id, "Ready to read input", 0, 0, 0)
         self.batch_status_var.set("Running ERBA batch...")
@@ -1220,6 +1263,8 @@ class ErbaTab(ttk.Frame):
     def _batch_complete(self, request_id, task, subtype, model_id, destination, count, error):
         duration_ms = self._finish_duration_ms(request_id)
         if request_id != self._active_batch_request_id:
+            if self._active_batch_request_id is None:
+                self._route_changed("batch")
             self._emit("batch.inference_stale", workflow="erba", task=task.value, subtype=subtype.value,
                        model_id=model_id, correlation_id=request_id, duration_ms=duration_ms)
             return
@@ -1231,6 +1276,7 @@ class ErbaTab(ttk.Frame):
             100 if not error else 0,
         )
         self._active_batch_request_id = None
+        self._set_batch_controls_running(False)
         if not self._snapshot_is_current("batch", request_id, task, subtype, model_id):
             self._route_changed("batch")
             self._emit("batch.inference_stale", workflow="erba", task=task.value, subtype=subtype.value,
@@ -1243,6 +1289,8 @@ class ErbaTab(ttk.Frame):
                        model_id=model_id, correlation_id=request_id, duration_ms=duration_ms,
                        row_count=0, status="failed", exception_type="BatchError")
             return
+        canonical_output_dir = str(destination.parent)
+        self.batch_output_var.set(canonical_output_dir)
         self.batch_status_var.set(f"ERBA batch complete: {destination}")
         self._emit("batch.inference_complete", workflow="erba", task=task.value, subtype=subtype.value,
                    model_id=model_id, correlation_id=request_id, duration_ms=duration_ms,

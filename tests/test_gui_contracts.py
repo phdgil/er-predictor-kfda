@@ -525,5 +525,250 @@ class ErbaExcelContractTests(unittest.TestCase):
             )
             self.assertEqual(existing.read_bytes(), b"prior")
             self.assertEqual(destination.name, "ERBA_classification_er_alpha_results_2.xlsx")
+
+
+class EralphaBatchUsabilityContractTests(unittest.TestCase):
+    class _Variable:
+        def __init__(self, value=""):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    class _Widget:
+        def __init__(self):
+            self.state = None
+
+        def configure(self, **kwargs):
+            self.state = kwargs.get("state", self.state)
+
+    class _Text(_Widget):
+        def __init__(self):
+            super().__init__()
+            self.value = ""
+
+        def delete(self, _start, _end):
+            self.value = ""
+
+        def insert(self, _start, value):
+            self.value = value
+
+    def _tab_with_batch_controls(self):
+        tab = ErbaTab.__new__(ErbaTab)
+        tab.batch_input_button = self._Widget()
+        tab.batch_output_button = self._Widget()
+        tab.batch_template_button = self._Widget()
+        tab.batch_button = self._Widget()
+        return tab
+
+    def test_downloaded_template_has_only_the_required_cas_header_and_becomes_input(self):
+        tab = self._tab_with_batch_controls()
+        tab.batch_input_var = self._Variable()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory, "ERalpha_batch_template.xlsx")
+            with patch("gui.erba_tab.filedialog.asksaveasfilename", return_value=str(destination)):
+                tab._download_batch_template()
+            template = pd.read_excel(destination, dtype=str, keep_default_na=False)
+        self.assertEqual(template.columns.tolist(), ["CAS"])
+        self.assertTrue(template.empty)
+        self.assertEqual(tab.batch_input_var.value, str(destination))
+
+    def test_completion_uses_exported_parent_for_displayed_directory_and_exact_destination_everywhere(self):
+        tab = self._tab_with_batch_controls()
+        tab._active_batch_request_id = 1
+        tab.batch_output_var = self._Variable("C:/selected")
+        tab.batch_status_var = self._Variable()
+        tab.batch_result = self._Text()
+        tab._finish_duration_ms = lambda _request_id: 0
+        tab._set_batch_progress = lambda *args: None
+        tab._snapshot_is_current = lambda *args: True
+        tab._route_changed = lambda _workflow: None
+        tab._emit = lambda *args, **kwargs: None
+        destination = Path("C:/published/output/ERBA_classification_er_alpha_results.xlsx")
+
+        tab._batch_complete(
+            1, ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA, "model-v1", destination, 3, ""
+        )
+
+        self.assertEqual(tab.batch_output_var.value, str(destination.parent))
+        self.assertEqual(tab.batch_status_var.value, f"ERBA batch complete: {destination}")
+        self.assertIn(str(destination), tab.batch_result.value)
+        self.assertTrue(all(
+            widget.state == "normal"
+            for widget in (
+                tab.batch_input_button, tab.batch_output_button,
+                tab.batch_template_button, tab.batch_button,
+            )
+        ))
+
+    def test_failure_and_stale_completion_restore_or_preserve_control_lock_correctly(self):
+        tab = self._tab_with_batch_controls()
+        tab._active_batch_request_id = 1
+        tab.batch_output_var = self._Variable()
+        tab.batch_status_var = self._Variable()
+        tab._finish_duration_ms = lambda _request_id: 0
+        tab._set_batch_progress = lambda *args: None
+        tab._snapshot_is_current = lambda *args: True
+        tab._route_changed = lambda _workflow: None
+        tab._emit = lambda *args, **kwargs: None
+
+        tab._batch_complete(1, ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA, "model-v1", None, 0, "write failed")
+
+        self.assertIn("write failed", tab.batch_status_var.value)
+        self.assertTrue(all(
+            widget.state == "normal"
+            for widget in (
+                tab.batch_input_button, tab.batch_output_button,
+                tab.batch_template_button, tab.batch_button,
+            )
+        ))
+
+        tab._set_batch_controls_running(True)
+        tab._active_batch_request_id = None
+        tab._route_changed = lambda _workflow: tab._set_batch_controls_running(False)
+        tab._batch_complete(2, ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA, "model-v1", None, 0, "stale")
+        self.assertTrue(all(
+            widget.state == "normal"
+            for widget in (
+                tab.batch_input_button, tab.batch_output_button,
+                tab.batch_template_button, tab.batch_button,
+            )
+        ))
+
+class _ErtaBatchVariable:
+    def __init__(self, value=None):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class _ErtaBatchControl:
+    def __init__(self):
+        self.state = "normal"
+
+    def configure(self, **kwargs):
+        self.state = kwargs.get("state", self.state)
+
+
+class _ErtaBatchPredictor:
+    model_name = "legacy"
+
+    def is_loaded(self):
+        return True
+
+    def predict_dataframe(self, frame, smiles_col):
+        result = frame.copy()
+        result["Prediction_label"] = "Positive"
+        return result, pd.DataFrame([[0.0] for _ in range(len(frame))])
+
+
+class ErtaBatchUsabilityContractTests(unittest.TestCase):
+    def _window(self):
+        window = MainWindow.__new__(MainWindow)
+        window.batch_input_button = _ErtaBatchControl()
+        window.output_dir_button = _ErtaBatchControl()
+        window.download_template_button = _ErtaBatchControl()
+        window.run_batch_button = _ErtaBatchControl()
+        window.batch_progress_var = _ErtaBatchVariable()
+        window.batch_progress_value = _ErtaBatchVariable()
+        window._batch_active = False
+        window._active_batch_input_path = None
+        window._active_batch_output_dir = None
+        window._active_batch_total = 1
+        window.statuses = []
+        window.set_status = window.statuses.append
+        window.after = lambda _delay, callback: callback()
+        window.ui = lambda callback, *args: callback(*args)
+        window.run_threaded = lambda job: job()
+        return window
+
+    def test_compact_erta_batch_controls_and_cas_notice_are_present(self):
+        source = Path("gui/main_window.py").read_text(encoding="utf-8")
+        self.assertIn('text="Input xlsx"', source)
+        self.assertIn('text="Output directory"', source)
+        self.assertIn('text="Download template"', source)
+        self.assertIn('text="Run batch"', source)
+        self.assertIn("required CAS column", source)
+        self.assertNotIn('text="Run batch prediction"', source)
+        self.assertNotIn('bg="#0969da"', source)
+
+    def test_template_contains_only_the_required_cas_header(self):
+        window = self._window()
+        window.project_root = str(Path.cwd() / "project-root")
+        window.batch_input_var = _ErtaBatchVariable()
+        window.batch_input_display_var = _ErtaBatchVariable()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "Template.xlsx")
+            with patch("gui.main_window.filedialog.asksaveasfilename", return_value=str(path)), \
+                 patch("gui.main_window.messagebox.showinfo"):
+                window.download_template_clicked()
+            self.assertEqual(pd.read_excel(path).columns.tolist(), ["CAS"])
+
+    def test_batch_controls_lock_and_restore_with_terminal_progress(self):
+        window = self._window()
+        window._set_batch_controls_active(True)
+        self.assertTrue(window._batch_active)
+        self.assertEqual(
+            [control.state for control in (
+                window.batch_input_button, window.output_dir_button,
+                window.download_template_button, window.run_batch_button,
+            )],
+            ["disabled"] * 4,
+        )
+        window._finish_batch(False, "Batch prediction failed")
+        self.assertFalse(window._batch_active)
+        self.assertEqual(window.batch_progress_var.value, "100% - 0/1 - Failed")
+        self.assertEqual(
+            [control.state for control in (
+                window.batch_input_button, window.output_dir_button,
+                window.download_template_button, window.run_batch_button,
+            )],
+            ["normal"] * 4,
+        )
+
+    def test_progress_updates_are_scheduled_through_after(self):
+        window = self._window()
+        scheduled = []
+        window.after = lambda delay, callback: scheduled.append((delay, callback))
+        window._batch_progress_from_worker("Writing workbook", 3, 4, 85)
+        self.assertEqual(window.batch_progress_var.value, None)
+        self.assertEqual(len(scheduled), 1)
+        scheduled[0][1]()
+        self.assertEqual(window.batch_progress_var.value, "85% - 3/4 - Writing workbook")
+
+    def test_batch_reports_the_published_file_in_the_captured_output_directory(self):
+        window = self._window()
+        window.predictor = _ErtaBatchPredictor()
+        window.ad_calculator = type("AD", (), {"fitted": False})()
+        window.model_path_var = _ErtaBatchVariable("")
+        window.ad_ref_path_var = _ErtaBatchVariable("")
+        window.output_dir_var = _ErtaBatchVariable()
+        window.output_dir_display_var = _ErtaBatchVariable()
+        window.update_preview_table = lambda _result: None
+        reported = []
+        window.update_batch_result_summary = lambda _result, path: reported.append(path)
+        window.update_batch_ad_summary = lambda _result: None
+        window.generate_batch_graphs = lambda *_args, **_kwargs: []
+        window.show_error = lambda _title, error: self.fail(str(error))
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.xlsx")
+            pd.DataFrame({"CAS": ["50-00-0"], "SMILES": ["CCO"]}).to_excel(source, index=False)
+            window.batch_input_var = _ErtaBatchVariable(str(source))
+            window.validated_output_dir = lambda: directory
+            window.prepare_batch_input = lambda frame: frame
+            with patch("gui.main_window.messagebox.showinfo"):
+                window.batch_predict_clicked()
+            self.assertEqual(Path(reported[0]).parent, Path(directory))
+            self.assertTrue(Path(reported[0]).exists())
+            self.assertEqual(window.output_dir_display_var.value, directory)
+
+
 if __name__ == "__main__":
     unittest.main()

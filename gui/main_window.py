@@ -76,6 +76,12 @@ class MainWindow(tk.Tk):
         default_batch_name = os.path.basename(self.batch_input_var.get()) if os.path.exists(self.batch_input_var.get()) else "No input template selected"
         self.batch_input_display_var = tk.StringVar(value=default_batch_name)
         self.output_dir_display_var = tk.StringVar(value=self.output_dir_var.get())
+        self.batch_progress_var = tk.StringVar(value="0% - 0/0 - Ready")
+        self.batch_progress_value = tk.IntVar(value=0)
+        self._batch_active = False
+        self._active_batch_input_path = None
+        self._active_batch_output_dir = None
+        self._active_batch_total = 0
 
         self._build_ui()
         self.bind_all("<Alt-e>", lambda _event: self.notebook.select(self.erta_tab))
@@ -263,29 +269,27 @@ class MainWindow(tk.Tk):
         frame = ttk.LabelFrame(self.batch_tab, text="Batch")
         frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
         frame.columnconfigure(1, weight=1)
-        frame.columnconfigure(3, weight=1)
 
-        ttk.Button(frame, text="Download template", command=self.download_template_clicked).grid(row=0, column=0, padx=6, pady=5)
+        self.batch_input_button = ttk.Button(frame, text="Input xlsx", command=self.browse_batch_input)
+        self.batch_input_button.grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(frame, textvariable=self.batch_input_display_var, anchor="w").grid(row=0, column=1, sticky="ew", padx=6, pady=4)
 
-        ttk.Button(frame, text="Input template", command=self.browse_batch_input).grid(row=0, column=1, sticky="e", padx=6, pady=5)
-        ttk.Label(frame, textvariable=self.batch_input_display_var, anchor="w").grid(row=0, column=2, sticky="ew", padx=6, pady=5)
+        self.output_dir_button = ttk.Button(frame, text="Output directory", command=self.browse_output_dir)
+        self.output_dir_button.grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(frame, textvariable=self.output_dir_display_var, anchor="w").grid(row=1, column=1, sticky="ew", padx=6, pady=4)
 
-        ttk.Button(frame, text="Output directory", command=self.browse_output_dir).grid(row=1, column=1, sticky="e", padx=6, pady=5)
-        ttk.Label(frame, textvariable=self.output_dir_display_var, anchor="w").grid(row=1, column=2, sticky="ew", padx=6, pady=5)
-        self.run_batch_button = tk.Button(
-            frame,
-            text="Run batch prediction",
-            command=self.batch_predict_clicked,
-            font=("Segoe UI", 10, "bold"),
-            bg="#0969da",
-            fg="white",
-            activebackground="#0757b5",
-            activeforeground="white",
-            relief="raised",
-            bd=1,
-            cursor="hand2",
+        ttk.Label(frame, text="Enter CAS numbers in the required CAS column.").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(3, 1)
         )
-        self.run_batch_button.grid(row=1, column=3, sticky="ew", padx=8, pady=6, ipadx=18, ipady=5)
+        self.download_template_button = ttk.Button(frame, text="Download template", command=self.download_template_clicked)
+        self.download_template_button.grid(row=3, column=0, sticky="w", padx=6, pady=(1, 4))
+        self.run_batch_button = ttk.Button(frame, text="Run batch", command=self.batch_predict_clicked)
+        self.run_batch_button.grid(row=4, column=0, sticky="w", padx=6, pady=(0, 5))
+        self.batch_progress = ttk.Progressbar(frame, maximum=100, variable=self.batch_progress_value, mode="determinate")
+        self.batch_progress.grid(row=4, column=1, sticky="ew", padx=6, pady=(0, 5))
+        ttk.Label(frame, textvariable=self.batch_progress_var, anchor="w").grid(
+            row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 5)
+        )
 
         table_frame = ttk.LabelFrame(self.batch_tab, text="Prediction result")
         table_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
@@ -297,7 +301,7 @@ class MainWindow(tk.Tk):
         self.batch_summary_text.tag_configure("detail_key", font=("Consolas", 9, "bold"))
         self.batch_summary_text.tag_configure("detail_value", font=("Consolas", 9))
         self.batch_summary_text.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 4))
-        self.batch_summary_text.insert(tk.END, "Run batch prediction to show summary.")
+        self.batch_summary_text.insert(tk.END, "Run a batch to show summary.")
         self.batch_summary_text.configure(state="disabled")
         self.batch_tree = ttk.Treeview(table_frame, show="headings")
         yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.batch_tree.yview)
@@ -1033,24 +1037,72 @@ class MainWindow(tk.Tk):
             self.batch_input_var.set(path)
             self.batch_input_display_var.set(os.path.basename(path))
             self.set_status(f"Template downloaded: {path}")
-            self.ui(messagebox.showinfo, "Template downloaded", f"Saved:\n{path}\n\nEnter CAS values, save the file, then run batch prediction.")
+            self.ui(messagebox.showinfo, "Template downloaded", f"Saved:\n{path}\n\nEnter CAS values, save the file, then run batch.")
         except Exception as e:
             self.show_error("Template download failed", e)
 
+    def _set_batch_controls_active(self, active: bool):
+        self._batch_active = active
+        state = "disabled" if active else "normal"
+        for control in (
+            self.batch_input_button,
+            self.output_dir_button,
+            self.download_template_button,
+            self.run_batch_button,
+        ):
+            control.configure(state=state)
+
+    def _set_batch_progress(self, stage: str, current: int, total: int, percent: int):
+        self.batch_progress_value.set(max(0, min(100, int(percent))))
+        self.batch_progress_var.set(f"{percent}% - {current}/{total} - {stage}")
+
+    def _batch_progress_from_worker(self, stage: str, current: int, total: int, percent: int):
+        self.after(0, lambda: self._set_batch_progress(stage, current, total, percent))
+
+    def _finish_batch(self, success: bool, message: str):
+        self._set_batch_controls_active(False)
+        total = max(0, int(self._active_batch_total))
+        if success:
+            self._set_batch_progress("Complete", total, total, 100)
+        else:
+            self._set_batch_progress("Failed", 0, total, 100)
+        self._active_batch_input_path = None
+        self._active_batch_output_dir = None
+        self._active_batch_total = 0
+        self.set_status(message)
+
     def batch_predict_clicked(self):
+        if self._batch_active:
+            return
+        input_path = self.batch_input_var.get()
+        try:
+            out_dir = self.validated_output_dir()
+        except Exception as error:
+            self.show_error("Batch prediction failed", error)
+            return
+        self.output_dir_var.set(out_dir)
+        self.output_dir_display_var.set(out_dir)
+        self._active_batch_input_path = input_path
+        self._active_batch_output_dir = out_dir
+        self._active_batch_total = 0
+        self._set_batch_controls_active(True)
+        self._set_batch_progress("Starting", 0, 1, 0)
+
         def job():
             try:
                 if not self.predictor.is_loaded():
                     self.predictor.load_model(self.model_path_var.get())
-                input_path = self.batch_input_var.get()
                 if not os.path.exists(input_path):
                     raise FileNotFoundError(input_path)
-                out_dir = self.validated_output_dir()
+                self._batch_progress_from_worker("Reading input", 0, 1, 10)
                 self.set_status("Reading batch input...")
                 df = pd.read_excel(input_path)
+                self._active_batch_total = len(df)
 
+                self._batch_progress_from_worker("Resolving CAS/SMILES", 0, len(df), 30)
                 df = self.prepare_batch_input(df)
 
+                self._batch_progress_from_worker("Preprocessing and prediction", 0, len(df), 55)
                 self.set_status("Running batch prediction...")
                 result_df, fp_df = self.predictor.predict_dataframe(df, smiles_col="SMILES")
                 if not self.ad_calculator.fitted and self.ad_ref_path_var.get() and os.path.exists(self.ad_ref_path_var.get()):
@@ -1075,21 +1127,24 @@ class MainWindow(tk.Tk):
                 model_name = self.predictor.model_name or "model"
                 base = os.path.splitext(os.path.basename(input_path))[0]
                 out_path = os.path.join(out_dir, f"{base}_{model_name}_prediction.xlsx")
+                self._batch_progress_from_worker("Writing workbook", len(result_df), len(result_df), 85)
                 result_df.to_excel(out_path, index=False)
                 self.last_batch_result = result_df
                 self.last_batch_fp = fp_df
                 self.ui(self.update_preview_table, result_df)
                 self.ui(self.update_batch_result_summary, result_df, out_path)
                 self.ui(self.update_batch_ad_summary, result_df)
-                graph_paths = self.generate_batch_graphs(show_errors=True)
+                graph_paths = self.generate_batch_graphs(show_errors=True, output_dir=out_dir)
                 if graph_paths:
-                    self.set_status(f"Batch prediction saved: {out_path} / Graphs: {len(graph_paths)}")
+                    status = f"Batch prediction saved: {out_path} / Graphs: {len(graph_paths)}"
                     message = f"Saved:\n{out_path}\n\nGraphs generated:\n{os.path.join(out_dir, 'graphs')}"
                 else:
-                    self.set_status(f"Batch prediction saved: {out_path} / No graphs generated")
+                    status = f"Batch prediction saved: {out_path} / No graphs generated"
                     message = f"Saved:\n{out_path}\n\nGraphs were not generated. Check the status/error message."
+                self.ui(self._finish_batch, True, status)
                 self.ui(messagebox.showinfo, "Batch prediction done", message)
             except Exception as e:
+                self.ui(self._finish_batch, False, "Batch prediction failed")
                 self.show_error("Batch prediction failed", e)
         self.run_threaded(job)
 
@@ -1181,11 +1236,12 @@ class MainWindow(tk.Tk):
         self.preview_df = sorted_df
         self.render_preview_table(sorted_df)
 
-    def generate_batch_graphs(self, show_errors: bool = True):
+    def generate_batch_graphs(self, show_errors: bool = True, output_dir: str | None = None):
         try:
             if self.last_batch_result is None:
                 raise ValueError("Run batch prediction first.")
-            out_dir = os.path.join(self.validated_output_dir(), "graphs")
+            destination = output_dir or self.validated_output_dir()
+            out_dir = os.path.join(destination, "graphs")
             self.set_status("Generating graphs...")
             paths = save_all_batch_graphs(self.last_batch_result, out_dir, self.ad_calculator, self.last_batch_fp)
             self.ui(self.refresh_graph_list, paths)
