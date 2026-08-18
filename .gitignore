@@ -1,0 +1,28 @@
+# Generated builds and installers
+build/
+dist/
+installer/
+
+# Generated release evidence and offline wheelhouse
+artifacts/
+
+# Local workflow/session state
+.gjc/
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime outputs and local state
+output/
+ER_Predictor_UserData/
+*.log
+
+# Editor/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

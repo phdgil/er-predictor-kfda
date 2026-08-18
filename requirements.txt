@@ -1,0 +1,22 @@
+# Python 3.10 x64 build/runtime dependencies. See requirements-lock.txt for the audited pins.
+# CatBoost is intentionally omitted pending winner selection. Add the identical exact pin
+# here and in requirements-lock.txt only for a selected catalogued artifact, then add
+# its PyInstaller data/native collection and hidden import before clean package validation.
+pip==26.2.1
+setuptools==84.0.0
+numpy==1.26.4
+pandas==2.2.3
+openpyxl==3.1.5
+scipy==1.14.1
+scikit-learn==1.5.2
+joblib==1.4.2
+xgboost==2.1.2
+matplotlib==3.9.2
+requests==2.32.3
+pillow==10.4.0
+tensorflow==2.15.1
+h5py==3.11.0
+rdkit==2024.3.5
+pyinstaller==6.10.0
+pytest==8.3.4
+pywinauto==0.6.9

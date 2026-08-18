@@ -1,0 +1,150 @@
+"""Create or verify the Windows CPython 3.10 x64 build wheelhouse and hash lock."""
+from __future__ import annotations
+
+import argparse
+import email
+import hashlib
+import json
+import pathlib
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
+
+ROOT = pathlib.Path(__file__).resolve().parent
+ARTIFACTS = ROOT / "artifacts"
+WHEELHOUSE = ARTIFACTS / "ER_Predictor-wheelhouse"
+LOCK = ROOT / "requirements-lock.txt"
+INVENTORY = ARTIFACTS / "ER_Predictor-wheelhouse-inventory.json"
+INPUT = ROOT / "requirements.txt"
+
+
+def normalized(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def wheels() -> dict[str, tuple[str, pathlib.Path, str]]:
+    found: dict[str, tuple[str, pathlib.Path, str]] = {}
+    for wheel in sorted(WHEELHOUSE.glob("*.whl")):
+        with zipfile.ZipFile(wheel) as archive:
+            metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+            metadata = email.message_from_bytes(archive.read(metadata_name))
+        name, version = metadata["Name"], metadata["Version"]
+        key = normalized(name)
+        if key in found:
+            raise RuntimeError(f"multiple wheels for {name}: {found[key][1].name}, {wheel.name}")
+        found[key] = (name, wheel, version)
+    if not found:
+        raise RuntimeError(f"wheelhouse is empty: {WHEELHOUSE}")
+    return found
+
+
+def lock_entries() -> dict[str, tuple[str, str]]:
+    entries: dict[str, tuple[str, str]] = {}
+    for raw in LOCK.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        requirement, *hashes = line.split()
+        if not requirement.count("==") == 1 or len(hashes) != 1 or not hashes[0].startswith("--hash=sha256:"):
+            raise RuntimeError(f"lock entry is not one pinned requirement with one SHA-256 hash: {raw}")
+        name, version = requirement.split("==")
+        key = normalized(name)
+        if key in entries:
+            raise RuntimeError(f"duplicate locked distribution: {name}")
+        entries[key] = (version, hashes[0].removeprefix("--hash=sha256:").lower())
+    if not entries:
+        raise RuntimeError("requirements-lock.txt is not generated; run prepare_build_wheelhouse.py prepare first")
+    return entries
+
+
+def toolchain_receipt() -> dict[str, object]:
+    executable = pathlib.Path(sys.executable).resolve()
+    return {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "machine": platform.machine(),
+        "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "requirements_input_sha256": hashlib.sha256(INPUT.read_bytes()).hexdigest(),
+    }
+
+
+def inventory_receipt(available: dict[str, tuple[str, pathlib.Path, str]]) -> dict:
+    return {
+        "schema_version": 1,
+        "toolchain": toolchain_receipt(),
+        "wheels": [
+            {
+                "filename": wheel.name,
+                "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                "size_bytes": wheel.stat().st_size,
+            }
+            for _, wheel, _ in sorted(
+                available.values(), key=lambda item: item[1].name.lower()
+            )
+        ],
+    }
+
+
+def verify() -> None:
+    available = wheels()
+    locked = lock_entries()
+    if set(available) != set(locked):
+        raise RuntimeError("lock and wheelhouse distribution sets differ")
+    for key, (name, wheel, version) in available.items():
+        locked_version, locked_hash = locked[key]
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        if version != locked_version or digest != locked_hash:
+            raise RuntimeError(f"wheel does not match lock: {wheel.name}")
+    expected_inventory = inventory_receipt(available)
+    if (
+        not INVENTORY.is_file()
+        or json.loads(INVENTORY.read_text(encoding="utf-8")) != expected_inventory
+    ):
+        raise RuntimeError(
+            "wheelhouse/toolchain inventory receipt is missing or does not match"
+        )
+    subprocess.check_call([
+        sys.executable, "-I", "-m", "pip", "install", "--dry-run", "--no-index",
+        "--find-links", str(WHEELHOUSE), "--only-binary=:all:", "--require-hashes",
+        "--no-cache-dir", "-r", str(LOCK),
+    ])
+
+
+def prepare() -> None:
+    if sys.version_info[:2] != (3, 10) or sys.maxsize <= 2**32:
+        raise RuntimeError("prepare requires CPython 3.10 x64, matching the release build")
+    if WHEELHOUSE.exists():
+        shutil.rmtree(WHEELHOUSE)
+    WHEELHOUSE.mkdir(parents=True)
+    subprocess.check_call([
+        sys.executable, "-I", "-m", "pip", "download", "--only-binary=:all:",
+        "--no-cache-dir", "--dest", str(WHEELHOUSE), "-r", str(INPUT),
+    ])
+    available = wheels()
+    lines = [
+        "# Generated by prepare_build_wheelhouse.py prepare for Windows CPython 3.10 x64.",
+        "# Do not edit manually. Build verification requires this complete wheelhouse lock.",
+    ]
+    for key in sorted(available):
+        name, wheel, version = available[key]
+        lines.append(f"{name}=={version} --hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}")
+    LOCK.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    inventory = inventory_receipt(available)
+    INVENTORY.write_text(
+        json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    verify()
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("mode", choices=("prepare", "verify"))
+args = parser.parse_args()
+try:
+    {"prepare": prepare, "verify": verify}[args.mode]()
+except Exception as error:
+    print(f"wheelhouse/lock {args.mode} failed: {error}", file=sys.stderr)
+    raise SystemExit(1) from error
+print(f"wheelhouse/lock {args.mode} passed: {WHEELHOUSE}")

@@ -1,0 +1,85 @@
+# ER_Predictor 배포 안내
+
+## 제품과 배포 경로
+
+이 제품은 기존 `ERTA_Predictor`와 분리된 one-folder Windows 제품입니다. 빌드 결과와 배포 실행 파일의 정확한 경로는 다음과 같습니다.
+
+```text
+dist\ER_Predictor\ER_Predictor.exe
+D:\research\FDA_endocrine_disruption\ER_Predictor\ER_Predictor\ER_Predictor.exe
+```
+
+기존 `D:\research\FDA_endocrine_disruption\ERTA_Predictor`는 변경 불가한 롤백 패키지입니다. 이 제품의 빌드/게시 스크립트는 해당 경로를 대상 또는 작업 루트로 받지 않습니다.
+
+## K-FDA 사용자 PC 설치
+
+K-FDA 사용자 PC에는 Python, pip, RDKit, TensorFlow 또는 기타 Python 패키지를 별도로 설치하지 않습니다. `ER_Predictor_Setup_x64.exe`가 검증된 Python 3.10 런타임과 모든 라이브러리, 모델, AD 참조 데이터를 함께 설치합니다. 시스템 Python이나 인터넷 연결에 의존하지 않는 방식이 재현성과 운영 안정성에 더 적합합니다.
+
+```text
+installer\ER_Predictor_Setup_x64.exe
+```
+
+1. 64-bit Windows 10/11 PC에서 설치 파일을 관리자 권한으로 실행합니다.
+2. 기본 설치 경로는 `C:\Program Files\ER Predictor`입니다.
+3. 시작 메뉴의 **ER Predictor**를 실행합니다.
+4. 직접 SMILES 예측은 완전히 오프라인입니다. CAS→SMILES 조회에만 인터넷이 필요합니다.
+5. 상태/캐시는 `%LOCALAPPDATA%\ER_Predictor\v1`, 결과는 `%USERPROFILE%\Documents\ER_Predictor\Exports`에 저장됩니다.
+
+기관 배포 전 `installer\ER_Predictor_Setup_x64.sha256.json`의 SHA-256을 전달 파일과 대조하고, 기관 코드서명 인증서가 있으면 설치 파일에 Authenticode 서명을 추가하십시오. 서명되지 않은 내부 빌드는 Windows SmartScreen 경고가 발생할 수 있습니다.
+
+## 탭과 지원 모델
+
+- 시작 탭은 **ERTA**이며 기존 ERTA 분류, AD, 그래프 흐름을 유지합니다.
+- **ERalpha** 탭은 FDA 요청 범위인 ERα 결합 분류만 제공합니다. ERβ와 회귀 모델은 FDA 배포 화면과 설치 파일에서 제외됩니다.
+- ERalpha 분류는 승인된 0.5 기준과 직접 결합 확률/라벨을 사용합니다.
+- ERalpha AD는 ERTA와 같은 계산 코드를 사용하지만 ERα 전용 학습 참조와 캐시만 사용합니다.
+- Batch 결과 파일의 `Guide` 시트는 각 탭, 빈 예측값, 제외 사유와 권장 조치를 설명합니다. `Predictions`의 확률/라벨이 빈 행은 `Result_Status`, `Reason_Category`, `Reason_Description`, `Recommended_Action`을 확인하십시오.
+
+**ERBA 분류 근거는 과거에 노출된 개발 행을 사용한 내부 평가입니다. 신선한 독립/외부/시간적/모집단 검증 또는 규제 검증이 아니며, 규제 용도로 사용할 수 없습니다.**
+
+## 입력과 저장 위치
+
+- 모든 지원 경로에서 직접 SMILES 입력은 오프라인으로 동작합니다.
+- CAS 조회만 인터넷이 필요합니다. 조회 실패가 이미 유효한 SMILES를 덮어쓰지 않습니다.
+- 기존 ERTA 입력은 변경하지 말고 `templates\ERTA_KRICT_example.xlsx`를 사용합니다.
+- 결합 예시는 `templates\ERTA_ERBA_example.xlsx`입니다. 첫 시트 **ERBA_Input**은 ERBA 입력용이며 정확히 `Row_ID`, `CAS`, `SMILES` 열을 사용합니다. 두 번째 **ERTA_Input**은 `CID`, `CAS`, `SMILES`, `label` 열을 보여 줍니다. 레거시 ERTA batch에 넣을 때는 이 시트를 별도 workbook으로 내보내십시오.
+
+설치 폴더와 묶인 자원은 읽기 전용입니다. 기본 상태 저장소는 `%LOCALAPPDATA%\ER_Predictor\v1`, export 저장소는 `%USERPROFILE%\Documents\ER_Predictor\Exports`입니다. 명시적으로 쓰기 가능한 portable 설치에서만 실행 전 `ER_PREDICTOR_PORTABLE=1`을 설정하면 실행 파일 옆 `ER_Predictor_UserData\state`와 `Exports`를 사용합니다. 어떤 경우에도 `ERTA_Predictor` 아래를 출력 위치로 사용하지 마십시오.
+
+## 빌드 PC 준비
+
+Windows x64와 Python 3.10이 필요합니다. 의존성 취득과 release build는 분리된 두 단계입니다. 먼저 승인된 Python 3.10 x64에서 전체 Windows wheelhouse, 정확한 전이 의존성 pin, wheel SHA-256 lock, inventory 증적을 생성하고 오프라인 해석을 검증합니다.
+
+```bat
+py -3.10 -I prepare_build_wheelhouse.py prepare
+```
+
+`py -3.10`을 찾지 못할 때만 `ER_PREDICTOR_PYTHON`에 승인된 Python 3.10 x64 실행 파일을 지정합니다. `requirements-lock.txt`와 wheelhouse inventory는 생성 증적이며 수동 pin 목록이 아닙니다. 빌드는 비어 있거나 오래된 lock, 누락된 wheel, hash 불일치, 온라인 fallback, 잘못된 Python 버전/아키텍처를 모두 거부합니다. 선정된 released 모델이 CatBoost를 필요로 하면 모델링 환경과 동일한 정확한 pin을 `requirements.txt`에 추가하고 `app.spec`의 data/native/hidden import를 활성화한 뒤 준비 단계를 다시 실행해야 합니다. Python/RDKit/TensorFlow/모델이 없는 사용자 PC에도 전체 배포 폴더를 복사하면 됩니다.
+
+## 빌드 증적 및 비교
+
+빌드는 catalog의 released ERBA 자산 경로, 크기, SHA-256을 먼저 검사하며 하나라도 없거나 다르면 실패합니다. 준비 단계가 통과한 뒤 다음을 실행합니다.
+
+```bat
+build_exe.bat
+```
+
+설치 파일 생성:
+
+```bat
+build_installer.bat
+```
+
+각 실행은 서로 다른 **두 개의 빈 venv**를 만들고, 검증된 로컬 wheelhouse와 `--require-hashes`만 사용하여 설치한 뒤 PyInstaller clean build를 두 번 수행합니다. 두 빌드의 component/source/SBOM-style/model/static/distribution inventory가 동일해야 하며, 불일치 시 빌드가 실패하고 `artifacts\ER_Predictor-clean-build-comparison.json`에 결과가 남습니다. resolved requirements, wheelhouse inventory, 두 reproducibility manifest, 비교 receipt, 최종 build manifest도 `artifacts`에 기록됩니다. 배포 런타임에는 절대 연구 경로가 포함되지 않습니다.
+
+## 실행 및 게시
+
+실행 파일 하나가 아니라 `dist\ER_Predictor` 폴더 전체를 복사한 뒤 `ER_Predictor.exe`를 실행합니다.
+
+감사된 빌드가 끝난 뒤 인자 없이 다음을 실행합니다.
+
+```bat
+publish_exe.bat
+```
+
+스크립트는 전체 one-folder collection을 새 루트에 staging하고 실행 파일을 검사한 뒤 원자적으로 정확한 게시 경로에만 승격합니다. 게시 전후 기존 `ERTA_Predictor`의 재귀 manifest를 비교하여 변경을 감지하면 실패합니다. 기존 ERTA 패키지는 절대 복사 대상이나 게시 대상이 아니며 수정하지 않습니다.
