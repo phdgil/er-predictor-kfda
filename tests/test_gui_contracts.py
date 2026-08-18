@@ -691,6 +691,9 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
 
     def test_compact_erta_batch_controls_and_cas_notice_are_present(self):
         source = Path("gui/main_window.py").read_text(encoding="utf-8")
+        batch_source = source.split("    def _build_batch_tab(self):", 1)[1].split(
+            "    # ---------- UI helpers ----------", 1
+        )[0]
         self.assertIn('text="Input xlsx"', source)
         self.assertIn('text="Output directory"', source)
         self.assertIn('text="Download template"', source)
@@ -698,6 +701,10 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
         self.assertIn("required CAS column", source)
         self.assertNotIn('text="Run batch prediction"', source)
         self.assertNotIn('bg="#0969da"', source)
+        self.assertIn("self.batch_result = tk.Text(", batch_source)
+        self.assertNotIn("self.batch_tree = ttk.Treeview", batch_source)
+        self.assertNotIn('text="Applicability domain"', batch_source)
+        self.assertNotIn("self.graph_combo", batch_source)
 
     def test_template_contains_only_the_required_cas_header(self):
         window = self._window()
@@ -751,10 +758,10 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
         window.ad_ref_path_var = _ErtaBatchVariable("")
         window.output_dir_var = _ErtaBatchVariable()
         window.output_dir_display_var = _ErtaBatchVariable()
-        window.update_preview_table = lambda _result: None
         reported = []
-        window.update_batch_result_summary = lambda _result, path: reported.append(path)
-        window.update_batch_ad_summary = lambda _result: None
+        window.update_batch_result_summary = (
+            lambda _result, path, _graphs: reported.append(path)
+        )
         window.generate_batch_graphs = lambda *_args, **_kwargs: []
         window.show_error = lambda _title, error: self.fail(str(error))
         with tempfile.TemporaryDirectory() as directory:

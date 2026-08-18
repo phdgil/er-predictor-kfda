@@ -134,3 +134,13 @@ This amendment is applied before the corresponding code changes.
 3. Both pages display determinate progress and a terminal success/failure state.
 4. The output directory shown beside the selector, the directory captured when the run starts, and the directory reported in the result/status areas are one canonical path. Input/output selectors and template actions are disabled for the duration of a batch so the displayed path cannot diverge from the running snapshot.
 5. The result box reports the exact atomically published file path returned by the exporter. Tests cover changed-directory snapshots, control locking, template generation, and path equality.
+
+## FDA usability amendment: batch result simplification
+
+This amendment is applied before the corresponding code changes.
+
+1. Batch applicability-domain graphs are output-file artifacts, not interactive batch-screen content.
+2. The ERTA Batch page follows the ERalpha layout exactly: one full-width input/control box, one progress row directly underneath, one full-width `Prediction result` text box, and one status row.
+3. Remove the ERTA batch preview table, graph selector, refresh button, and in-app batch AD graph panel. Preserve generation of AD columns and graph files in the selected output directory.
+4. The result box contains a concise completion summary: row totals, prediction counts, in/out-domain counts when available, exact workbook path, and graph directory/count. On failure it contains a concise terminal error summary.
+5. Existing single-prediction visualization, batch workbook schema, sorting, model behavior, AD calculations, graph generation, template flow, progress, and canonical path guarantees remain unchanged.

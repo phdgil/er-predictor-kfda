@@ -46,17 +46,13 @@ class MainWindow(tk.Tk):
             empirical=True,
             cache_root=os.path.join(self.state_root, "cache") if self.state_root else None,
         )
+        self.last_single_result = None
         self.last_batch_result = None
         self.last_batch_fp = None
-        self.preview_df = None
-        self.preview_sort_column = None
-        self.preview_sort_ascending = True
-        self.graph_paths_by_name = {}
         self.loaded_images = []  # Keep references for Tkinter images.
         self.single_preview_size = (250, 180)
         self.nearest_reference_preview_size = (250, 180)
         self.single_ad_preview_size = (520, 300)
-        self.batch_graph_preview_size = (430, 360)
         self.main_thread = threading.current_thread()
         self.options_visible = False
 
@@ -70,7 +66,6 @@ class MainWindow(tk.Tk):
         self.inactive_probability_var = tk.StringVar(value="Probability Negative: -")
         self.ad_domain_var = tk.StringVar(value="Applicability domain: Not evaluated")
         self.nearest_reference_var = tk.StringVar(value="Nearest training reference: -")
-        self.batch_ad_summary_var = tk.StringVar(value="AD graph will appear after batch prediction.")
         self.batch_input_var = tk.StringVar(value=os.path.join(self.project_root, "templates", "ERTA_KRICT_example.xlsx"))
         self.output_dir_var = tk.StringVar(value=self.output_root)
         default_batch_name = os.path.basename(self.batch_input_var.get()) if os.path.exists(self.batch_input_var.get()) else "No input template selected"
@@ -262,12 +257,11 @@ class MainWindow(tk.Tk):
         note.grid(row=2, column=0, columnspan=2, sticky="sw", padx=8, pady=8)
 
     def _build_batch_tab(self):
-        self.batch_tab.columnconfigure(0, weight=3, uniform="batch")
-        self.batch_tab.columnconfigure(1, weight=2, uniform="batch")
-        self.batch_tab.rowconfigure(1, weight=1)
+        self.batch_tab.columnconfigure(0, weight=1)
+        self.batch_tab.rowconfigure(2, weight=1)
 
         frame = ttk.LabelFrame(self.batch_tab, text="Batch")
-        frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
+        frame.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
         frame.columnconfigure(1, weight=1)
 
         self.batch_input_button = ttk.Button(frame, text="Input xlsx", command=self.browse_batch_input)
@@ -285,49 +279,33 @@ class MainWindow(tk.Tk):
         self.download_template_button.grid(row=3, column=0, sticky="w", padx=6, pady=(1, 4))
         self.run_batch_button = ttk.Button(frame, text="Run batch", command=self.batch_predict_clicked)
         self.run_batch_button.grid(row=4, column=0, sticky="w", padx=6, pady=(0, 5))
-        self.batch_progress = ttk.Progressbar(frame, maximum=100, variable=self.batch_progress_value, mode="determinate")
-        self.batch_progress.grid(row=4, column=1, sticky="ew", padx=6, pady=(0, 5))
-        ttk.Label(frame, textvariable=self.batch_progress_var, anchor="w").grid(
-            row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 5)
+
+        progress = ttk.Frame(self.batch_tab)
+        progress.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        progress.columnconfigure(0, weight=1)
+        self.batch_progress = ttk.Progressbar(
+            progress,
+            maximum=100,
+            variable=self.batch_progress_value,
+            mode="determinate",
+        )
+        self.batch_progress.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(progress, textvariable=self.batch_progress_var, anchor="w").grid(
+            row=0, column=1, sticky="w"
         )
 
-        table_frame = ttk.LabelFrame(self.batch_tab, text="Prediction result")
-        table_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
-        table_frame.configure(width=650)
-        table_frame.grid_propagate(False)
-        table_frame.rowconfigure(1, weight=1)
-        table_frame.columnconfigure(0, weight=1)
-        self.batch_summary_text = tk.Text(table_frame, height=6, wrap="word", font=("Consolas", 9))
-        self.batch_summary_text.tag_configure("detail_key", font=("Consolas", 9, "bold"))
-        self.batch_summary_text.tag_configure("detail_value", font=("Consolas", 9))
-        self.batch_summary_text.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 4))
-        self.batch_summary_text.insert(tk.END, "Run a batch to show summary.")
-        self.batch_summary_text.configure(state="disabled")
-        self.batch_tree = ttk.Treeview(table_frame, show="headings")
-        yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.batch_tree.yview)
-        xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.batch_tree.xview)
-        self.batch_tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-        self.batch_tree.grid(row=1, column=0, sticky="nsew")
-        self.batch_tree.bind("<Double-1>", self.on_batch_tree_double_click)
-        yscroll.grid(row=1, column=1, sticky="ns")
-        xscroll.grid(row=2, column=0, sticky="ew")
-
-        graph_frame = ttk.LabelFrame(self.batch_tab, text="Applicability domain")
-        graph_frame.grid(row=1, column=1, sticky="nsew", padx=8, pady=8)
-        graph_frame.configure(width=450)
-        graph_frame.grid_propagate(False)
-        graph_frame.columnconfigure(0, weight=1)
-        graph_frame.rowconfigure(1, weight=1)
-        graph_top = ttk.Frame(graph_frame)
-        graph_top.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-        ttk.Button(graph_top, text="Refresh", command=self.refresh_graph_list).pack(side="left", padx=(0, 4))
-        self.graph_combo = ttk.Combobox(graph_top, values=[], state="readonly", width=42)
-        self.graph_combo.pack(side="left", fill="x", expand=True)
-        self.graph_combo.bind("<<ComboboxSelected>>", lambda e: self.display_selected_graph())
-        self.graph_label = ttk.Label(graph_frame, text="Graphs will appear after batch prediction.")
-        self.graph_label.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
-        self.batch_ad_summary_label = ttk.Label(graph_frame, textvariable=self.batch_ad_summary_var, wraplength=430, justify="left")
-        self.batch_ad_summary_label.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        result_frame = ttk.LabelFrame(self.batch_tab, text="Prediction result")
+        result_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
+        result_frame.columnconfigure(0, weight=1)
+        result_frame.rowconfigure(0, weight=1)
+        self.batch_result = tk.Text(
+            result_frame,
+            height=12,
+            wrap="word",
+            state="disabled",
+        )
+        self.batch_result.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self._set_erta_batch_result("Run a batch to show the completion summary.")
 
     # ---------- UI helpers ----------
     def ui(self, func, *args, **kwargs):
@@ -1131,10 +1109,13 @@ class MainWindow(tk.Tk):
                 result_df.to_excel(out_path, index=False)
                 self.last_batch_result = result_df
                 self.last_batch_fp = fp_df
-                self.ui(self.update_preview_table, result_df)
-                self.ui(self.update_batch_result_summary, result_df, out_path)
-                self.ui(self.update_batch_ad_summary, result_df)
                 graph_paths = self.generate_batch_graphs(show_errors=True, output_dir=out_dir)
+                self.ui(
+                    self.update_batch_result_summary,
+                    result_df,
+                    out_path,
+                    graph_paths,
+                )
                 if graph_paths:
                     status = f"Batch prediction saved: {out_path} / Graphs: {len(graph_paths)}"
                     message = f"Saved:\n{out_path}\n\nGraphs generated:\n{os.path.join(out_dir, 'graphs')}"
@@ -1144,97 +1125,62 @@ class MainWindow(tk.Tk):
                 self.ui(self._finish_batch, True, status)
                 self.ui(messagebox.showinfo, "Batch prediction done", message)
             except Exception as e:
+                self.ui(
+                    self._set_erta_batch_result,
+                    f"Batch prediction failed.\n\nTechnical details: {type(e).__name__}: {e}",
+                )
                 self.ui(self._finish_batch, False, "Batch prediction failed")
                 self.show_error("Batch prediction failed", e)
         self.run_threaded(job)
 
-    def update_preview_table(self, df: pd.DataFrame, max_rows: int = 200):
-        self.preview_df = df.copy()
-        self.preview_sort_column = None
-        self.preview_sort_ascending = True
-        self.render_preview_table(self.preview_df, max_rows=max_rows)
+    def _set_erta_batch_result(self, text: str):
+        self.batch_result.configure(state="normal")
+        self.batch_result.delete("1.0", tk.END)
+        self.batch_result.insert("1.0", text)
+        self.batch_result.configure(state="disabled")
 
-    def update_batch_result_summary(self, df: pd.DataFrame, out_path: str):
+    def update_batch_result_summary(
+        self,
+        df: pd.DataFrame,
+        out_path: str,
+        graph_paths: list[str] | None = None,
+    ):
         total = int(len(df))
-        pred_counts = df["Prediction_label"].value_counts() if "Prediction_label" in df.columns else pd.Series(dtype=int)
+        pred_counts = (
+            df["Prediction_label"].value_counts()
+            if "Prediction_label" in df.columns
+            else pd.Series(dtype=int)
+        )
         lines = [
-            f"Total chemicals: {total}",
+            "Batch prediction completed.",
+            "",
+            f"Total rows: {total}",
             f"Positive: {int(pred_counts.get('Positive', 0))}",
             f"Negative: {int(pred_counts.get('Negative', 0))}",
         ]
         if "AD" in df.columns:
             ad_counts = df["AD"].value_counts()
-            lines.extend([
-                f"AD In-domain: {int(ad_counts.get('In-domain', 0))}",
-                f"AD Out-of-domain: {int(ad_counts.get('Out-of-domain', 0))}",
-            ])
-        lines.append(f"Output file: {out_path}")
-        self.render_text_lines(self.batch_summary_text, lines)
-
-    def update_batch_ad_summary(self, df: pd.DataFrame):
-        if "AD" not in df.columns:
-            self.batch_ad_summary_var.set("Applicability domain was not evaluated.")
-            return
-        counts = df["AD"].value_counts()
-        in_count = int(counts.get("In-domain", 0))
-        out_count = int(counts.get("Out-of-domain", 0))
-        total = int(len(df))
-        self.batch_ad_summary_var.set(f"Applicability domain: In-domain {in_count} / Out-of-domain {out_count} / Total {total}")
-
-    def render_preview_table(self, df: pd.DataFrame, max_rows: int = 200):
-        self.batch_tree.delete(*self.batch_tree.get_children())
-        cols = list(df.columns[:12])
-        self.batch_tree["columns"] = cols
-        for col in cols:
-            self.batch_tree.heading(col, text=col)
-            self.batch_tree.column(col, width=105, minwidth=80, anchor="w", stretch=False)
-        for _, row in df.head(max_rows).iterrows():
-            values = []
-            for col in cols:
-                v = row[col]
-                if isinstance(v, float):
-                    v = f"{v:.5g}"
-                values.append(v)
-            self.batch_tree.insert("", "end", values=values)
-
-    def on_batch_tree_double_click(self, event):
-        if self.batch_tree.identify_region(event.x, event.y) != "heading":
-            return
-        column_id = self.batch_tree.identify_column(event.x)
-        if not column_id:
-            return
-        try:
-            column_index = int(column_id.replace("#", "")) - 1
-            column_name = self.batch_tree["columns"][column_index]
-        except Exception:
-            return
-        self.sort_preview_by_column(column_name)
-
-    def sort_preview_by_column(self, column_name: str):
-        if self.preview_df is None or column_name not in self.preview_df.columns:
-            return
-        ascending = not self.preview_sort_ascending if self.preview_sort_column == column_name else True
-        sorted_df = self.preview_df.copy()
-        sort_values = pd.to_numeric(sorted_df[column_name], errors="coerce")
-        if sort_values.notna().any():
-            sorted_df = sorted_df.assign(_sort_key=sort_values).sort_values(
-                "_sort_key",
-                ascending=ascending,
-                na_position="last",
-                kind="mergesort",
-            ).drop(columns="_sort_key")
-        else:
-            sorted_df = sorted_df.sort_values(
-                column_name,
-                ascending=ascending,
-                na_position="last",
-                kind="mergesort",
-                key=lambda series: series.astype(str).str.lower(),
+            lines.extend(
+                [
+                    f"AD In-domain: {int(ad_counts.get('In-domain', 0))}",
+                    f"AD Out-of-domain: {int(ad_counts.get('Out-of-domain', 0))}",
+                ]
             )
-        self.preview_sort_column = column_name
-        self.preview_sort_ascending = ascending
-        self.preview_df = sorted_df
-        self.render_preview_table(sorted_df)
+        lines.extend(["", f"Output workbook: {out_path}"])
+        if graph_paths:
+            lines.extend(
+                [
+                    f"AD graph files: {len(graph_paths)}",
+                    f"Graph directory: {os.path.dirname(graph_paths[0])}",
+                ]
+            )
+        else:
+            lines.append("AD graph files: Not generated")
+        lines.append("")
+        lines.append(
+            "Detailed predictions and applicability-domain results are available in the output workbook."
+        )
+        self._set_erta_batch_result("\n".join(lines))
 
     def generate_batch_graphs(self, show_errors: bool = True, output_dir: str | None = None):
         try:
@@ -1244,7 +1190,6 @@ class MainWindow(tk.Tk):
             out_dir = os.path.join(destination, "graphs")
             self.set_status("Generating graphs...")
             paths = save_all_batch_graphs(self.last_batch_result, out_dir, self.ad_calculator, self.last_batch_fp)
-            self.ui(self.refresh_graph_list, paths)
             if paths:
                 self.set_status(f"Graphs generated: {len(paths)}")
             return paths
@@ -1252,50 +1197,6 @@ class MainWindow(tk.Tk):
             if show_errors:
                 self.show_error("Graph generation failed", e)
             return []
-
-    def generate_graphs_clicked(self):
-        def job():
-            paths = self.generate_batch_graphs(show_errors=True)
-            if paths:
-                self.set_status(f"Graphs saved: {os.path.join(self.validated_output_dir(), 'graphs')}")
-        self.run_threaded(job)
-
-    def refresh_graph_list(self, paths=None):
-        graph_dir = os.path.join(self.output_dir_var.get(), "graphs")
-        if paths is None:
-            if os.path.exists(graph_dir):
-                paths = [os.path.join(graph_dir, f) for f in os.listdir(graph_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-            else:
-                paths = []
-        paths = [path for path in paths if os.path.basename(path).lower() != "single_ad_pca_plot.png"]
-        paths = sorted(paths, key=lambda path: (0 if os.path.basename(path).lower() == "ad_pca_plot.png" else 1, os.path.basename(path).lower()))
-        self.graph_paths_by_name = {os.path.basename(path): path for path in paths}
-        names = list(self.graph_paths_by_name.keys())
-        self.graph_combo["values"] = names
-        if paths:
-            selected = "ad_pca_plot.png" if "ad_pca_plot.png" in self.graph_paths_by_name else names[0]
-            self.graph_combo.set(selected)
-            self.display_selected_graph()
-            self.update_idletasks()
-            self.set_status(f"Graph preview loaded: {selected}")
-        else:
-            self.graph_combo.set("")
-            self.graph_label.configure(text="AD graph will appear after batch prediction.", image="")
-
-    def display_selected_graph(self):
-        if not PIL_AVAILABLE:
-            self.graph_label.configure(text="Pillow is not installed; graph preview unavailable.", image="")
-            return
-        path = self.graph_paths_by_name.get(self.graph_combo.get(), self.graph_combo.get())
-        if not path or not os.path.exists(path):
-            self.graph_label.configure(text="Selected graph file was not found.", image="")
-            return
-        try:
-            photo = self.make_preview_photo(path, self.batch_graph_preview_size)
-            self.loaded_images.append(photo)
-            self.graph_label.configure(image=photo, text="")
-        except Exception as e:
-            self.graph_label.configure(text=f"Graph preview failed:\n{e}", image="")
 
 
 class StructureEditorDialog(tk.Toplevel):

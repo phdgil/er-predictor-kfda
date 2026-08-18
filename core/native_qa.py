@@ -331,21 +331,35 @@ class NativePackageQa:
                 self._require([row[0] for row in rows] == [2, 1, 3], "ERTA batch input order drift")
                 self._require(rows[1][3] == self.MOCK_SMILES and rows[1][-1] == "Found", "mocked CAS batch row was not resolved")
                 self._require(rows[2][5] is False, "legacy invalid batch row did not preserve invalid marker")
-                self._require(bool(app.graph_paths_by_name), "ERTA batch graphs were not generated")
-                graph_names = list(app.graph_combo.cget("values"))
-                self._require(app.graph_combo.get() in graph_names and bool(app.graph_label.cget("image")), "selected batch graph was not rendered")
-                rendered_graphs = []
-                for graph_name in graph_names:
-                    app.graph_combo.set(graph_name)
-                    app.display_selected_graph()
-                    self._require(bool(app.graph_label.cget("image")), f"batch graph was not rendered: {graph_name}")
-                    rendered_graphs.append(graph_name)
-                self._record("erta_batch_workbook_graphs_and_order", output=str(outputs[0]), sheet=sheet.title, headers=headers, input_order=[row[0] for row in rows], mocked_cas_status=rows[1][-1], invalid_row_mol_valid=rows[2][5], graphs=rendered_graphs, selected_graph=app.graph_combo.get(), completion_dialog=self.dialogs[-1])
-                original_order = [app.batch_tree.item(item, "values")[0] for item in app.batch_tree.get_children()]
-                app.sort_preview_by_column("No.")
-                sorted_order = [app.batch_tree.item(item, "values")[0] for item in app.batch_tree.get_children()]
-                self._require(original_order != sorted_order and sorted_order == ["1", "2", "3"], "ERTA preview sorting did not reorder rows")
-                self._record("erta_batch_sorting", column="No.", original_order=original_order, sorted_order=sorted_order, ascending=app.preview_sort_ascending)
+                graph_paths = sorted(
+                    path.name for path in (self.root / "graphs").glob("*.png")
+                )
+                self._require(graph_paths, "ERTA batch graph files were not generated")
+                summary = app.batch_result.get("1.0", "end").strip()
+                self._require(
+                    str(outputs[0]) in summary
+                    and "AD In-domain:" in summary
+                    and "Graph directory:" in summary,
+                    "ERTA batch completion summary is incomplete",
+                )
+                self._require(
+                    not hasattr(app, "batch_tree")
+                    and not hasattr(app, "graph_combo")
+                    and not hasattr(app, "graph_label"),
+                    "obsolete ERTA batch table/graph preview remains in the UI",
+                )
+                self._record(
+                    "erta_batch_workbook_graphs_and_order",
+                    output=str(outputs[0]),
+                    sheet=sheet.title,
+                    headers=headers,
+                    input_order=[row[0] for row in rows],
+                    mocked_cas_status=rows[1][-1],
+                    invalid_row_mol_valid=rows[2][5],
+                    graph_files=graph_paths,
+                    batch_summary=summary,
+                    completion_dialog=self.dialogs[-1],
+                )
                 self._restore_patches()
                 self.mock_cas_enabled = False
                 self._install_dialog_observer()
