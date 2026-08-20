@@ -1,0 +1,229 @@
+{
+  "applicability_domain": {
+    "cache": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\20260803-ERTA_코드공유(덕성여대)\\20260803-ERTA_코드공유(덕성여대)\\project_erta_predictor\\models\\erba\\ad\\classification_er_alpha_reference_ad_cache.npz",
+      "sha256": "f5b1d657152701e8567c8fdffb41f3774c9ab4d047be4ba1326c426d88a56685",
+      "size_bytes": 1305061
+    },
+    "coverage": 0.95,
+    "distance_metric": "Euclidean distance after StandardScaler transformation of route-reference RDKit fingerprint matrix",
+    "fitted_distance_threshold": 54.999514498872124,
+    "method": "knn_mean_distance_p95_rdkit_ad_morgan_display",
+    "n_neighbors": 5,
+    "overall_rule": "distance_in_domain AND similarity_in_domain",
+    "pca_use": "two-component visualization only",
+    "reference": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\20260803-ERTA_코드공유(덕성여대)\\20260803-ERTA_코드공유(덕성여대)\\project_erta_predictor\\models\\erba\\ad\\classification_er_alpha_reference.xlsx",
+      "sha256": "761f847d929567679388412bbfed3a19a97fdcde505187dbd8ee4a7369e42620",
+      "size_bytes": 8975446
+    },
+    "reference_row_ids_equal_development": true,
+    "reference_rows": 1481,
+    "reference_unique_row_ids": 1481,
+    "similarity_threshold": 0.6
+  },
+  "development_tabulation": {
+    "assay_class_counts": {
+      "ER_binding": 1481
+    },
+    "available_columns": [
+      "row_id",
+      "source_name",
+      "source_record_id",
+      "source_row_locator",
+      "raw_artifact_filename",
+      "raw_artifact_path",
+      "compound_name",
+      "cas",
+      "dtxsid",
+      "cid",
+      "sid",
+      "smiles_input",
+      "smiles_source",
+      "pubchem_attempted",
+      "receptor_subtype",
+      "species",
+      "target_name",
+      "assay_name",
+      "assay_class",
+      "endpoint_label",
+      "numeric_value",
+      "unit",
+      "original_label",
+      "label",
+      "label_basis",
+      "smiles_class",
+      "standardized_smiles",
+      "inchikey",
+      "parent_smiles",
+      "duplicate_group_id",
+      "resolved_label",
+      "exclusion_reason",
+      "derived_pic50",
+      "derived_iqr_lower",
+      "derived_iqr_upper",
+      "derived_rule",
+      "model_smiles",
+      "group",
+      "partition",
+      "split_fold"
+    ],
+    "endpoint_counts": {
+      "% Inhibition of Control Specific Binding": 1,
+      "% Inhibition of Control Specific Binding (Mean n=2)": 6,
+      "Activity": 73,
+      "Covalent binding": 10,
+      "EC50": 13,
+      "IC50": 1120,
+      "Inhibition": 37,
+      "Kb": 2,
+      "Kd": 2,
+      "Ki": 74,
+      "RBA": 66,
+      "aid_1223_ERalpha_binding_dose_response": 50,
+      "aid_70335_ERalpha_estradiol_binding_inhibition": 3,
+      "aid_70347_ERalpha_binding_affinity": 9,
+      "log(RBA)": 15
+    },
+    "label_counts": {
+      "negative": 852,
+      "positive": 629
+    },
+    "partition_values": [
+      "development"
+    ],
+    "receptor_subtypes": {
+      "ERalpha": 1481
+    },
+    "regression_derived_positive_rule": "ERalpha positive-match pIC50 IQR [7.50439325, 8.607218]",
+    "regression_derived_positive_rule_rows": 198,
+    "rows": 1481,
+    "source_counts": {
+      "ChEMBL": 1221,
+      "ChEMBL regression-derived": 198,
+      "PubChem BioAssay": 62
+    },
+    "species_counts": {
+      "<missing>": 62,
+      "Homo sapiens": 1419
+    },
+    "unique_parent_smiles": 1481,
+    "unique_row_ids": 1481
+  },
+  "document_purpose": "Frozen supporting evidence for QMRF_ERalpha_Binding_Classification_v7; generated from current model, development partitions, route-specific AD assets, and release manifests.",
+  "frozen_inputs": {
+    "ad_asset_generator": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\20260803-ERTA_코드공유(덕성여대)\\20260803-ERTA_코드공유(덕성여대)\\project_erta_predictor\\prepare_erba_ad_assets.py",
+      "sha256": "8c2c7c4aa78179b9c53808a6a442c78e1509a5b9acb2362ecc8a0e4c9e18be68",
+      "size_bytes": 7308
+    },
+    "ad_source": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\20260803-ERTA_코드공유(덕성여대)\\20260803-ERTA_코드공유(덕성여대)\\project_erta_predictor\\core\\ad.py",
+      "sha256": "3c6450ed081b4f5cdd803802bc5d2bc2a8c2bc395c208a42349d76255366724e",
+      "size_bytes": 25868
+    },
+    "development_partition": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\data\\normalized_erba\\classification_modeling_nested_mcc_v7\\development_ERalpha.csv",
+      "sha256": "0c042eda221d4055f4e701e8f6c6edddfe6053f57f59514d36c7e7cc957ab486",
+      "size_bytes": 1472873
+    },
+    "feature_source": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\20260803-ERTA_코드공유(덕성여대)\\20260803-ERTA_코드공유(덕성여대)\\project_erta_predictor\\core\\erba_features.py",
+      "sha256": "8e366b6c37950499d08162d88f08a93f6373cb15e92105bc612854b782846f78",
+      "size_bytes": 3468
+    },
+    "internal_sensitivity_evaluation": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\data\\normalized_erba\\classification_modeling_nested_mcc_v7\\internal_resplit_sensitivity_evaluation.json",
+      "sha256": "6f30c84d445ab530c1daaf816972f15af2e86b21c88ce0238f4bf81a7ef106cc",
+      "size_bytes": 4235
+    },
+    "internal_sensitivity_partition": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\data\\normalized_erba\\classification_modeling_nested_mcc_v7\\internal_resplit_ERalpha.csv",
+      "sha256": "4c791e830793ba5db2f504f17033ee4c663d46d97790ca33ba46ba65ff9c8791",
+      "size_bytes": 225431
+    },
+    "model_artifact": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\20260803-ERTA_코드공유(덕성여대)\\20260803-ERTA_코드공유(덕성여대)\\project_erta_predictor\\models\\erba\\production_classification_model_ERalpha.joblib",
+      "sha256": "db3f2c369cfc9f2a08ecc985424879b70b82f3a4bc8d11a5e2f94ab8c7fe96ea",
+      "size_bytes": 11743515
+    },
+    "preprocessing_source": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\20260803-ERTA_코드공유(덕성여대)\\20260803-ERTA_코드공유(덕성여대)\\project_erta_predictor\\core\\erba_preprocessing.py",
+      "sha256": "63fac666b37759965f658e64dd456df141906ba1bc64e4f9ae3fd8e4f8ba90a3",
+      "size_bytes": 5547
+    },
+    "production_manifest": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\data\\normalized_erba\\classification_modeling_nested_mcc_v7\\production_classification_model_ERalpha_manifest.json",
+      "sha256": "7333f3295e3fe89f779525d93c26ea073b03b62af4d0ed0f6b7bf52a110c6c95",
+      "size_bytes": 8419
+    },
+    "protocol": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\data\\normalized_erba\\classification_modeling_nested_mcc_v7\\protocol.json",
+      "sha256": "406da317873c99882cab4f07f280ecacca26e1f1fa47d70822e6c446835ffe6d",
+      "size_bytes": 4527
+    },
+    "release_manifest": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\data\\normalized_erba\\classification_modeling_nested_mcc_v7\\release_manifest_ERalpha.json",
+      "sha256": "b5799c3ec45a2a2ccd5a2975d89cac8a9a5d40a73ad186f14de27e43325c9918",
+      "size_bytes": 2367
+    },
+    "source_manifest": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\data\\normalized_erba\\classification_modeling_nested_mcc_v7\\source_manifest.json",
+      "sha256": "63e890935aab3afae78ebf6bc3c120140677b87218753e8fa15571ad9068d0d5",
+      "size_bytes": 4178
+    },
+    "split_manifest": {
+      "path": "D:\\research\\FDA_endocrine_disruption\\data\\normalized_erba\\classification_modeling_nested_mcc_v7\\split_manifest.json",
+      "sha256": "9d2299a90de30fba4763fd63e11d69898a92a9b7c461e6762e95c131f6c00582",
+      "size_bytes": 1737
+    }
+  },
+  "generated_date": "2026-08-20",
+  "internal_sensitivity_tabulation": {
+    "evidence_scope": "internal_historically_exposed",
+    "label_counts": {
+      "negative": 145,
+      "positive": 79
+    },
+    "rows": 224,
+    "unique_row_ids": 224
+  },
+  "interpretation_constraints": [
+    "All reported performance is internal and historically exposed.",
+    "The selected model outer-fold metrics are selection-associated because mean outer MCC was used to choose among 56 candidate families.",
+    "The 224-row sensitivity partition is not external or regulatory validation.",
+    "The endpoint pools heterogeneous direct-binding assay evidence and is not one standardized assay method.",
+    "Future K-FDA single-assay data should remain prospective external evidence unless K-FDA explicitly authorizes training use."
+  ],
+  "model_id": "erba_classification_v7_er_alpha",
+  "pipeline_introspection": {
+    "classes": [
+      0,
+      1
+    ],
+    "classifier": "SVC(C=2.0, probability=True, random_state=20260811)",
+    "decision_threshold": 0.5,
+    "effective_gamma": 0.0004882812492761384,
+    "feature_transformer": "ERBARawSmilesFeatures(feature_set='rdkit_fp_2048')",
+    "imputer": "SimpleImputer(strategy='median')",
+    "rdkit_fingerprint_generator_info": "Common arguments : countSimulation=0 fpSize=2048 bitsPerFeature=2 includeChirality=0 --- RDKitFPArguments minPath=1 maxPath=7 useHs=1 branchedPaths=1 useBondOrder=1 --- RDKitFPEnvGenerator --- RDKitFPAtomInvGenerator --- No bond invariants generator",
+    "rdkit_version": "2024.03.5",
+    "scaler": "StandardScaler()",
+    "selector": "SelectKBest(k='all')",
+    "steps": [
+      "raw_smiles",
+      "impute",
+      "variance",
+      "select",
+      "scale",
+      "model"
+    ],
+    "support_vectors_by_class": [
+      434,
+      276
+    ],
+    "support_vectors_total": 710,
+    "variance_filter": "VarianceThreshold()"
+  },
+  "schema_version": 1
+}

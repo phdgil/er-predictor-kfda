@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "created_date": "2026-08-20",
+  "model_id": "erba_classification_v7_er_alpha",
+  "document_status": "draft_owner_review_required",
+  "artifacts": [
+    {
+      "filename": "QMRF_ERalpha_Binding_Classification_v7.docx",
+      "size_bytes": 50429,
+      "sha256": "73a07c6a6d78898e7b1fbdc57a5f15c3bf07964645354f9bed4edef23b7f63b3"
+    },
+    {
+      "filename": "QMRF_ERalpha_Binding_Classification_v7.pdf",
+      "size_bytes": 400024,
+      "sha256": "95bcb2a4da64129b2da67a9a1f3546681371dc9816afffd7c4fa6d6295506aa0"
+    },
+    {
+      "filename": "QMRF_ERalpha_Binding_Classification_v7_supporting_evidence.json",
+      "size_bytes": 9837,
+      "sha256": "45f28d92104d460be776bbc3790ba5ad4406287b3defe3ae375865d12d407e89"
+    }
+  ],
+  "review_basis": [
+    "OECD QMRF v2.1",
+    "VEGA Estrogen Receptor Relative Binding Affinity Model v1.0.2 QMRF",
+    "VEGA Estrogen Receptor-mediated effect IRFMN/CERAPP v1.0.1 QMRF"
+  ],
+  "submission_blockers": [
+    "QMRF author and model developer contact details",
+    "scientific-owner approval",
+    "external validation using an independent assay-defined dataset"
+  ],
+  "evidence_scope": "internal_historically_exposed"
+}
