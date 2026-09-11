@@ -2,6 +2,7 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import joblib
@@ -73,6 +74,31 @@ class _BatchPredictor:
             raw_smiles=request.smiles, model_smiles=request.smiles or None,
             status_code=self.status, status_message=self.status.value,
             non_binding_probability=0.2, binding_probability=0.8, binding_label="binding",
+        )
+
+
+class _BatchAD:
+    def __init__(self):
+        self.calls = []
+        self.calculator = SimpleNamespace(fitted=True)
+
+    def evaluate(self, task, subtype, model_smiles):
+        self.calls.append((task, subtype, model_smiles))
+        return (
+            self.calculator,
+            SimpleNamespace(
+                fitted=True,
+                in_domain=True,
+                distance=1.25,
+                threshold=2.5,
+                distance_in_domain=True,
+                max_similarity=0.75,
+                similarity_threshold=0.6,
+                similarity_in_domain=True,
+                pc1=0.5,
+                pc2=-0.25,
+            ),
+            np.asarray([[1.0, 0.0, 1.0]], dtype=float),
         )
 
 
@@ -227,15 +253,22 @@ class ERBACoreTests(unittest.TestCase):
                 input_path, index=False
             )
             predictor = _BatchPredictor()
+            erba_ad = _BatchAD()
             with patch("gui.erba_tab.cas_to_smiles", return_value={
                 "CAS": "50-00-0", "PubChem_CID": 712, "CanonicalSMILES": "C=O", "IsomericSMILES": "C=O",
-            }) as lookup:
-                destination, count = export_erba_batch(
-                    input_path, directory, task, subtype, predictor, spec, provenance
+            }) as lookup, patch(
+                "gui.erba_tab.save_erba_batch_graphs", return_value=((), None)
+            ):
+                export_result = export_erba_batch(
+                    input_path, task, subtype, predictor, erba_ad, spec, provenance
                 )
-            self.assertTrue(destination.exists())
-            self.assertEqual(count, 1)
+            self.assertTrue(export_result.destination.exists())
+            self.assertEqual(export_result.destination.parent, input_path.resolve().parent)
+            self.assertEqual(export_result.count, 1)
+            self.assertEqual(export_result.binding_count, 1)
+            self.assertEqual(export_result.ad_in_domain_count, 1)
             self.assertEqual([request.smiles for request in predictor.calls], ["C=O"])
+            self.assertEqual(erba_ad.calls, [(task, subtype, "C=O")])
             lookup.assert_called_once_with("50-00-0")
         with patch("gui.erba_tab.cas_to_smiles", return_value={"IsomericSMILES": "C[C@H](O)F"}):
             self.assertEqual(cas_lookup_smiles("75-05-8"), "C[C@H](O)F")
@@ -247,8 +280,9 @@ class ERBACoreTests(unittest.TestCase):
             pd.DataFrame([["x", "CCO"]], columns=["Row_ID", "SMILES"]).to_excel(input_path, index=False)
             with self.assertRaisesRegex(RuntimeError, "no output"):
                 export_erba_batch(
-                    input_path, directory, task, subtype,
-                    _BatchPredictor(ERBAStatusCode.INFERENCE_INTERNAL_ERROR), spec, provenance,
+                    input_path, task, subtype,
+                    _BatchPredictor(ERBAStatusCode.INFERENCE_INTERNAL_ERROR),
+                    _BatchAD(), spec, provenance,
                 )
             self.assertEqual(list(Path(directory).glob("ERBA_*.xlsx")), [])
 

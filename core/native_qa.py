@@ -9,7 +9,11 @@ import traceback
 
 from openpyxl import Workbook, load_workbook
 
-from core.contracts import ERBASubtype, ERBATask
+from core.contracts import (
+    ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID,
+    ERBASubtype,
+    ERBATask,
+)
 
 
 class NativePackageQa:
@@ -19,6 +23,34 @@ class NativePackageQa:
     LEGACY_INVALID_SMILES = "not a SMILES"
     MOCK_CAS = "50-00-0"
     MOCK_SMILES = "C=O"
+    ERBA_BATCH_AD_COLUMNS = (
+        "AD",
+        "AD_MeanDistance",
+        "AD_DistanceThreshold",
+        "AD_Distance_InDomain",
+        "AD_SimilarityMax",
+        "AD_SimilarityThreshold",
+        "AD_Similarity_InDomain",
+        "AD_PC1",
+        "AD_PC2",
+    )
+    ERBA_BATCH_GRAPH_FILES = {
+        "binding_class_count.png",
+        "binding_probability_histogram.png",
+        "top_binding_chemicals.png",
+        "ad_pca_plot.png",
+        "ad_decision_plot.png",
+    }
+    ERBA_PROVENANCE_COLUMNS = (
+        "Protocol_SHA256",
+        "Source_Manifest_SHA256",
+        "Historical_Exposure_Manifest_SHA256",
+        "Split_Manifest_SHA256",
+        "Nested_CV_SHA256",
+        "Internal_Resplit_SHA256",
+        "Report_SHA256",
+        "Caveat_SHA256",
+    )
 
     def __init__(self, app, destination: str | Path) -> None:
         self.app = app
@@ -33,6 +65,11 @@ class NativePackageQa:
         self.deadline = self.started_at + 900
         self.erta_summary = ""
         self.erta_probability = ""
+        self.erta_batch_input_path: Path | None = None
+        self.erta_batch_outputs_before: set[Path] = set()
+        self.erba_batch_input_path: Path | None = None
+        self.erba_batch_outputs_before: set[Path] = set()
+        self.erba_batch_graph_dirs_before: set[Path] = set()
         self.dialogs: list[dict] = []
         self.patches: list[tuple[object, str, object]] = []
         self.mock_cas_enabled = False
@@ -307,10 +344,16 @@ class NativePackageQa:
                 sheet.append([1, self.MOCK_CAS, "mocked-cas", ""])
                 sheet.append([3, "", "legacy-invalid", self.LEGACY_INVALID_SMILES])
                 workbook.save(input_path)
+                self.erta_batch_input_path = input_path.resolve()
+                self.erta_batch_outputs_before = {
+                    path.resolve()
+                    for path in self.erta_batch_input_path.parent.glob(
+                        "erta-mixed-input_*_prediction*.xlsx"
+                    )
+                }
                 app.batch_input_var.set(str(input_path))
                 app.batch_input_display_var.set(input_path.name)
-                app.output_dir_var.set(str(self.root))
-                app.output_dir_display_var.set(str(self.root))
+                app.batch_destination_var.set(str(self.erta_batch_input_path.parent))
                 self.batch_dialog_count = len(self.dialogs)
                 app.batch_predict_clicked()
                 self.stage = 7
@@ -320,9 +363,27 @@ class NativePackageQa:
                 if not self._wait_dialog(self.batch_dialog_count):
                     self._reschedule()
                     return
-                outputs = sorted(self.root.glob("erta-mixed-input_*_prediction.xlsx"))
-                self._require(len(outputs) == 1, f"expected one ERTA workbook, found {len(outputs)}")
-                workbook = load_workbook(outputs[0], read_only=True, data_only=True)
+                self._require(
+                    self.erta_batch_input_path is not None,
+                    "ERTA batch input path was not recorded",
+                )
+                input_parent = self.erta_batch_input_path.parent
+                outputs = {
+                    path.resolve()
+                    for path in input_parent.glob(
+                        "erta-mixed-input_*_prediction*.xlsx"
+                    )
+                } - self.erta_batch_outputs_before
+                self._require(
+                    len(outputs) == 1,
+                    f"expected one fresh ERTA workbook, found {len(outputs)}",
+                )
+                output = outputs.pop()
+                self._require(
+                    output.parent == input_parent,
+                    "ERTA workbook was not saved beside the input workbook",
+                )
+                workbook = load_workbook(output, read_only=True, data_only=True)
                 sheet = workbook.active
                 headers = [cell.value for cell in sheet[1]]
                 rows = list(sheet.iter_rows(min_row=2, values_only=True))
@@ -337,7 +398,7 @@ class NativePackageQa:
                 self._require(graph_paths, "ERTA batch graph files were not generated")
                 summary = app.batch_result.get("1.0", "end").strip()
                 self._require(
-                    str(outputs[0]) in summary
+                    f"Output workbook: {output}" in summary
                     and "AD In-domain:" in summary
                     and "Graph directory:" in summary,
                     "ERTA batch completion summary is incomplete",
@@ -350,7 +411,7 @@ class NativePackageQa:
                 )
                 self._record(
                     "erta_batch_workbook_graphs_and_order",
-                    output=str(outputs[0]),
+                    output=str(output),
                     sheet=sheet.title,
                     headers=headers,
                     input_order=[row[0] for row in rows],
@@ -438,6 +499,203 @@ class NativePackageQa:
                     return
                 self.stage = 12
             if self.stage == 12:
+                app.notebook.select(tab)
+                tab.notebook.select(tab.batch_tab)
+                tab.batch_task_var.set(ERBATask.CLASSIFICATION.value)
+                tab.batch_subtype_var.set(ERBASubtype.ER_ALPHA.value)
+                input_path = self.root / "erba-alpha-batch-input.xlsx"
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.title = "Original_Input"
+                sheet.append(["Row_ID", "SMILES", "Analyst_Note"])
+                sheet.append(["native-valid", "Oc1ccccc1", "preserve-valid"])
+                sheet.append(["native-invalid", "[*]CC", "preserve-invalid"])
+                workbook.save(input_path)
+                self.erba_batch_input_path = input_path.resolve()
+                input_parent = self.erba_batch_input_path.parent
+                self.erba_batch_outputs_before = {
+                    path.resolve()
+                    for path in input_parent.glob(
+                        "ERBA_classification_er_alpha_results*.xlsx"
+                    )
+                }
+                self.erba_batch_graph_dirs_before = {
+                    path.resolve()
+                    for path in input_parent.glob(
+                        "ERBA_classification_er_alpha_results*_graphs*"
+                    )
+                    if path.is_dir()
+                }
+                tab.batch_input_var.set(str(self.erba_batch_input_path))
+                tab.batch_destination_var.set(str(input_parent))
+                tab.batch_predict_clicked()
+                self._require(
+                    tab._active_batch_request_id is not None,
+                    f"ERalpha batch callback did not start: {tab.batch_status_var.get()}",
+                )
+                self.stage = 13
+                self._reschedule()
+                return
+            if self.stage == 13:
+                if tab._active_batch_request_id is not None:
+                    self._reschedule()
+                    return
+                self._require(
+                    self.erba_batch_input_path is not None,
+                    "ERalpha batch input path was not recorded",
+                )
+                input_parent = self.erba_batch_input_path.parent
+                outputs = {
+                    path.resolve()
+                    for path in input_parent.glob(
+                        "ERBA_classification_er_alpha_results*.xlsx"
+                    )
+                } - self.erba_batch_outputs_before
+                self._require(
+                    len(outputs) == 1,
+                    f"expected one new ERalpha workbook, found {len(outputs)}: "
+                    f"{tab.batch_status_var.get()}",
+                )
+                output = outputs.pop()
+                self._require(
+                    output.parent == input_parent
+                    and tab.batch_destination_var.get() == str(input_parent),
+                    "ERalpha workbook destination is not the input workbook parent",
+                )
+                graph_dirs = {
+                    path.resolve()
+                    for path in input_parent.glob(
+                        "ERBA_classification_er_alpha_results*_graphs*"
+                    )
+                    if path.is_dir()
+                } - self.erba_batch_graph_dirs_before
+                self._require(
+                    len(graph_dirs) == 1,
+                    f"expected one new input-adjacent ERalpha graph directory, found {len(graph_dirs)}",
+                )
+                graph_directory = graph_dirs.pop()
+                graph_files = {
+                    path.name for path in graph_directory.iterdir() if path.is_file()
+                }
+                self._require(
+                    graph_directory.parent == input_parent
+                    and graph_files == self.ERBA_BATCH_GRAPH_FILES,
+                    "ERalpha batch graphs are incomplete or outside the input parent",
+                )
+
+                workbook = load_workbook(output, read_only=True, data_only=True)
+                sheet_names = workbook.sheetnames
+                self._require(
+                    sheet_names == ["Predictions", "Guide", "Input", "Metadata"]
+                    and workbook.active.title == "Predictions",
+                    "ERalpha batch workbook is not Predictions-first and active",
+                )
+                prediction_sheet = workbook["Predictions"]
+                prediction_headers = [cell.value for cell in prediction_sheet[1]]
+                self._require(
+                    all(column in prediction_headers for column in self.ERBA_BATCH_AD_COLUMNS),
+                    "ERalpha batch workbook is missing applicability-domain columns",
+                )
+                prediction_rows = [
+                    dict(zip(prediction_headers, row))
+                    for row in prediction_sheet.iter_rows(min_row=2, values_only=True)
+                ]
+                self._require(
+                    len(prediction_rows) == 2
+                    and prediction_rows[0]["Analyst_Note"] == "preserve-valid"
+                    and prediction_rows[1]["Analyst_Note"] == "preserve-invalid",
+                    "ERalpha primary predictions did not retain safe input fields and row order",
+                )
+                self._require(
+                    prediction_rows[0]["Result_Status"] == "Predicted"
+                    and prediction_rows[0]["AD"] in {"In-domain", "Out-of-domain"}
+                    and prediction_rows[1]["Result_Status"] == "Not predicted"
+                    and all(
+                        prediction_rows[1][column] is None
+                        for column in self.ERBA_BATCH_AD_COLUMNS
+                    ),
+                    "ERalpha prediction/AD row mapping is incorrect",
+                )
+
+                input_sheet = workbook["Input"]
+                input_headers = [cell.value for cell in input_sheet[1]]
+                input_rows = list(input_sheet.iter_rows(min_row=2, values_only=True))
+                self._require(
+                    input_headers == ["Row_ID", "SMILES", "Analyst_Note"]
+                    and input_rows
+                    == [
+                        ("native-valid", "Oc1ccccc1", "preserve-valid"),
+                        ("native-invalid", "[*]CC", "preserve-invalid"),
+                    ],
+                    "ERalpha Input sheet did not preserve the supplied input",
+                )
+
+                metadata_sheet = workbook["Metadata"]
+                metadata_headers = [cell.value for cell in metadata_sheet[1]]
+                metadata_values = [
+                    cell.value for cell in next(metadata_sheet.iter_rows(min_row=2, max_row=2))
+                ]
+                metadata = dict(zip(metadata_headers, metadata_values))
+                expected_spec = tab.catalog[
+                    (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA)
+                ]
+                hex_digits = set("0123456789abcdef")
+                self._require(
+                    metadata.get("Excel_Contract_ID")
+                    == ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID
+                    and metadata.get("Model_ID") == expected_spec.model_id
+                    and metadata.get("Model_SHA256") == expected_spec.sha256
+                    and metadata.get("Performance_Evidence_Scope")
+                    == "internal_historically_exposed"
+                    and bool(metadata.get("Evidence_Caveat"))
+                    and all(
+                        isinstance(metadata.get(column), str)
+                        and len(metadata[column]) == 64
+                        and set(metadata[column]) <= hex_digits
+                        for column in self.ERBA_PROVENANCE_COLUMNS
+                    ),
+                    "ERalpha batch metadata did not preserve catalog model provenance",
+                )
+                workbook.close()
+
+                binding_count = sum(
+                    row["binding_label"] == "binding" for row in prediction_rows
+                )
+                non_binding_count = sum(
+                    row["binding_label"] == "non_binding" for row in prediction_rows
+                )
+                not_predicted_count = sum(
+                    row["Result_Status"] != "Predicted" for row in prediction_rows
+                )
+                summary = tab.batch_result.get("1.0", "end").strip()
+                self._require(
+                    tab.batch_status_var.get() == f"ERBA batch complete: {output}"
+                    and f"Total rows: {len(prediction_rows)}" in summary
+                    and f"Binding: {binding_count}" in summary
+                    and f"Non-binding: {non_binding_count}" in summary
+                    and f"Not predicted: {not_predicted_count}" in summary
+                    and f"Output workbook: {output}" in summary
+                    and f"Graph files: {len(graph_files)}" in summary
+                    and f"Graph directory: {graph_directory}" in summary,
+                    "ERalpha batch completion did not expose binding and artifact summaries",
+                )
+                self._record(
+                    "erba_eralpha_batch_workbook_ad_graphs_and_summary",
+                    input=str(self.erba_batch_input_path),
+                    output=str(output),
+                    sheets=sheet_names,
+                    prediction_headers=prediction_headers,
+                    preserved_input_rows=[list(row) for row in input_rows],
+                    metadata=metadata,
+                    graph_directory=str(graph_directory),
+                    graph_files=sorted(graph_files),
+                    binding_count=binding_count,
+                    non_binding_count=non_binding_count,
+                    not_predicted_count=not_predicted_count,
+                    batch_summary=summary,
+                )
+                self.stage = 14
+            if self.stage == 14:
                 self._require(
                     app.eralpha_tab._selected_route("single")
                     == (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA),

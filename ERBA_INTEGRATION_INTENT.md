@@ -4,7 +4,7 @@
 
 This document records the existing ERTA code intent before implementation of the 2026 ERBA work. It is the first product-source change. The pre-change source and installed package were hashed first in `D:\research\FDA_endocrine_disruption\ER_Predictor_evidence\baseline\prechange_manifest.json`.
 
-The existing package at `D:\research\FDA_endocrine_disruption\ERTA_Predictor` is an immutable behavioral oracle. The integrated application is a separate product and must never overwrite or modify it.
+The active source and working tree are at `D:\research\FDA_endocrine_disruption\ER_Predictor_Code`. The archived legacy package at `D:\research\FDA_endocrine_disruption\_archive\legacy_apps\ERTA_Predictor` is an immutable behavioral oracle. The integrated application is a separate product and must never overwrite or modify the archived package.
 
 ## Existing code intention
 
@@ -18,20 +18,20 @@ The current code is a Tkinter desktop application for **estrogen receptor transc
 6. `KerasPredictor` loads the model directly or reconstructs its fixed dense architecture for Keras-version compatibility, then assigns Positive/Negative by the larger softmax probability.
 7. Single prediction renders structure, probabilities, ERTA AD, nearest training reference, and ERTA plots.
 8. Batch prediction reads Excel, preserves identifiers, adds canonical SMILES/validity/probabilities/class, evaluates ERTA AD, writes a workbook, and generates ERTA graphs.
-9. `core.paths.resource_path` resolves PyInstaller resources through `_MEIPASS`; current exports default below `project_root/output`.
+9. `core.paths.resource_path` resolves PyInstaller resources through `_MEIPASS`; in the pre-integration baseline, exports defaulted below `project_root/output`.
 10. `app.spec` bundles the Keras model, AD data, templates, TensorFlow, RDKit, scikit-learn, SciPy, Pillow, and HDF5.
 
 ## ERTA invariants
 
-- ERTA remains startup-selected and keeps its Keras model, legacy fingerprint, probability mapping, labels, decision rule, AD, graphs, examples, batch schema, and filename behavior.
+- ERTA remains startup-selected and keeps its Keras model, legacy fingerprint, probability mapping, labels, decision rule, AD, graphs, examples, batch schema, and base filename pattern. The authoritative input-adjacent publication amendment below controls batch destinations and collision suffixes.
 - Existing model/AD browsing remains ERTA-only.
 - ERTA must not load ERBA joblibs or display direct-binding claims.
 - New ERBA invalid-structure handling must not change historical ERTA behavior.
-- The old packaged `ERTA_Predictor` tree remains unchanged.
+- The archived legacy `ERTA_Predictor` tree remains unchanged.
 
 ## New product intention
 
-Build a separate sibling product named **ER Predictor**, with executable exactly `ER_Predictor.exe` and two FDA-facing top-level tabs:
+Build the separate product named **ER Predictor**, with executable exactly `ER_Predictor.exe` and two FDA-facing top-level tabs:
 
 - **ERTA:** the current single/batch experience, preserved rather than generalized.
 - **ERalpha:** independent single/batch state for direct ERα binding classification.
@@ -85,16 +85,19 @@ A versioned contract shared by adapters, GUI, export, docs, and tests defines ex
 - Outputs include task/subtype, raw/model SMILES, predictions, model/policy IDs and hashes, row status, and evidence caveat.
 - FDA-facing ERalpha exports classification only.
 - ERalpha uses the same AD algorithm and UI structure as ERTA, but only with its own route-specific training reference and cache.
-- Writes are atomic and never silently overwrite existing files.
+- ERalpha workbooks open on the primary `Predictions` worksheet, followed by `Guide`, `Input`, and `Metadata`. `Predictions` starts with collision-safe original input columns in their original order, then trusted binding classification/result/provenance columns, then the nine route-specific AD columns. The untouched source columns remain on `Input`.
+- The ERalpha AD columns are, in order, `AD`, `AD_MeanDistance`, `AD_DistanceThreshold`, `AD_Distance_InDomain`, `AD_SimilarityMax`, `AD_SimilarityThreshold`, `AD_Similarity_InDomain`, `AD_PC1`, and `AD_PC2`. Their values and graph artifacts use only the ERalpha route's training reference, cache, and batch results.
+- ERTA and ERalpha batch workbooks are atomically published beside the selected input workbook. They never overwrite the input or an existing result; an available collision-safe filename is allocated instead.
+- A protected or unwritable input parent is rejected before prediction with clear guidance to copy the input workbook to a writable folder outside the application files and select that copy. Batch publication never silently redirects to another directory.
 
 ## Runtime, GUI, and release boundaries
 
 - Bundled resources and install root are read-only.
-- Logs/cache/state use `%LOCALAPPDATA%\ER_Predictor`; exports use an explicit user-owned directory and never silently redirect.
+- Logs/cache/state and single-prediction plots/exports use writable external user roots under `%LOCALAPPDATA%\ER_Predictor` and `%USERPROFILE%\Documents\ER_Predictor\Exports`. Batch workbooks do not use an independent export root or directory chooser; their sole destination is the selected input workbook's parent.
 - Optional portable writes require an explicit mode and successful probe.
 - ERTA and ERalpha tabs own separate controls/state. Background requests snapshot workflow/task/subtype/model/policy/input and discard stale completions.
 - Build from an isolated pinned Windows environment with resolved dependencies, hashes, SBOM/build manifest, audited assets, and target `ER_Predictor.exe`.
-- Publish only as a new sibling package. Never write beneath the old `ERTA_Predictor` root.
+- Publish only as a separate product. Never write beneath the archived legacy `D:\research\FDA_endocrine_disruption\_archive\legacy_apps\ERTA_Predictor` root.
 
 ## Completion gates
 
@@ -104,15 +107,15 @@ A versioned contract shared by adapters, GUI, export, docs, and tests defines ex
 4. All classification evidence is labeled internal and historically exposed.
 5. ERBA fixtures prove raw input → model SMILES → feature hash → prediction.
 6. FDA-facing routes are limited to ERTA and ERα binding classification; ERβ and regression routes are absent from the UI, shortcuts, release catalog, packaged assets, and installer.
-7. Unit/integration tests cover contracts, preprocessing, integrity, class order, conversion, invalid structures, paths, stale requests, batch order/status, and no ERTA AD/graphs for ERBA.
+7. Unit/integration tests cover contracts, preprocessing, integrity, class order, conversion, invalid structures, paths, stale requests, batch order/status, and strict route isolation for ERTA and ERalpha AD fields/graphs.
 8. Packaged Windows automation covers ERTA default, ERα classification, invalid/mixed batch, ERTA→ERalpha→ERTA isolation, output capture, progress reporting, and shutdown.
 9. Source and packaged predictions match independent golden fixtures.
-10. The final artifact is a separate `ER_Predictor.exe`; the old package still matches its pre-change manifest.
+10. The final artifact is a separate `ER_Predictor.exe`; the archived legacy package still matches its pre-change manifest.
 11. Cleaner, architecture/product/code, QA/red-team, and terminal critic gates are clean.
 
 ## Non-goals
 
-No old-package replacement, ERTA retraining, combined ERTA/ERBA score, general endocrine-disruption claim, FDA-facing ERβ/regression route, external/regulatory claim from current classification data, or arbitrary ERBA model loading.
+No archived legacy-package replacement, ERTA retraining, combined ERTA/ERBA score, general endocrine-disruption claim, FDA-facing ERβ/regression route, external/regulatory claim from current classification data, or arbitrary ERBA model loading.
 
 ## FDA feedback amendment: executable implementation steps
 
@@ -121,19 +124,19 @@ This amendment supersedes earlier UI/release scope where it conflicts. The FDA t
 1. **Scope lock:** retain ERTA and ERalpha only. Remove ERbeta from tabs, shortcuts, native QA, released catalog, packaged model/manifest/AD assets, installer, and user documentation. Keep research artifacts outside the FDA distribution.
 2. **Progress:** add a determinate batch progress bar and text for read, CAS/SMILES resolution, preprocessing/prediction, workbook writing, and terminal success/failure. Worker threads communicate progress through Tk `after`; no widget is updated directly from a worker.
 3. **Explain non-predictions:** keep probability/label columns blank and numeric-safe when no prediction exists, and add bilingual-friendly result status, category, description, and recommended action columns.
-4. **Workbook guidance:** make `Guide` the first worksheet and explain `Predictions`, `Input`, and `Metadata`; include totals and reason counts. Preserve exact machine-readable headers on data sheets. Add filters, frozen headers, widths, wrapped text, and yellow/red outcome highlighting.
-5. **Compatibility:** preserve ERTA behavior, ERalpha model/preprocessing/AD calculations, input precedence, row order, passthrough identifiers, atomic publication, read-only install boundaries, and immutable old ERTA package.
-6. **Validation:** run unit/integration tests, exercise the FDA-provided 504-row workbook, verify progress reaches 100% or a terminal failure, build twice, publish, install to a clean directory, run packaged ERTA/ERalpha QA, uninstall, and re-audit all 10,280 old ERTA files.
+4. **Workbook guidance:** make `Predictions` the first and active worksheet, followed by `Guide`, `Input`, and `Metadata`. `Guide` explains all sheets and includes totals and reason counts. Preserve exact machine-readable headers on data sheets. Add filters, frozen headers, widths, wrapped text, and yellow/red outcome highlighting.
+5. **Compatibility:** preserve ERTA behavior, ERalpha model/preprocessing/AD calculations, input precedence, row order, passthrough identifiers, atomic publication, read-only install boundaries, and the immutable archived legacy ERTA package.
+6. **Validation:** run unit/integration tests, exercise the FDA-provided 504-row workbook, verify progress reaches 100% or a terminal failure, build twice, publish, install to a clean directory, run packaged ERTA/ERalpha QA, uninstall, and re-audit all 10,280 archived legacy ERTA files.
 
 ## FDA usability amendment: batch controls and path consistency
 
 This amendment is applied before the corresponding code changes.
 
-1. ERTA and ERalpha batch pages use the same compact control hierarchy: `Input xlsx`, `Output directory`, `Download template`, and a normal-sized `Run batch` button.
+1. ERTA and ERalpha batch pages use the same compact control hierarchy: `Input xlsx`, a read-only `Result folder (same as input)` display, `Download template`, and a normal-sized `Run batch` button.
 2. `Download template` appears immediately above `Run batch` with the notice that the `CAS` column is the required batch input; direct SMILES remains supported where the workbook contract permits it.
 3. Both pages display determinate progress and a terminal success/failure state.
-4. The output directory shown beside the selector, the directory captured when the run starts, and the directory reported in the result/status areas are one canonical path. Input/output selectors and template actions are disabled for the duration of a batch so the displayed path cannot diverge from the running snapshot.
-5. The result box reports the exact atomically published file path returned by the exporter. Tests cover changed-directory snapshots, control locking, template generation, and path equality.
+4. The displayed result directory is derived from the selected input workbook and is not independently selectable. The input path captured when the run starts, its parent shown in the read-only display, and the directory reported in the result/status areas are one canonical snapshot. Input selection and template actions are disabled for the duration of a batch so the displayed path cannot diverge from the running snapshot.
+5. The result box reports the exact atomically published file path returned by the exporter. Tests cover changed-input snapshots, control locking, template generation, and path equality.
 
 ## FDA usability amendment: batch result simplification
 
@@ -141,6 +144,28 @@ This amendment is applied before the corresponding code changes.
 
 1. Batch applicability-domain graphs are output-file artifacts, not interactive batch-screen content.
 2. The ERTA Batch page follows the ERalpha layout exactly: one full-width input/control box, one progress row directly underneath, one full-width `Prediction result` text box, and one status row.
-3. Remove the ERTA batch preview table, graph selector, refresh button, and in-app batch AD graph panel. Preserve generation of AD columns and graph files in the selected output directory.
+3. Remove the ERTA batch preview table, graph selector, refresh button, and in-app batch AD graph panel. Preserve generation of AD columns and graph files under the input-adjacent `graphs` directory.
 4. The result box contains a concise completion summary: row totals, prediction counts, in/out-domain counts when available, exact workbook path, and graph directory/count. On failure it contains a concise terminal error summary.
-5. Existing single-prediction visualization, batch workbook schema, sorting, model behavior, AD calculations, graph generation, template flow, progress, and canonical path guarantees remain unchanged.
+5. Existing single-prediction visualization, sorting, model behavior, and AD calculations remain unchanged. The authoritative amendments below govern batch workbook layout, graph artifacts, template flow, progress, and canonical paths.
+
+## FDA usability amendment: authoritative input-adjacent batch publication
+
+This amendment supersedes every earlier requirement for an independently selected or configurable batch output directory. It changes publication location and controls only; it does not change the released models, preprocessing, decision rules, applicability-domain calculations, FDA-facing task scope, or evidence limitations.
+
+1. For both ERTA and ERalpha, the selected input workbook's resolved parent directory is the sole destination for the batch result workbook.
+2. The independent batch output-directory chooser is removed. Each batch page instead shows the derived parent path in a read-only field labeled `Result folder (same as input)`.
+3. Before prediction begins, the application must reject a protected or unwritable input parent and instruct the user to copy the input workbook to a writable folder outside application files and select the copy. It must not fall back or silently redirect to `%LOCALAPPDATA%`, Documents, the install root, the source tree, or any other location.
+4. Batch workbook publication remains atomic. It must never overwrite the selected input workbook or any prior result workbook; when the base result name is occupied, it allocates a collision-safe name such as `_2`, `_3`, and so on.
+5. ERTA batch graph artifacts remain under an input-adjacent `graphs` directory. ERalpha batch AD graphs are published in a collision-safe sibling directory named from the result workbook stem (`<workbook-stem>_graphs`, then `_2`, `_3`, and so on when occupied). Single-prediction caches, plots, and exports remain in their writable external user roots and are not moved beside the batch input.
+6. The result summary and terminal status report the exact published workbook path. The displayed destination, captured input parent, exporter destination, and reported path must agree.
+
+## FDA usability amendment: authoritative ERalpha result and AD parity
+
+This amendment supersedes the earlier `Guide`-first rule and any earlier statement that ERalpha batch produces no AD graph artifacts. It adds reporting parity only: no model change or new model release was identified or authorized, and the accepted V7 classification release remains unchanged.
+
+1. The ERalpha workbook sheet order is `Predictions`, `Guide`, `Input`, `Metadata`; `Predictions` is both first and active when the workbook opens. `Guide`, the untouched source `Input`, and release/provenance `Metadata` remain present.
+2. Within `Predictions`, collision-safe original input columns appear first in their original order. Trusted binding classification, status, and provenance columns—including `non_binding_probability`, `binding_probability`, and `binding_label`—follow, then the nine ERalpha AD columns. When a normalized input header collides with a trusted result, status, or AD header, the trusted generated column controls `Predictions`; the untouched original remains available on `Input`.
+3. The nine AD fields, in order, are `AD`, `AD_MeanDistance`, `AD_DistanceThreshold`, `AD_Distance_InDomain`, `AD_SimilarityMax`, `AD_SimilarityThreshold`, `AD_Similarity_InDomain`, `AD_PC1`, and `AD_PC2`. They are computed and graphed only from the ERalpha route-specific training reference, cache, and batch results; ERTA AD state is never substituted.
+4. ERalpha batch AD graphs use binding-specific labels and the input-adjacent, collision-safe graph directory defined above. In the same full-width `Prediction result` placement used by ERTA, the detailed completion summary reports Total, Binding, Non-binding, Not predicted, AD In-domain, AD Out-of-domain, exact workbook path, graph count/directory, and the evidence caveat.
+5. `Binding` and `Non-binding` continue to mean direct ERalpha receptor binding classification only. They do not assert transcriptional activation, agonism, antagonism, signaling, coactivator recruitment, or general endocrine disruption.
+6. The accepted V7 evidence remains an internal resplit/sensitivity evaluation using historically exposed development data. It is not fresh independent, external, temporal, population, regulatory, or regulatory-use validation.

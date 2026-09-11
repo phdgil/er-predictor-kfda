@@ -5,7 +5,12 @@ import sys
 
 import pytest
 
-from core.paths import IMMUTABLE_ERTA_ROOT, resolve_runtime_paths, validate_mutable_directory
+from core.paths import (
+    IMMUTABLE_ARCHIVED_ERTA_ROOT,
+    IMMUTABLE_ERTA_ROOT,
+    resolve_runtime_paths,
+    validate_mutable_directory,
+)
 
 
 def test_default_mutable_roots_are_outside_the_install_tree(monkeypatch, tmp_path):
@@ -61,3 +66,39 @@ def test_user_selected_output_rejects_read_only_and_old_package_roots(tmp_path):
 
     with pytest.raises(RuntimeError, match="immutable ERTA_Predictor"):
         validate_mutable_directory(IMMUTABLE_ERTA_ROOT / "exports")
+
+
+@pytest.mark.parametrize(
+    "legacy_root",
+    (IMMUTABLE_ERTA_ROOT, IMMUTABLE_ARCHIVED_ERTA_ROOT),
+)
+@pytest.mark.parametrize("descendant", (Path(), Path("exports") / "batch"))
+def test_legacy_package_roots_are_rejected_before_probe_creates_them(
+    tmp_path, legacy_root, descendant
+):
+    target = tmp_path / legacy_root / descendant
+
+    with pytest.raises(RuntimeError, match="immutable ERTA_Predictor"):
+        validate_mutable_directory(target)
+
+    assert not target.exists()
+
+
+def test_archived_legacy_package_match_is_case_insensitive_and_component_exact(tmp_path):
+    archived_root = (
+        tmp_path
+        / "fDa_EnDoCrInE_dIsRuPtIoN"
+        / "_ArChIvE"
+        / "LeGaCy_ApPs"
+        / "erta_predictor"
+    )
+    forbidden_target = archived_root / "Exports"
+
+    with pytest.raises(RuntimeError, match="immutable ERTA_Predictor"):
+        validate_mutable_directory(forbidden_target)
+
+    assert not forbidden_target.exists()
+
+    sibling_target = archived_root.parent / "ERTA_Predictor_Backup" / "Exports"
+    assert validate_mutable_directory(sibling_target) == sibling_target.resolve()
+    assert sibling_target.is_dir()

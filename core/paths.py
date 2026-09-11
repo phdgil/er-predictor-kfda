@@ -14,6 +14,10 @@ import tempfile
 PRODUCT = "ER_Predictor"
 PRODUCT_MAJOR = "v1"
 IMMUTABLE_ERTA_ROOT = Path("FDA_endocrine_disruption") / "ERTA_Predictor"
+IMMUTABLE_ARCHIVED_ERTA_ROOT = (
+    Path("FDA_endocrine_disruption") / "_archive" / "legacy_apps" / "ERTA_Predictor"
+)
+IMMUTABLE_ERTA_ROOTS = (IMMUTABLE_ERTA_ROOT, IMMUTABLE_ARCHIVED_ERTA_ROOT)
 
 
 @dataclass(frozen=True)
@@ -35,17 +39,24 @@ def _is_within(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
 def _is_old_package(path: Path) -> bool:
     parts = tuple(part.casefold() for part in _resolved(path).parts)
-    suffix = tuple(part.casefold() for part in IMMUTABLE_ERTA_ROOT.parts)
-    return any(parts[index:index + len(suffix)] == suffix for index in range(len(parts) - len(suffix) + 1))
-
-
+    for immutable_root in IMMUTABLE_ERTA_ROOTS:
+        suffix = tuple(part.casefold() for part in immutable_root.parts)
+        if any(
+            parts[index : index + len(suffix)] == suffix
+            for index in range(len(parts) - len(suffix) + 1)
+        ):
+            return True
+    return False
 
 
 def _reject_old_package(path: Path, label: str) -> None:
     if _is_old_package(path):
         raise RuntimeError(f"{label} must not resolve inside the immutable ERTA_Predictor package.")
+
 
 def validate_mutable_directory(
     path: str | Path,

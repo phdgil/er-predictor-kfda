@@ -2,14 +2,14 @@
 
 ## 제품과 배포 경로
 
-이 제품은 기존 `ERTA_Predictor`와 분리된 one-folder Windows 제품입니다. 빌드 결과와 배포 실행 파일의 정확한 경로는 다음과 같습니다.
+이 제품은 보관된 레거시 `ERTA_Predictor`와 분리된 one-folder Windows 제품입니다. 활성 소스와 작업 루트는 `D:\research\FDA_endocrine_disruption\ER_Predictor_Code`입니다. 빌드 결과와 배포 실행 파일의 정확한 경로는 다음과 같습니다.
 
 ```text
 dist\ER_Predictor\ER_Predictor.exe
 D:\research\FDA_endocrine_disruption\ER_Predictor\ER_Predictor\ER_Predictor.exe
 ```
 
-기존 `D:\research\FDA_endocrine_disruption\ERTA_Predictor`는 변경 불가한 롤백 패키지입니다. 이 제품의 빌드/게시 스크립트는 해당 경로를 대상 또는 작업 루트로 받지 않습니다.
+보관된 `D:\research\FDA_endocrine_disruption\_archive\legacy_apps\ERTA_Predictor`는 변경 불가한 레거시 롤백 패키지입니다. 이 제품의 빌드/게시 스크립트는 해당 경로를 대상 또는 작업 루트로 받지 않습니다.
 
 ## K-FDA 사용자 PC 설치
 
@@ -23,7 +23,7 @@ installer\ER_Predictor_Setup_x64.exe
 2. 기본 설치 경로는 `C:\Program Files\ER Predictor`입니다.
 3. 시작 메뉴의 **ER Predictor**를 실행합니다.
 4. 직접 SMILES 예측은 완전히 오프라인입니다. CAS→SMILES 조회에만 인터넷이 필요합니다.
-5. 상태/캐시는 `%LOCALAPPDATA%\ER_Predictor\v1`, 결과는 `%USERPROFILE%\Documents\ER_Predictor\Exports`에 저장됩니다.
+5. 상태/캐시는 `%LOCALAPPDATA%\ER_Predictor\v1`, 단일 예측의 플롯/내보내기는 `%USERPROFILE%\Documents\ER_Predictor\Exports`에 저장됩니다. ERTA와 ERalpha batch 결과 workbook은 선택한 입력 파일과 같은 폴더에 저장됩니다.
 
 기관 배포 전 `installer\ER_Predictor_Setup_x64.sha256.json`의 SHA-256을 전달 파일과 대조하고, 기관 코드서명 인증서가 있으면 설치 파일에 Authenticode 서명을 추가하십시오. 서명되지 않은 내부 빌드는 Windows SmartScreen 경고가 발생할 수 있습니다.
 
@@ -32,8 +32,13 @@ installer\ER_Predictor_Setup_x64.exe
 - 시작 탭은 **ERTA**이며 기존 ERTA 분류, AD, 그래프 흐름을 유지합니다.
 - **ERalpha** 탭은 FDA 요청 범위인 ERα 결합 분류만 제공합니다. ERβ와 회귀 모델은 FDA 배포 화면과 설치 파일에서 제외됩니다.
 - ERalpha 분류는 승인된 0.5 기준과 직접 결합 확률/라벨을 사용합니다.
+- `Binding`과 `Non-binding`은 직접 ERα 수용체 결합 분류만 뜻합니다. 전사 활성, 작용제/길항제 활성, 신호 전달, 공동활성인자 모집 또는 일반 내분비계 장애를 뜻하지 않습니다.
 - ERalpha AD는 ERTA와 같은 계산 코드를 사용하지만 ERα 전용 학습 참조와 캐시만 사용합니다.
-- Batch 결과 파일의 `Guide` 시트는 각 탭, 빈 예측값, 제외 사유와 권장 조치를 설명합니다. `Predictions`의 확률/라벨이 빈 행은 `Result_Status`, `Reason_Category`, `Reason_Description`, `Recommended_Action`을 확인하십시오.
+- ERalpha batch 결과 workbook은 `Predictions`, `Guide`, `Input`, `Metadata` 순서이며, 열 때 `Predictions`가 첫 시트이자 활성 시트입니다. `Guide`, 변경하지 않은 원본 `Input`, 추적용 `Metadata`도 그대로 유지됩니다.
+- `Predictions`에는 원본 입력 열이 원래 순서대로 먼저 나오고, `non_binding_probability`, `binding_probability`, `binding_label`을 포함한 신뢰된 결합 분류 결과/상태/모델 추적 열과 ERalpha 전용 AD 열 9개가 이어집니다. 이름을 정규화했을 때 입력 열과 결과 열이 충돌하면 신뢰된 결과 열을 사용하며, 원본 값과 머리글은 `Input` 시트에서 확인할 수 있습니다.
+- ERalpha AD 열은 `AD`, `AD_MeanDistance`, `AD_DistanceThreshold`, `AD_Distance_InDomain`, `AD_SimilarityMax`, `AD_SimilarityThreshold`, `AD_Similarity_InDomain`, `AD_PC1`, `AD_PC2`입니다. 모두 ERalpha 경로의 학습 참조와 캐시로 계산하며 ERTA AD 데이터를 섞지 않습니다.
+- `Guide`는 각 시트, 빈 예측값, 제외 사유와 권장 조치를 설명합니다. `Predictions`의 확률/라벨이 빈 행은 `Result_Status`, `Reason_Category`, `Reason_Description`, `Recommended_Action`을 확인하십시오.
+- 이 workbook/AD 보고 개선을 위해 새 모델을 도입하거나 승인하지 않았습니다. 기존에 승인된 V7 ERalpha 분류 모델과 그 과학적 한계가 그대로 적용됩니다.
 
 **ERBA 분류 근거는 과거에 노출된 개발 행을 사용한 내부 평가입니다. 신선한 독립/외부/시간적/모집단 검증 또는 규제 검증이 아니며, 규제 용도로 사용할 수 없습니다.**
 
@@ -42,9 +47,15 @@ installer\ER_Predictor_Setup_x64.exe
 - 모든 지원 경로에서 직접 SMILES 입력은 오프라인으로 동작합니다.
 - CAS 조회만 인터넷이 필요합니다. 조회 실패가 이미 유효한 SMILES를 덮어쓰지 않습니다.
 - 기존 ERTA 입력은 변경하지 말고 `templates\ERTA_KRICT_example.xlsx`를 사용합니다.
-- 결합 예시는 `templates\ERTA_ERBA_example.xlsx`입니다. 첫 시트 **ERBA_Input**은 ERBA 입력용이며 정확히 `Row_ID`, `CAS`, `SMILES` 열을 사용합니다. 두 번째 **ERTA_Input**은 `CID`, `CAS`, `SMILES`, `label` 열을 보여 줍니다. 레거시 ERTA batch에 넣을 때는 이 시트를 별도 workbook으로 내보내십시오.
+- 결합 예시는 `templates\ERTA_ERBA_example.xlsx`입니다. 첫 시트 **ERBA_Input**은 ERBA 입력용이며 정확히 `Row_ID`, `CAS`, `SMILES` 열을 사용합니다. 두 번째 **ERTA_Input**은 `CID`, `CAS`, `SMILES`, `label` 열을 보여 줍니다. ERTA batch에 넣을 때는 이 시트를 별도 workbook으로 내보내십시오.
 
-설치 폴더와 묶인 자원은 읽기 전용입니다. 기본 상태 저장소는 `%LOCALAPPDATA%\ER_Predictor\v1`, export 저장소는 `%USERPROFILE%\Documents\ER_Predictor\Exports`입니다. 명시적으로 쓰기 가능한 portable 설치에서만 실행 전 `ER_PREDICTOR_PORTABLE=1`을 설정하면 실행 파일 옆 `ER_Predictor_UserData\state`와 `Exports`를 사용합니다. 어떤 경우에도 `ERTA_Predictor` 아래를 출력 위치로 사용하지 마십시오.
+- ERTA와 ERalpha batch 페이지에는 별도의 출력 폴더 선택기가 없습니다. 입력 workbook을 선택하면 읽기 전용 **Result folder (same as input)** 항목에 입력 파일의 폴더가 표시되고, 결과 workbook은 항상 그 폴더에 원자적으로 게시됩니다. ERTA batch 그래프는 같은 위치의 `graphs` 하위 폴더에 저장됩니다.
+- ERalpha batch AD 그래프는 ERalpha 경로의 AD 데이터와 Binding/Non-binding 의미만 사용하고, 결과 workbook 옆의 충돌 방지 폴더 `<workbook-stem>_graphs`에 저장됩니다. 같은 이름이 이미 있으면 `_2`, `_3` 접미사를 사용하여 이전 그래프 폴더를 덮어쓰지 않습니다.
+- ERalpha batch 완료 요약은 ERTA와 같은 `Prediction result` 영역에 표시되며 전체 행, Binding, Non-binding, 예측하지 못한 행, AD In-domain/Out-of-domain 수, 정확한 workbook 경로, 그래프 수/폴더 및 내부 평가 근거의 한계를 포함합니다.
+- 입력 파일의 상위 폴더가 보호되어 있거나 쓰기 불가능하면 예측을 시작하지 않고, 입력 workbook을 응용 프로그램 설치 폴더 밖의 쓰기 가능한 폴더로 복사한 뒤 다시 선택하라는 안내와 함께 실패합니다. 다른 위치로 자동 전환하지 않습니다.
+- 입력 workbook과 이전 batch 결과 workbook은 절대 덮어쓰지 않습니다. 같은 결과 이름이 이미 있으면 `_2`, `_3`처럼 충돌하지 않는 이름을 사용합니다.
+
+설치 폴더와 묶인 자원은 읽기 전용입니다. 기본 상태 저장소는 `%LOCALAPPDATA%\ER_Predictor\v1`, 단일 예측 플롯/내보내기 저장소는 `%USERPROFILE%\Documents\ER_Predictor\Exports`입니다. 명시적으로 쓰기 가능한 portable 설치에서만 실행 전 `ER_PREDICTOR_PORTABLE=1`을 설정하면 실행 파일 옆 `ER_Predictor_UserData\state`와 `Exports`를 사용합니다. 이 외부 사용자 저장소 설정은 batch 결과 위치를 변경하지 않습니다. Batch 결과는 portable 모드에서도 선택한 입력 파일 옆에 저장됩니다. 어떤 경우에도 보관된 `D:\research\FDA_endocrine_disruption\_archive\legacy_apps\ERTA_Predictor` 아래를 출력 위치로 사용하지 마십시오.
 
 ## 빌드 PC 준비
 
@@ -82,4 +93,4 @@ build_installer.bat
 publish_exe.bat
 ```
 
-스크립트는 전체 one-folder collection을 새 루트에 staging하고 실행 파일을 검사한 뒤 원자적으로 정확한 게시 경로에만 승격합니다. 게시 전후 기존 `ERTA_Predictor`의 재귀 manifest를 비교하여 변경을 감지하면 실패합니다. 기존 ERTA 패키지는 절대 복사 대상이나 게시 대상이 아니며 수정하지 않습니다.
+스크립트는 전체 one-folder collection을 새 루트에 staging하고 실행 파일을 검사한 뒤 원자적으로 정확한 게시 경로에만 승격합니다. 게시 전후 보관된 `D:\research\FDA_endocrine_disruption\_archive\legacy_apps\ERTA_Predictor`의 재귀 manifest를 비교하여 변경을 감지하면 실패합니다. 레거시 ERTA 패키지는 절대 복사 대상이나 게시 대상이 아니며 수정하지 않습니다.

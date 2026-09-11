@@ -17,9 +17,13 @@ BUILD_MANIFEST = ARTIFACTS / "ER_Predictor-build-manifest.json"
 BASELINE_MANIFEST = Path(
     r"D:/research/FDA_endocrine_disruption/ER_Predictor_evidence/baseline/prechange_manifest.json"
 )
-IMMUTABLE_OLD = Path(r"D:/research/FDA_endocrine_disruption/ERTA_Predictor")
+BASELINE_ORIGINAL_OLD = Path(r"D:/research/FDA_endocrine_disruption/ERTA_Predictor")
+IMMUTABLE_OLD = Path(
+    r"D:/research/FDA_endocrine_disruption/_archive/legacy_apps/ERTA_Predictor"
+)
 PUBLISH_ROOT = Path(r"D:/research/FDA_endocrine_disruption/ER_Predictor")
 PUBLISHED = PUBLISH_ROOT / "ER_Predictor"
+ROLLBACK_ROOT = PUBLISH_ROOT / "_archive"
 RECEIPT = ARTIFACTS / "ER_Predictor-publication-receipt.json"
 
 
@@ -78,9 +82,24 @@ def expected_distribution() -> list[tuple[str, int, str]]:
 
 def approved_old_baseline() -> list[tuple[str, int, str]]:
     baseline = json.loads(BASELINE_MANIFEST.read_text(encoding="utf-8"))
-    if Path(baseline.get("existing_package_root", "")).resolve() != IMMUTABLE_OLD.resolve():
+    approved_root = BASELINE_ORIGINAL_OLD.resolve(strict=False)
+    declared_root = Path(baseline.get("existing_package_root", "")).resolve(strict=False)
+    if declared_root != approved_root:
         raise RuntimeError("approved baseline does not identify the immutable ERTA tree")
-    return canonical(baseline.get("existing_package_files", []), size_key="size")
+    scoped_items = []
+    for item in baseline.get("existing_package_files", []):
+        declared_path = Path(str(item.get("path", "")))
+        candidate = declared_path if declared_path.is_absolute() else approved_root / declared_path
+        try:
+            relative_path = candidate.resolve(strict=False).relative_to(approved_root)
+        except ValueError as error:
+            raise RuntimeError(
+                f"approved baseline path is outside the original immutable ERTA root: {declared_path}"
+            ) from error
+        if relative_path == Path("."):
+            raise RuntimeError("approved baseline contains an empty file path")
+        scoped_items.append({**item, "path": relative_path.as_posix()})
+    return canonical(scoped_items, size_key="size")
 
 
 def main() -> None:
@@ -112,8 +131,9 @@ def main() -> None:
 
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     PUBLISH_ROOT.mkdir(parents=True, exist_ok=True)
+    ROLLBACK_ROOT.mkdir(parents=True, exist_ok=True)
     stage = PUBLISH_ROOT / f".ER_Predictor.staging.{uuid.uuid4().hex}"
-    backup = PUBLISH_ROOT / (
+    backup = ROLLBACK_ROOT / (
         "ER_Predictor.rollback." + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     )
     promoted = False

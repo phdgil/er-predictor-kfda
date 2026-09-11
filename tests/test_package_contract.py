@@ -132,9 +132,14 @@ def test_publication_is_fixed_atomic_and_baseline_gated():
     assert "accepts no destination or positional arguments" in batch
     for required in (
         "D:/research/FDA_endocrine_disruption/ER_Predictor",
-        "D:/research/FDA_endocrine_disruption/ERTA_Predictor",
+        'BASELINE_ORIGINAL_OLD = Path(r"D:/research/FDA_endocrine_disruption/ERTA_Predictor")',
+        "D:/research/FDA_endocrine_disruption/_archive/legacy_apps/ERTA_Predictor",
+        'ROLLBACK_ROOT = PUBLISH_ROOT / "_archive"',
+        "backup = ROLLBACK_ROOT / (",
         "prechange_manifest.json",
         "existing_package_files",
+        "relative_to(approved_root)",
+        "old_before == old_after == old_baseline",
         "source distribution differs from the audited build manifest",
         "staged distribution differs from the build manifest",
         "published distribution differs from the build manifest",

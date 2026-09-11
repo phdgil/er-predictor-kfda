@@ -12,6 +12,7 @@ def main():
     event_log = EventLog(paths.state_root)
     app = MainWindow(
         project_root=str(paths.resource_root),
+        install_root=str(paths.install_root),
         output_root=str(paths.export_root),
         state_root=str(paths.state_root),
         event_log=event_log,

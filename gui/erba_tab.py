@@ -2,18 +2,24 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 import json
 import os
+import shutil
 import tempfile
 import threading
 import re
 import time
-from dataclasses import asdict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from typing import Callable
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -45,7 +51,7 @@ from core.contracts import (
 )
 from core.erba_predictor import ERBAPredictor
 from core.erba_ad import ERBAApplicabilityDomain
-from core.graph import save_single_ad_plot
+from core.graph import save_ad_decision_plot, save_ad_plot, save_single_ad_plot
 from core.molecule_image import save_molecule_image
 from core.pubchem import cas_to_smiles
 from core.paths import validate_mutable_directory
@@ -58,6 +64,41 @@ except Exception:
 
 _RELEASED = "released"
 _CAS_PATTERN = re.compile(r"^\d{2,7}-\d{2}-\d$")
+_RESOURCE_ROOT = Path(__file__).resolve().parents[1]
+ERBA_BATCH_AD_COLUMNS = (
+    "AD",
+    "AD_MeanDistance",
+    "AD_DistanceThreshold",
+    "AD_Distance_InDomain",
+    "AD_SimilarityMax",
+    "AD_SimilarityThreshold",
+    "AD_Similarity_InDomain",
+    "AD_PC1",
+    "AD_PC2",
+)
+
+
+@dataclass(frozen=True)
+class ERBABatchExportResult:
+    destination: Path
+    count: int
+    binding_count: int
+    non_binding_count: int
+    not_predicted_count: int
+    ad_in_domain_count: int
+    ad_out_of_domain_count: int
+    ad_unavailable_count: int
+    graph_paths: tuple[Path, ...]
+    graph_directory: Path | None
+    graph_error: str = ""
+    ad_error: str = ""
+
+
+def batch_destination_display(input_path: str | Path) -> str:
+    """Describe the fixed batch destination without probing or creating directories."""
+    if not str(input_path).strip():
+        return "Select an input workbook; the result workbook is saved in the same folder."
+    return str(Path(input_path).expanduser().resolve(strict=False).parent)
 
 
 def load_erba_catalog(path: str | Path):
@@ -161,6 +202,181 @@ def canonicalize_batch_input(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
             if target in canonical else ""
         )
     return canonical_rows.loc[:, ERBA_CANONICAL_INPUT_COLUMNS].copy(), frame.copy()
+
+
+def _normalized_header(value) -> str:
+    return re.sub(r"\s+", " ", str(value).strip()).casefold()
+
+
+def build_primary_predictions(
+    input_rows: pd.DataFrame,
+    trusted_predictions: pd.DataFrame,
+    ad_rows: pd.DataFrame,
+) -> pd.DataFrame:
+    """Prefix safe input fields while preventing them from spoofing trusted output fields."""
+    if not (len(input_rows) == len(trusted_predictions) == len(ad_rows)):
+        raise ValueError("ERBA batch result rows are not aligned.")
+    reserved = {
+        _normalized_header(column)
+        for column in (*trusted_predictions.columns, *ad_rows.columns)
+    }
+    used = set(reserved)
+    passthrough = []
+    for position, header in enumerate(input_rows.columns):
+        normalized = _normalized_header(header)
+        if normalized in reserved:
+            continue
+        base = str(header).strip() or f"Input_{position + 1}"
+        candidate = base
+        suffix = 2
+        while _normalized_header(candidate) in used:
+            candidate = f"{base}_input_{suffix}"
+            suffix += 1
+        used.add(_normalized_header(candidate))
+        passthrough.append(
+            input_rows.iloc[:, position].reset_index(drop=True).rename(candidate)
+        )
+    passthrough_frame = (
+        pd.concat(passthrough, axis=1)
+        if passthrough
+        else pd.DataFrame(index=range(len(input_rows)))
+    )
+    return pd.concat(
+        (
+            passthrough_frame,
+            trusted_predictions.reset_index(drop=True),
+            ad_rows.reset_index(drop=True),
+        ),
+        axis=1,
+    )
+
+
+def _blank_ad_row() -> dict[str, object]:
+    return {column: "" for column in ERBA_BATCH_AD_COLUMNS}
+
+
+def _ad_result_row(ad_result) -> dict[str, object]:
+    if not getattr(ad_result, "fitted", False) or ad_result.in_domain is None:
+        raise RuntimeError(getattr(ad_result, "message", "") or "AD evaluation is unavailable.")
+    return {
+        "AD": "In-domain" if ad_result.in_domain else "Out-of-domain",
+        "AD_MeanDistance": ad_result.distance,
+        "AD_DistanceThreshold": ad_result.threshold,
+        "AD_Distance_InDomain": ad_result.distance_in_domain,
+        "AD_SimilarityMax": ad_result.max_similarity,
+        "AD_SimilarityThreshold": ad_result.similarity_threshold,
+        "AD_Similarity_InDomain": ad_result.similarity_in_domain,
+        "AD_PC1": ad_result.pc1,
+        "AD_PC2": ad_result.pc2,
+    }
+
+
+def allocate_graph_directory(destination: str | Path) -> Path:
+    """Reserve a batch-specific graph directory without reusing prior artifacts."""
+    workbook = Path(destination)
+    base = workbook.parent / f"{workbook.stem}_graphs"
+    for index in range(1, 10000):
+        suffix = "" if index == 1 else f"_{index}"
+        candidate = base.with_name(f"{base.name}{suffix}")
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError("Could not allocate a non-overwriting ERBA graph directory.")
+
+
+def _binding_display_label(value) -> str:
+    normalized = str(value or "").strip().replace("-", "_").replace(" ", "_").casefold()
+    if normalized == "binding":
+        return "Binding"
+    if normalized in {"non_binding", "nonbinding"}:
+        return "Non-binding"
+    return ""
+
+
+def _graph_row_label(row: pd.Series) -> str:
+    for column in ("CAS", "Row_ID", "model_smiles", "raw_smiles"):
+        value = str(row.get(column, "") or "").strip()
+        if value and value.casefold() != "nan":
+            return value[:24]
+    return "-"
+
+
+def save_erba_batch_graphs(
+    predictions: pd.DataFrame,
+    destination: str | Path,
+    calculator,
+    fingerprints: np.ndarray,
+) -> tuple[tuple[Path, ...], Path]:
+    """Write binding-labelled graphs using only aligned ERBA AD-success rows."""
+    if calculator is None or not getattr(calculator, "fitted", False):
+        raise RuntimeError("The route-specific ERBA AD calculator is unavailable.")
+    matrix = np.asarray(fingerprints, dtype=float)
+    if matrix.ndim != 2 or len(matrix) != len(predictions) or not len(predictions):
+        raise ValueError("ERBA graph rows and AD fingerprints are not aligned.")
+
+    directory = allocate_graph_directory(destination)
+    paths: list[Path] = []
+    try:
+        labels = predictions["binding_label"].map(_binding_display_label)
+        counts = labels.value_counts().reindex(("Non-binding", "Binding"), fill_value=0)
+        figure, axis = plt.subplots(figsize=(5, 3.5))
+        axis.bar(counts.index, counts.values)
+        axis.set_ylabel("Count")
+        axis.set_title("ERalpha direct-binding class count")
+        for index, value in enumerate(counts.values):
+            axis.text(index, value, str(int(value)), ha="center", va="bottom")
+        figure.tight_layout()
+        path = directory / "binding_class_count.png"
+        figure.savefig(path, dpi=150)
+        plt.close(figure)
+        paths.append(path)
+
+        probabilities = pd.to_numeric(
+            predictions["binding_probability"], errors="coerce"
+        ).dropna()
+        figure, axis = plt.subplots(figsize=(5, 3.5))
+        axis.hist(probabilities, bins=20)
+        axis.set_xlabel("Binding probability")
+        axis.set_ylabel("Count")
+        axis.set_title("ERalpha binding-probability distribution")
+        figure.tight_layout()
+        path = directory / "binding_probability_histogram.png"
+        figure.savefig(path, dpi=150)
+        plt.close(figure)
+        paths.append(path)
+
+        top = predictions.assign(
+            _binding_probability=pd.to_numeric(
+                predictions["binding_probability"], errors="coerce"
+            )
+        ).dropna(subset=["_binding_probability"])
+        top = top.sort_values("_binding_probability", ascending=False).head(10)
+        top_labels = [_graph_row_label(row) for _, row in top.iterrows()]
+        figure, axis = plt.subplots(figsize=(6, 4))
+        axis.barh(
+            top_labels[::-1],
+            top["_binding_probability"].to_numpy()[::-1],
+        )
+        axis.set_xlabel("Binding probability")
+        axis.set_title(f"Top {len(top)} predicted ERalpha binders")
+        axis.set_xlim(0, 1)
+        figure.tight_layout()
+        path = directory / "top_binding_chemicals.png"
+        figure.savefig(path, dpi=150)
+        plt.close(figure)
+        paths.append(path)
+
+        paths.append(Path(save_ad_plot(calculator, matrix, predictions, str(directory))))
+        paths.append(
+            Path(save_ad_decision_plot(calculator, matrix, predictions, str(directory)))
+        )
+        return tuple(paths), directory
+    except Exception:
+        plt.close("all")
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
 
 
 def excel_contract_id(task: ERBATask) -> str:
@@ -287,19 +503,96 @@ def _progress(callback, stage: str, current: int, total: int, percent: int) -> N
         callback(stage, current, total, percent)
 
 
-def _format_workbook(writer, predictions: pd.DataFrame, input_rows: pd.DataFrame, metadata: pd.DataFrame) -> None:
+def _format_workbook(
+    writer,
+    predictions: pd.DataFrame,
+    input_rows: pd.DataFrame,
+    metadata: pd.DataFrame,
+    task: ERBATask,
+    graph_paths: tuple[Path, ...],
+    graph_directory: Path | None,
+    graph_error: str,
+    ad_error: str,
+) -> None:
     """Apply readable presentation without changing data-sheet headers or values."""
+    classification = task is ERBATask.CLASSIFICATION
     guide_rows = [
-        ("ERalpha batch prediction guide", "ERalpha direct receptor-binding classification output."),
-        ("Predictions", "One row per input row. Numeric probabilities and labels are blank when Result_Status is Not predicted."),
+        (
+            "ERalpha batch prediction guide",
+            "ERalpha direct receptor-binding classification output."
+            if classification
+            else "ERalpha direct receptor-binding potency output.",
+        ),
+        (
+            "Predictions",
+            "Primary input-first result table. Original fields that do not collide with trusted "
+            "result fields appear first, followed by validated prediction and applicability-domain fields.",
+        ),
+        (
+            "Unavailable predictions",
+            (
+                "Binding probabilities, binding label, and AD values are blank when Result_Status is Not predicted; "
+                "the reason and recommended action remain on the same row."
+                if classification
+                else "pIC50 and IC50 values are blank when Result_Status is Not predicted; "
+                "the reason and recommended action remain on the same row."
+            ),
+        ),
+        (
+            "Applicability domain",
+            (
+                "AD fields use only the bundled reference for this ERBA route. AD can be Unavailable without "
+                "changing a successful binding prediction."
+                if classification
+                else "Batch AD fields are not part of this regression workbook contract."
+            ),
+        ),
         ("Input", "Original first-sheet input, retained in its original row order."),
         ("Metadata", "Model identity, integrity hashes, and evidence caveat for this export."),
-        ("Caveat", HISTORICAL_EXPOSURE_CAVEAT_FULL),
+        ("Graph files", str(len(graph_paths))),
+        (
+            "Graph directory",
+            str(graph_directory) if graph_directory is not None else "Not generated",
+        ),
+        (
+            "Graph warning",
+            ""
+            if graph_paths
+            else (
+                graph_error or "No route-specific AD rows were available."
+                if classification
+                else "Graphs are not generated for this regression task."
+            ),
+        ),
+        (
+            "Caveat",
+            HISTORICAL_EXPOSURE_CAVEAT_FULL
+            if classification
+            else REGRESSION_EVIDENCE_CAVEAT_FULL,
+        ),
         ("Total rows", str(len(predictions))),
         ("Predicted rows", str((predictions["Result_Status"] == "Predicted").sum())),
         ("Not predicted rows", str((predictions["Result_Status"] != "Predicted").sum())),
         ("Reason counts", "Counts below include not-predicted categories only."),
     ]
+    if "binding_label" in predictions:
+        labels = predictions["binding_label"].map(_binding_display_label)
+        guide_rows.extend(
+            (
+                ("Binding rows", str((labels == "Binding").sum())),
+                ("Non-binding rows", str((labels == "Non-binding").sum())),
+            )
+        )
+    if "AD" in predictions:
+        guide_rows.extend(
+            (
+                ("AD In-domain rows", str((predictions["AD"] == "In-domain").sum())),
+                ("AD Out-of-domain rows", str((predictions["AD"] == "Out-of-domain").sum())),
+                ("AD Unavailable rows", str((predictions["AD"] == "Unavailable").sum())),
+            )
+        )
+    if ad_error:
+        guide_rows.append(("AD evaluation warning", ad_error))
     for category, count in (
         predictions.loc[predictions["Result_Status"] != "Predicted", "Reason_Category"]
         .value_counts()
@@ -316,8 +609,8 @@ def _format_workbook(writer, predictions: pd.DataFrame, input_rows: pd.DataFrame
     warning_fill = PatternFill("solid", fgColor="FFF2CC")
     fatal_fill = PatternFill("solid", fgColor="F4CCCC")
     for sheet_name, frame in (
-        (ERBA_GUIDE_SHEET_NAME, pd.DataFrame(guide_rows)),
         (ERBA_PREDICTIONS_SHEET_NAME, predictions),
+        (ERBA_GUIDE_SHEET_NAME, pd.DataFrame(guide_rows)),
         (ERBA_INPUT_SHEET_NAME, input_rows),
         (ERBA_METADATA_SHEET_NAME, metadata),
     ):
@@ -352,30 +645,41 @@ def _format_workbook(writer, predictions: pd.DataFrame, input_rows: pd.DataFrame
                     for cell in sheet[row]:
                         cell.fill = fill
     writer.book._sheets = [
-        writer.book[ERBA_GUIDE_SHEET_NAME],
         writer.book[ERBA_PREDICTIONS_SHEET_NAME],
+        writer.book[ERBA_GUIDE_SHEET_NAME],
         writer.book[ERBA_INPUT_SHEET_NAME],
         writer.book[ERBA_METADATA_SHEET_NAME],
     ]
+    writer.book.active = writer.book[ERBA_PREDICTIONS_SHEET_NAME]
+
+
 def export_erba_batch(
     input_path: str | Path,
-    output_dir: str | Path,
     task: ERBATask,
     subtype: ERBASubtype,
     predictor: ERBAPredictor,
+    erba_ad: ERBAApplicabilityDomain,
     spec: ERBAArtifactSpec,
     catalog_payload: dict,
     progress_callback: Callable[[str, int, int, int], None] | None = None,
-) -> tuple[Path, int]:
-    """Predict a first-sheet ERBA workbook and atomically publish a new result workbook."""
+    *,
+    forbidden_roots: tuple[str | Path, ...] = (),
+) -> ERBABatchExportResult:
+    """Predict an ERBA workbook and publish a new result beside that input workbook."""
     _progress(progress_callback, "Reading input workbook", 0, 0, 0)
-    output_dir = validate_mutable_directory(output_dir)
+    source = Path(input_path).expanduser().resolve(strict=False)
+    if not source.is_file():
+        raise FileNotFoundError(f"ERBA batch input does not exist: {source}")
+    output_dir = validate_mutable_directory(
+        source.parent,
+        forbidden_roots=(_RESOURCE_ROOT, *forbidden_roots),
+    )
     preflight = predictor.preflight(task, subtype)
     if not preflight.ready:
         raise RuntimeError(
             f"ERBA route preflight failed ({preflight.status_code.value}): {preflight.status_message}"
         )
-    frame = read_batch_input(input_path)
+    frame = read_batch_input(source)
     if frame.empty:
         raise ValueError("ERBA batch input has no rows; no output was published.")
     canonical_rows, input_rows = canonicalize_batch_input(frame)
@@ -396,9 +700,15 @@ def export_erba_batch(
                 except Exception as error:
                     lookup_error = f"CAS lookup failed: {error}"
         resolved_rows.append((position, row_id, cas, smiles, lookup_error))
-        _progress(progress_callback, "Resolving CAS/SMILES", position + 1, total, 10 + int(30 * (position + 1) / total))
+        _progress(
+            progress_callback,
+            "Resolving CAS/SMILES",
+            position + 1,
+            total,
+            10 + int(25 * (position + 1) / total),
+        )
     results = []
-    _progress(progress_callback, "Predicting", 0, total, 40)
+    _progress(progress_callback, "Predicting", 0, total, 35)
     for position, row_id, cas, smiles, lookup_error in resolved_rows:
         if lookup_error:
             result = predictor.predict(ERBARequest("", task, subtype, position))
@@ -410,7 +720,13 @@ def export_erba_batch(
         else:
             result = predictor.predict(ERBARequest(smiles, task, subtype, position))
         results.append((result, row_id, cas))
-        _progress(progress_callback, "Predicting", position + 1, total, 40 + int(45 * (position + 1) / total))
+        _progress(
+            progress_callback,
+            "Predicting",
+            position + 1,
+            total,
+            35 + int(35 * (position + 1) / total),
+        )
 
     if fatal_artifact_failure([result for result, _, _ in results]):
         raise RuntimeError("ERBA artifact validation failed; no output was published.")
@@ -420,15 +736,84 @@ def export_erba_batch(
         if task is ERBATask.CLASSIFICATION
         else ERBA_REGRESSION_PREDICTION_COLUMNS
     )
-    predictions = pd.DataFrame(
+    trusted_predictions = pd.DataFrame(
         [result_row(result, task, row_id, cas) for result, row_id, cas in results],
         columns=prediction_columns,
     )
+
+    ad_rows = [_blank_ad_row() for _ in range(total)]
+    ad_errors = []
+    ad_positions = []
+    ad_fingerprints = []
+    graph_calculator = None
+    _progress(progress_callback, "Evaluating applicability domain", 0, total, 70)
+    for current, (result, row_id, _) in enumerate(results, 1):
+        if (
+            task is ERBATask.CLASSIFICATION
+            and subtype is ERBASubtype.ER_ALPHA
+            and result.status_code is ERBAStatusCode.OK
+        ):
+            try:
+                calculator, ad_result, fingerprint = erba_ad.evaluate(
+                    task,
+                    subtype,
+                    result.model_smiles or "",
+                )
+                ad_rows[current - 1] = _ad_result_row(ad_result)
+                graph_calculator = graph_calculator or calculator
+                ad_positions.append(current - 1)
+                ad_fingerprints.append(
+                    np.asarray(fingerprint, dtype=float).reshape(1, -1)
+                )
+            except Exception as error:
+                ad_rows[current - 1]["AD"] = "Unavailable"
+                ad_errors.append(f"Row {row_id or current}: {error}")
+        _progress(
+            progress_callback,
+            "Evaluating applicability domain",
+            current,
+            total,
+            70 + int(18 * current / total),
+        )
+
+    ad_frame = pd.DataFrame(ad_rows, columns=ERBA_BATCH_AD_COLUMNS)
+    predictions = (
+        build_primary_predictions(input_rows, trusted_predictions, ad_frame)
+        if task is ERBATask.CLASSIFICATION
+        and subtype is ERBASubtype.ER_ALPHA
+        else trusted_predictions
+    )
+    unique_ad_errors = list(dict.fromkeys(ad_errors))
+    ad_error = "; ".join(unique_ad_errors[:3])
+    if len(unique_ad_errors) > 3:
+        ad_error += f"; and {len(unique_ad_errors) - 3} more row(s)"
+
     destination = allocate_output_path(output_dir, task, subtype)
-    _progress(progress_callback, "Writing workbook", total, total, 90)
-    temp_fd, temp_name = tempfile.mkstemp(suffix=".xlsx", dir=str(destination.parent))
-    os.close(temp_fd)
+    graph_paths: tuple[Path, ...] = ()
+    graph_directory = None
+    graph_error = ""
+    if ad_positions:
+        try:
+            graph_predictions = predictions.iloc[ad_positions].reset_index(drop=True)
+            graph_paths, graph_directory = save_erba_batch_graphs(
+                graph_predictions,
+                destination,
+                graph_calculator,
+                np.vstack(ad_fingerprints),
+            )
+        except Exception as error:
+            graph_error = str(error)
+    elif task is ERBATask.CLASSIFICATION and subtype is ERBASubtype.ER_ALPHA:
+        graph_error = (
+            "No rows had an available route-specific AD evaluation; "
+            "binding graphs were not generated."
+        )
+
+    temp_name = None
     try:
+        _progress(progress_callback, "Writing workbook", total, total, 90)
+        temp_fd, temp_name = tempfile.mkstemp(suffix=".xlsx", dir=str(destination.parent))
+        os.close(temp_fd)
         with pd.ExcelWriter(temp_name, engine="openpyxl") as writer:
             predictions.to_excel(writer, sheet_name=ERBA_PREDICTIONS_SHEET_NAME, index=False)
             input_rows.to_excel(writer, sheet_name=ERBA_INPUT_SHEET_NAME, index=False)
@@ -437,14 +822,47 @@ def export_erba_batch(
                 columns=ERBA_METADATA_COLUMNS,
             )
             metadata.to_excel(writer, sheet_name=ERBA_METADATA_SHEET_NAME, index=False)
-            _format_workbook(writer, predictions, input_rows, metadata)
+            _format_workbook(
+                writer,
+                predictions,
+                input_rows,
+                metadata,
+                task,
+                graph_paths,
+                graph_directory,
+                graph_error,
+                ad_error,
+            )
         os.replace(temp_name, destination)
     except Exception:
-        Path(temp_name).unlink(missing_ok=True)
+        if temp_name is not None:
+            Path(temp_name).unlink(missing_ok=True)
         Path(destination).unlink(missing_ok=True)
+        if graph_directory is not None:
+            shutil.rmtree(graph_directory, ignore_errors=True)
         raise
     _progress(progress_callback, "Completed", total, total, 100)
-    return destination, len(results)
+    binding_labels = (
+        trusted_predictions["binding_label"].map(_binding_display_label)
+        if "binding_label" in trusted_predictions
+        else pd.Series("", index=trusted_predictions.index)
+    )
+    return ERBABatchExportResult(
+        destination=destination,
+        count=len(results),
+        binding_count=int((binding_labels == "Binding").sum()),
+        non_binding_count=int((binding_labels == "Non-binding").sum()),
+        not_predicted_count=int(
+            (trusted_predictions["Result_Status"] != "Predicted").sum()
+        ),
+        ad_in_domain_count=int((ad_frame["AD"] == "In-domain").sum()),
+        ad_out_of_domain_count=int((ad_frame["AD"] == "Out-of-domain").sum()),
+        ad_unavailable_count=int((ad_frame["AD"] == "Unavailable").sum()),
+        graph_paths=graph_paths,
+        graph_directory=graph_directory,
+        graph_error=graph_error,
+        ad_error=ad_error,
+    )
 
 
 class ErbaTab(ttk.Frame):
@@ -452,6 +870,7 @@ class ErbaTab(ttk.Frame):
         self,
         parent,
         project_root: str,
+        install_root: str,
         output_root: str | None = None,
         event_log=None,
         structure_editor=None,
@@ -459,6 +878,7 @@ class ErbaTab(ttk.Frame):
     ):
         super().__init__(parent)
         self.project_root = Path(project_root)
+        self.install_root = Path(install_root)
         self.output_root = Path(output_root) if output_root else self.project_root / "output"
         self.event_log = event_log
         self.structure_editor = structure_editor
@@ -480,8 +900,8 @@ class ErbaTab(ttk.Frame):
         self.cas_var = tk.StringVar()
         self.single_status_var = tk.StringVar(value=self.catalog_error or "Ready")
         self.single_prediction_summary_var = tk.StringVar(value="Prediction: -")
-        self.single_negative_probability_var = tk.StringVar(value="Negative probability: -")
-        self.single_positive_probability_var = tk.StringVar(value="Positive probability: -")
+        self.single_negative_probability_var = tk.StringVar(value="Non-binding probability: -")
+        self.single_positive_probability_var = tk.StringVar(value="Binding probability: -")
         self.single_pic50_var = tk.StringVar(value="pIC50: -")
         self.single_ic50_var = tk.StringVar(value="IC50: - nM")
         self.single_ad_domain_var = tk.StringVar(
@@ -489,10 +909,12 @@ class ErbaTab(ttk.Frame):
         )
         self.single_detail_var = tk.StringVar(value="Awaiting prediction.")
         self.batch_input_var = tk.StringVar()
-        self.batch_output_var = tk.StringVar(value=str(self.output_root))
+        self.batch_destination_var = tk.StringVar(
+            value=batch_destination_display(self.batch_input_var.get())
+        )
         self.single_evidence_caveat_var = tk.StringVar(value=HISTORICAL_EXPOSURE_CAVEAT_COMPACT)
         self.batch_status_var = tk.StringVar(value=self.catalog_error or "Ready")
-        self.batch_progress_var = tk.StringVar(value="0% - Ready")
+        self.batch_progress_var = tk.StringVar(value="0% - 0/0 - Ready")
         self.batch_progress_value = tk.DoubleVar(value=0)
         self._active_single_request_id = None
         self._active_ad_request_id = None
@@ -518,6 +940,12 @@ class ErbaTab(ttk.Frame):
     def _workflow_tab_changed(self, _event=None):
         selected = self.notebook.select()
         tab = self.notebook.tab(selected, "text") if selected else ""
+        status_var = (
+            self.batch_status_var
+            if selected == str(self.batch_tab)
+            else self.single_status_var
+        )
+        self.workflow_status_label.configure(textvariable=status_var)
         self._emit("workflow.tab_changed", workflow="erba", tab=tab)
 
     def _load_catalog(self):
@@ -587,10 +1015,15 @@ class ErbaTab(ttk.Frame):
         self.notebook.add(self.batch_tab, text="Batch prediction")
         self._build_single()
         self._build_batch()
-        self.notebook.bind("<<NotebookTabChanged>>", self._workflow_tab_changed)
-        ttk.Label(self, textvariable=self.single_status_var, anchor="w").grid(
+        self.workflow_status_label = ttk.Label(
+            self,
+            textvariable=self.single_status_var,
+            anchor="w",
+        )
+        self.workflow_status_label.grid(
             row=3, column=0, sticky="ew", padx=10, pady=(2, 8)
         )
+        self.notebook.bind("<<NotebookTabChanged>>", self._workflow_tab_changed)
 
     def toggle_options(self):
         self.options_visible = not self.options_visible
@@ -690,6 +1123,14 @@ class ErbaTab(ttk.Frame):
         ).grid(row=0, column=1, sticky="w", padx=(24, 0))
         ttk.Label(result_frame, text="Details").grid(row=2, column=0, sticky="w", padx=8)
         self.single_result_text = tk.Text(result_frame, height=7, wrap="word", font=("Consolas", 9))
+        self.single_result_text.tag_configure(
+            "detail_key",
+            font=("Consolas", 9, "bold"),
+        )
+        self.single_result_text.tag_configure(
+            "detail_value",
+            font=("Consolas", 9),
+        )
         self.single_result_text.grid(row=3, column=0, sticky="nsew", padx=8, pady=(2, 8))
 
         right_frame = ttk.Frame(self.single_tab)
@@ -731,7 +1172,7 @@ class ErbaTab(ttk.Frame):
     def _build_batch(self):
         self.batch_tab.columnconfigure(0, weight=1)
         self.batch_tab.rowconfigure(2, weight=1)
-        controls = ttk.LabelFrame(self.batch_tab, text="Input")
+        controls = ttk.LabelFrame(self.batch_tab, text="Batch")
         controls.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
         controls.columnconfigure(1, weight=1)
         self.batch_input_button = ttk.Button(controls, text="Input xlsx", command=self._choose_batch_input)
@@ -741,13 +1182,10 @@ class ErbaTab(ttk.Frame):
         ttk.Label(controls, textvariable=self.batch_input_var, anchor="w").grid(
             row=0, column=1, columnspan=3, sticky="ew", padx=6, pady=5
         )
-        self.batch_output_button = ttk.Button(
-            controls, text="Output directory", command=self._choose_output_dir
+        ttk.Label(controls, text="Result folder (same as input)").grid(
+            row=1, column=0, sticky="w", padx=6, pady=5
         )
-        self.batch_output_button.grid(
-            row=1, column=0, padx=6, pady=5
-        )
-        ttk.Label(controls, textvariable=self.batch_output_var, anchor="w").grid(
+        ttk.Label(controls, textvariable=self.batch_destination_var, anchor="w").grid(
             row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=5
         )
         ttk.Label(controls, text="Enter CAS numbers in the required CAS column.").grid(
@@ -777,9 +1215,6 @@ class ErbaTab(ttk.Frame):
         result_frame.rowconfigure(0, weight=1)
         self.batch_result = tk.Text(result_frame, height=12, wrap="word", state="disabled")
         self.batch_result.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        ttk.Label(self.batch_tab, textvariable=self.batch_status_var, anchor="w").grid(
-            row=3, column=0, sticky="ew", padx=8, pady=(0, 8)
-        )
 
     def _selected_route(self, workflow: str):
         return ERBATask.CLASSIFICATION, self.fixed_subtype
@@ -821,7 +1256,6 @@ class ErbaTab(ttk.Frame):
                 self.batch_button.configure(state=state)
                 if self._active_batch_request_id is None:
                     self.batch_input_button.configure(state="normal")
-                    self.batch_output_button.configure(state="normal")
                     self.batch_template_button.configure(state="normal")
 
     def _configure_single_result_task(self, task):
@@ -876,7 +1310,18 @@ class ErbaTab(ttk.Frame):
                 try:
                     smiles = cas_lookup_smiles(cas)
                 except Exception as error:
-                    self.after(0, lambda: self._single_complete(request_id, task, subtype, model_id, None, f"CAS lookup failed: {error}"))
+                    error_message = f"CAS lookup failed: {error}"
+                    self.after(
+                        0,
+                        lambda: self._single_complete(
+                            request_id,
+                            task,
+                            subtype,
+                            model_id,
+                            None,
+                            error_message,
+                        ),
+                    )
                     return
             result = self.predictor.predict(ERBARequest(smiles=smiles, task=task, subtype=subtype))
             self.after(0, lambda: self._single_complete(request_id, task, subtype, model_id, result, "", smiles))
@@ -927,10 +1372,11 @@ class ErbaTab(ttk.Frame):
                 ),
             )
         except Exception as error:
+            error_message = str(error)
             self.after(
                 0,
                 lambda: self._render_single_ad(
-                    request_id, task, subtype, None, "", str(error)
+                    request_id, task, subtype, None, "", error_message
                 ),
             )
 
@@ -976,12 +1422,14 @@ class ErbaTab(ttk.Frame):
         if hasattr(self, "_active_ad_request_id"):
             self._active_ad_request_id = None
         self.single_prediction_summary_var.set(summary)
-        self.single_negative_probability_var.set("Negative probability: -")
-        self.single_positive_probability_var.set("Positive probability: -")
+        self.single_negative_probability_var.set("Non-binding probability: -")
+        self.single_positive_probability_var.set("Binding probability: -")
         self.single_pic50_var.set("pIC50: -")
         self.single_ic50_var.set("IC50: - nM")
         self.single_detail_var.set("No prediction result is available.")
         self._single_detail_lines = [f"Status: {summary}"]
+        self._single_positive_probability = None
+        self.draw_probability_graph()
         for name in ("single_negative_bar", "single_positive_bar"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -1006,14 +1454,22 @@ class ErbaTab(ttk.Frame):
         if result.status_code is not ERBAStatusCode.OK:
             self._clear_single_result("Prediction unavailable")
             self.single_detail_var.set(f"Status: {status}")
+            self._single_detail_lines = [
+                f"Status: {result.status_code.value}",
+                f"Status message: {status}",
+                f"Model ID: {result.model_id or ''}",
+                f"Preprocessing policy ID: {result.preprocessing_policy_id or ''}",
+                f"Evidence scope: {result.evidence_scope or ''}",
+            ]
+            self._render_detail_lines()
             return
         if result.task is ERBATask.CLASSIFICATION:
-            label = (result.binding_label or "Unknown").replace("_", " ").title()
+            label = _binding_display_label(result.binding_label) or "Unknown"
             self.single_prediction_summary_var.set(f"Binding prediction: {label}")
             negative = float(result.non_binding_probability or 0)
             positive = float(result.binding_probability or 0)
-            self.single_negative_probability_var.set(f"Negative probability: {negative:.1%}")
-            self.single_positive_probability_var.set(f"Positive probability: {positive:.1%}")
+            self.single_negative_probability_var.set(f"Non-binding probability: {negative:.1%}")
+            self.single_positive_probability_var.set(f"Binding probability: {positive:.1%}")
             if self.single_negative_bar is not None:
                 self.single_negative_bar.configure(value=negative * 100)
             if self.single_positive_bar is not None:
@@ -1031,7 +1487,7 @@ class ErbaTab(ttk.Frame):
             )
             self.single_detail_var.set(f"Status: {status}  •  Model: {result.model_id or '-'}")
         label = (
-            (result.binding_label or "Unknown").replace("_", " ").title()
+            _binding_display_label(result.binding_label) or "Unknown"
             if result.task is ERBATask.CLASSIFICATION
             else "-"
         )
@@ -1041,10 +1497,10 @@ class ErbaTab(ttk.Frame):
             f"CAS: {cas}",
             f"Input SMILES: {result.raw_smiles}",
             f"Canonical SMILES: {result.model_smiles or ''}",
-            f"Task: Binding classification",
+            f"Task: {'Binding classification' if result.task is ERBATask.CLASSIFICATION else 'IC50 regression'}",
             f"Receptor subtype: {'ERalpha' if result.subtype is ERBASubtype.ER_ALPHA else 'ERbeta'}",
-            f"Negative probability: {float(result.non_binding_probability or 0):.6f}",
-            f"Positive probability: {float(result.binding_probability or 0):.6f}",
+            f"Non-binding probability: {float(result.non_binding_probability or 0):.6f}",
+            f"Binding probability: {float(result.binding_probability or 0):.6f}",
             f"Binding prediction: {label}",
             f"Status: {result.status_code.value}",
             f"Status message: {status}",
@@ -1061,7 +1517,14 @@ class ErbaTab(ttk.Frame):
         if details is None:
             return
         details.delete("1.0", "end")
-        details.insert("1.0", "\n".join(self._single_detail_lines))
+        for line in self._single_detail_lines:
+            text = str(line)
+            if ":" in text:
+                key, value = text.split(":", 1)
+                details.insert("end", f"{key}:", "detail_key")
+                details.insert("end", f"{value}\n", "detail_value")
+            else:
+                details.insert("end", f"{text}\n", "detail_value")
 
     def _draw_nearest_reference_structure(self, reference):
         widget = getattr(self, "single_nearest_reference_structure_label", None)
@@ -1106,7 +1569,7 @@ class ErbaTab(ttk.Frame):
         canvas = self.single_prob_canvas
         canvas.delete("all")
         positive = getattr(self, "_single_positive_probability", None)
-        width, margin, label_width, bar_h = max(canvas.winfo_width(), 320), 18, 72, 18
+        width, margin, label_width, bar_h = max(canvas.winfo_width(), 360), 18, 94, 18
         bar_x, bar_w = margin + label_width, max(width - margin - label_width - 48, 120)
         def bar(y, label, value, color):
             canvas.create_text(margin, y + bar_h / 2, text=label, anchor="w")
@@ -1114,12 +1577,12 @@ class ErbaTab(ttk.Frame):
             canvas.create_rectangle(bar_x, y, bar_x + bar_w * value, y + bar_h, fill=color, outline=color)
             canvas.create_text(bar_x + bar_w + 8, y + bar_h / 2, text=f"{value:.3f}", anchor="w")
         if positive is None:
-            bar(22, "Negative", 0, "#2da44e")
-            bar(58, "Positive", 0, "#cf222e")
+            bar(22, "Non-binding", 0, "#2da44e")
+            bar(58, "Binding", 0, "#cf222e")
             canvas.create_text(bar_x, 8, text="Run prediction to show probabilities", anchor="w", fill="#57606a")
             return
-        bar(22, "Negative", 1 - positive, "#2da44e")
-        bar(58, "Positive", positive, "#cf222e")
+        bar(22, "Non-binding", 1 - positive, "#2da44e")
+        bar(58, "Binding", positive, "#cf222e")
 
     def _draw_single_structure(self, smiles):
         structure = getattr(self, "single_structure_label", None)
@@ -1148,7 +1611,26 @@ class ErbaTab(ttk.Frame):
     def _choose_batch_input(self):
         path = filedialog.askopenfilename(title="Select ERBA input", filetypes=[("Excel", "*.xlsx")])
         if path:
-            self.batch_input_var.set(path)
+            source = Path(path).expanduser().resolve(strict=False)
+            self.batch_input_var.set(str(source))
+            try:
+                destination = validate_mutable_directory(
+                    source.parent,
+                    forbidden_roots=(self.project_root, self.install_root),
+                )
+            except Exception as error:
+                self.batch_destination_var.set(
+                    f"Unavailable — input folder cannot receive results: {source.parent}"
+                )
+                self.batch_status_var.set(
+                    "Copy or download the input workbook to a writable folder outside "
+                    f"the application files. Details: {error}"
+                )
+                return
+            self.batch_destination_var.set(str(destination))
+            self.batch_status_var.set(
+                f"Result workbook will be saved beside the input: {destination}"
+            )
 
     def _download_batch_template(self):
         path = filedialog.asksaveasfilename(
@@ -1159,30 +1641,30 @@ class ErbaTab(ttk.Frame):
         )
         if not path:
             return
-        destination = Path(path)
+        destination = Path(path).expanduser().resolve(strict=False)
         try:
+            validate_mutable_directory(
+                destination.parent,
+                forbidden_roots=(self.project_root, self.install_root),
+            )
             pd.DataFrame(columns=["CAS"]).to_excel(destination, index=False)
         except Exception as error:
-            messagebox.showerror("Template download failed", str(error))
+            messagebox.showerror(
+                "Template download failed",
+                "Save the template in a writable folder outside the application files. "
+                f"Details: {error}",
+            )
             return
         self.batch_input_var.set(str(destination))
-
-    def _choose_output_dir(self):
-        path = filedialog.askdirectory(title="Select ERBA output directory")
-        if not path:
-            return
-        try:
-            validated = validate_mutable_directory(path, forbidden_roots=(self.project_root,))
-        except Exception as error:
-            messagebox.showerror("Invalid output directory", str(error))
-            return
-        self.batch_output_var.set(str(validated))
+        self.batch_destination_var.set(batch_destination_display(destination))
+        self.batch_status_var.set(
+            f"Template saved. Result workbook will be saved beside it: {destination.parent}"
+        )
 
     def _set_batch_controls_running(self, running: bool):
         state = "disabled" if running else "normal"
         for widget in (
             self.batch_input_button,
-            self.batch_output_button,
             self.batch_template_button,
             self.batch_button,
         ):
@@ -1193,33 +1675,64 @@ class ErbaTab(ttk.Frame):
         normalized = {str(column).strip().lower(): column for column in frame.columns}
         return next((normalized[name] for name in aliases if name in normalized), None)
 
+    def _reject_batch_start(self, request_id: int, message: str) -> None:
+        self.batch_status_var.set(message)
+        self.batch_progress_value.set(100)
+        self.batch_progress_var.set("100% - 0/0 - Failed")
+        result = getattr(self, "batch_result", None)
+        if result is not None:
+            self._set_text(
+                result,
+                f"Batch prediction failed.\n\nTechnical details: {message}",
+            )
+        self._started_at.pop(request_id, None)
+
     def batch_predict_clicked(self):
         snapshot = self._snapshot("batch")
         if not snapshot:
             return
         request_id, task, subtype, model_id = snapshot
-        input_path, output_dir = self.batch_input_var.get().strip(), self.batch_output_var.get().strip()
-        if not input_path or not output_dir:
-            self.batch_status_var.set("Choose an input xlsx and output directory.")
-            self._started_at.pop(request_id, None)
+        input_path = self.batch_input_var.get().strip()
+        self.batch_destination_var.set(batch_destination_display(input_path))
+        if not input_path:
+            self._reject_batch_start(request_id, "Choose an input xlsx.")
             return
         try:
-            output_dir = str(validate_mutable_directory(output_dir, forbidden_roots=(self.project_root,)))
+            source = Path(input_path).expanduser().resolve(strict=False)
+            if not source.is_file():
+                raise FileNotFoundError(f"Input workbook does not exist: {source}")
+            output_dir = validate_mutable_directory(
+                source.parent,
+                forbidden_roots=(self.project_root, self.install_root),
+            )
+        except Exception as error:
+            self._reject_batch_start(
+                request_id,
+                "The ERBA result workbook must be saved beside the input workbook. "
+                "Choose an input workbook in a writable folder outside the application files. "
+                f"Details: {error}",
+            )
+            return
+        try:
             preflight = self.predictor.preflight(task, subtype)
             if not preflight.ready:
                 raise RuntimeError(
                     f"ERBA route preflight failed ({preflight.status_code.value}): {preflight.status_message}"
                 )
         except Exception as error:
-            self.batch_status_var.set(str(error))
-            self._started_at.pop(request_id, None)
+            self._reject_batch_start(request_id, str(error))
             return
-        self.batch_output_var.set(output_dir)
+        input_path = str(source)
+        self.batch_destination_var.set(str(output_dir))
         self._set_batch_controls_running(True)
         self._active_batch_request_id = request_id
         self._set_batch_progress(request_id, "Ready to read input", 0, 0, 0)
         self.batch_status_var.set("Running ERBA batch...")
-        threading.Thread(target=self._batch_work, args=(request_id, task, subtype, model_id, input_path, output_dir), daemon=True).start()
+        threading.Thread(
+            target=self._batch_work,
+            args=(request_id, task, subtype, model_id, input_path),
+            daemon=True,
+        ).start()
 
     def _batch_progress_from_worker(self, request_id, stage, current, total, percent):
         """Schedule all Tk mutation on the event loop, never on the batch worker."""
@@ -1240,27 +1753,39 @@ class ErbaTab(ttk.Frame):
         if progress_value is not None:
             progress_value.set(percent)
 
-    def _batch_work(self, request_id, task, subtype, model_id, input_path, output_dir):
+    def _batch_work(self, request_id, task, subtype, model_id, input_path):
         try:
-            destination, count = export_erba_batch(
+            export_result = export_erba_batch(
                 input_path,
-                output_dir,
                 task,
                 subtype,
                 self.predictor,
+                self.erba_ad,
                 self.catalog[(task, subtype)],
                 self.catalog_payload,
                 progress_callback=lambda stage, current, total, percent: self._batch_progress_from_worker(
                     request_id, stage, current, total, percent
                 ),
+                forbidden_roots=(self.project_root, self.install_root),
             )
             self.after(0, lambda: self._batch_complete(
-                request_id, task, subtype, model_id, destination, count, ""
+                request_id, task, subtype, model_id, export_result, ""
             ))
         except Exception as error:
-            self.after(0, lambda: self._batch_complete(request_id, task, subtype, model_id, None, 0, str(error)))
+            error_message = str(error)
+            self.after(0, lambda: self._batch_complete(
+                request_id, task, subtype, model_id, None, error_message
+            ))
 
-    def _batch_complete(self, request_id, task, subtype, model_id, destination, count, error):
+    def _batch_complete(
+        self,
+        request_id,
+        task,
+        subtype,
+        model_id,
+        export_result: ERBABatchExportResult | None,
+        error,
+    ):
         duration_ms = self._finish_duration_ms(request_id)
         if request_id != self._active_batch_request_id:
             if self._active_batch_request_id is None:
@@ -1270,10 +1795,10 @@ class ErbaTab(ttk.Frame):
             return
         self._set_batch_progress(
             request_id,
-            f"Failed: {error}" if error else "Completed",
-            count if not error else 0,
-            count if not error else 0,
-            100 if not error else 0,
+            "Failed" if error else "Completed",
+            export_result.count if export_result is not None else 0,
+            export_result.count if export_result is not None else 0,
+            100,
         )
         self._active_batch_request_id = None
         self._set_batch_controls_running(False)
@@ -1285,22 +1810,59 @@ class ErbaTab(ttk.Frame):
         self._route_changed("batch")
         if error:
             self.batch_status_var.set(f"ERBA batch failed: {error}")
+            self._set_text(
+                self.batch_result,
+                f"Batch prediction failed.\n\nTechnical details: {error}",
+            )
             self._emit("batch.inference_complete", workflow="erba", task=task.value, subtype=subtype.value,
                        model_id=model_id, correlation_id=request_id, duration_ms=duration_ms,
                        row_count=0, status="failed", exception_type="BatchError")
             return
-        canonical_output_dir = str(destination.parent)
-        self.batch_output_var.set(canonical_output_dir)
+        if export_result is None:
+            raise RuntimeError("ERBA batch completed without an export result.")
+        destination = export_result.destination
+        self.batch_destination_var.set(str(destination.parent))
         self.batch_status_var.set(f"ERBA batch complete: {destination}")
         self._emit("batch.inference_complete", workflow="erba", task=task.value, subtype=subtype.value,
                    model_id=model_id, correlation_id=request_id, duration_ms=duration_ms,
-                   row_count=count, status="ok")
+                   row_count=export_result.count, status="ok")
         caveat = (
             HISTORICAL_EXPOSURE_CAVEAT_COMPACT
             if task is ERBATask.CLASSIFICATION
             else REGRESSION_EVIDENCE_CAVEAT_COMPACT
         )
-        self._set_text(self.batch_result, f"Exported {count} rows to\n{destination}\n\n{caveat}")
+        lines = [
+            "ERalpha batch prediction completed.",
+            "",
+            f"Total rows: {export_result.count}",
+            f"Binding: {export_result.binding_count}",
+            f"Non-binding: {export_result.non_binding_count}",
+            f"Not predicted: {export_result.not_predicted_count}",
+            f"AD In-domain: {export_result.ad_in_domain_count}",
+            f"AD Out-of-domain: {export_result.ad_out_of_domain_count}",
+            f"AD Unavailable: {export_result.ad_unavailable_count}",
+            "",
+            f"Output workbook: {destination}",
+        ]
+        if export_result.graph_paths:
+            lines.extend(
+                (
+                    f"Graph files: {len(export_result.graph_paths)}",
+                    f"Graph directory: {export_result.graph_directory}",
+                )
+            )
+        else:
+            lines.extend(
+                (
+                    "Graph files: 0",
+                    "Graph directory: Not generated",
+                    f"Graph warning: {export_result.graph_error or 'no graphs were generated.'}",
+                )
+            )
+        if export_result.ad_error:
+            lines.append(f"AD warning: {export_result.ad_error}")
+        lines.extend(("", caveat))
+        self._set_text(self.batch_result, "\n".join(lines))
 
     def _snapshot_is_current(self, workflow, request_id, task, subtype, model_id):
         active_id = (
