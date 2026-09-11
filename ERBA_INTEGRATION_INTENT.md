@@ -169,3 +169,46 @@ This amendment supersedes the earlier `Guide`-first rule and any earlier stateme
 4. ERalpha batch AD graphs use binding-specific labels and the input-adjacent, collision-safe graph directory defined above. In the same full-width `Prediction result` placement used by ERTA, the detailed completion summary reports Total, Binding, Non-binding, Not predicted, AD In-domain, AD Out-of-domain, exact workbook path, graph count/directory, and the evidence caveat.
 5. `Binding` and `Non-binding` continue to mean direct ERalpha receptor binding classification only. They do not assert transcriptional activation, agonism, antagonism, signaling, coactivator recruitment, or general endocrine disruption.
 6. The accepted V7 evidence remains an internal resplit/sensitivity evaluation using historically exposed development data. It is not fresh independent, external, temporal, population, regulatory, or regulatory-use validation.
+
+## FDA usability amendment: exact ERTA/ERalpha interaction parity
+
+This amendment replaces approximate visual similarity with a shared widget and
+interaction contract. It also supersedes the earlier statement that model/AD
+browsing remains ERTA-only; ERalpha browsing is restricted as specified below.
+
+1. ERTA and ERalpha use the same outer grid, hidden-by-default `Options` box,
+   single/batch notebook placement, padding, row/column weights, control order,
+   fixed-size probability/result areas, batch progress row, result box, and
+   status-row placement. A stable `parity_widgets` map names the corresponding
+   controls for native bounding-box comparison.
+2. Both single pages initialize and reset from the exact first `CAS` and
+   `SMILES` row in `templates\ERTA_KRICT_example.xlsx`. Both batch pages
+   initialize to that same workbook; endpoint state remains independent after
+   initialization.
+3. Both `Options` boxes expose, in order, `Model`, `Browse`, `Reload model`,
+   `AD reference`, `Browse`, and `Reload AD`. ERalpha model browsing accepts
+   only regular bundled files represented by a `released` catalog entry whose
+   model ID, size, and SHA-256 also match an executable release allowlist trust
+   anchor. Rejection occurs before `joblib` deserialization. ERalpha AD browsing
+   and reload are confined to the approved route-specific bundled reference.
+   Both approved defaults are validated and loaded automatically at startup.
+4. The ERalpha catalog retains every uniquely identified released model for a
+   route while preserving one route default for existing inference APIs.
+   Activating a choice creates a route-keyed predictor snapshot from that exact
+   approved specification, binds the matching ERalpha AD route, and invalidates
+   stale single/batch completions and progress. Reload completions are accepted
+   only for the latest operation and unchanged typed selection. AD reload fits
+   a fresh route manager before atomically replacing the active manager, so
+   in-flight request snapshots keep their original fitted AD state. Additional
+   choices appear only when their model and trust-anchor artifacts have
+   completed the approved release process; this is not a plugin or
+   arbitrary-file mechanism.
+5. `Download template` remains an explicit save dialog on both batch pages.
+   The destination must be a writable user-selected folder outside bundled or
+   installed resources, and neither endpoint silently redirects a protected
+   destination.
+6. The intentional endpoint wording differences are limited to
+   Positive/Negative for ERTA transcriptional activation versus
+   Binding/Non-binding and the required binding-evidence caveat for direct
+   ERalpha binding. Predictor state, model paths, AD references, request
+   snapshots, results, and batch destinations remain endpoint-isolated.

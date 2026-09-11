@@ -31,6 +31,20 @@ installer\ER_Predictor_Setup_x64.exe
 
 - 시작 탭은 **ERTA**이며 기존 ERTA 분류, AD, 그래프 흐름을 유지합니다.
 - **ERalpha** 탭은 FDA 요청 범위인 ERα 결합 분류만 제공합니다. ERβ와 회귀 모델은 FDA 배포 화면과 설치 파일에서 제외됩니다.
+- ERTA와 ERalpha의 `Options`, `Single prediction`, `Batch prediction`은 같은
+  컨트롤 순서, 위치, 크기, 여백, 행/열 확장 규칙 및 열기/닫기 동작을
+  사용합니다. 의도적으로 다른 결과 용어는 ERTA의 `Positive/Negative`와
+  ERalpha의 `Binding/Non-binding`뿐입니다.
+- 두 `Options`에는 같은 위치에 `Model`/`Browse`/`Reload model`과
+  `AD reference`/`Browse`/`Reload AD`가 있습니다. ERalpha에서 선택할 수
+  있는 모델은 bundled released catalog와 실행 파일 release allowlist의
+  모델 ID, 크기, SHA-256이 모두 일치하는 파일뿐이며, 이 검증은 joblib
+  역직렬화 전에 끝납니다. 승인된 후속 모델도 같은 release 절차를 완료한
+  경우에만 선택 목록에 들어갑니다. 임의 joblib 또는 외부 AD 파일은
+  로드하지 않습니다. Reload 완료는 가장 최근 작업과 사용자가 입력한
+  경로가 그대로인 경우에만 적용되며, AD Reload는 새 AD 관리자를 완전히
+  fit한 뒤 교체하여 실행 중 요청의 기존 AD 상태를 변경하지 않습니다.
+  승인된 기본 model/AD는 두 탭 모두 시작 시 자동으로 검증하고 로드합니다.
 - ERalpha 분류는 승인된 0.5 기준과 직접 결합 확률/라벨을 사용합니다.
 - `Binding`과 `Non-binding`은 직접 ERα 수용체 결합 분류만 뜻합니다. 전사 활성, 작용제/길항제 활성, 신호 전달, 공동활성인자 모집 또는 일반 내분비계 장애를 뜻하지 않습니다.
 - ERalpha AD는 ERTA와 같은 계산 코드를 사용하지만 ERα 전용 학습 참조와 캐시만 사용합니다.
@@ -46,7 +60,15 @@ installer\ER_Predictor_Setup_x64.exe
 
 - 모든 지원 경로에서 직접 SMILES 입력은 오프라인으로 동작합니다.
 - CAS 조회만 인터넷이 필요합니다. 조회 실패가 이미 유효한 SMILES를 덮어쓰지 않습니다.
-- 기존 ERTA 입력은 변경하지 말고 `templates\ERTA_KRICT_example.xlsx`를 사용합니다.
+- ERTA와 ERalpha의 단일 입력은 모두
+  `templates\ERTA_KRICT_example.xlsx` 첫 행의 정확한 `CAS`와 `SMILES`로
+  초기화됩니다. 각 탭의 **Example input**은 변경된 두 필드를 그 값으로
+  독립적으로 되돌립니다.
+- 두 batch 페이지도 같은 `templates\ERTA_KRICT_example.xlsx`를 초기 예제로
+  표시합니다. 이 bundled workbook 자체의 폴더에는 결과를 쓸 수 없습니다.
+  **Download template** 저장 대화상자에서 응용 프로그램 폴더 밖의 쓰기
+  가능한 사용자 폴더를 명시적으로 선택하고, 저장된 workbook을 편집한 뒤
+  실행하십시오. 보호된 경로를 다른 위치로 자동 전환하지 않습니다.
 - 결합 예시는 `templates\ERTA_ERBA_example.xlsx`입니다. 첫 시트 **ERBA_Input**은 ERBA 입력용이며 정확히 `Row_ID`, `CAS`, `SMILES` 열을 사용합니다. 두 번째 **ERTA_Input**은 `CID`, `CAS`, `SMILES`, `label` 열을 보여 줍니다. ERTA batch에 넣을 때는 이 시트를 별도 workbook으로 내보내십시오.
 
 - ERTA와 ERalpha batch 페이지에는 별도의 출력 폴더 선택기가 없습니다. 입력 workbook을 선택하면 읽기 전용 **Result folder (same as input)** 항목에 입력 파일의 폴더가 표시되고, 결과 workbook은 항상 그 폴더에 원자적으로 게시됩니다. ERTA batch 그래프는 같은 위치의 `graphs` 하위 폴더에 저장됩니다.

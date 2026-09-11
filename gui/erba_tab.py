@@ -1,8 +1,9 @@
-"""ERBA-only Tkinter journey; it never exposes legacy ERTA models or AD tools."""
+"""ERalpha Tkinter journey with released-model and route-isolated AD controls."""
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import os
 import shutil
@@ -50,7 +51,12 @@ from core.contracts import (
     output_columns,
 )
 from core.erba_predictor import ERBAPredictor
-from core.erba_ad import ERBAApplicabilityDomain
+from core.erba_ad import (
+    ERBAApplicabilityDomain,
+    erba_ad_cache_path,
+    erba_ad_reference_path,
+)
+from core.erba_release_allowlist import TRUSTED_ERBA_ARTIFACTS
 from core.graph import save_ad_decision_plot, save_ad_plot, save_single_ad_plot
 from core.molecule_image import save_molecule_image
 from core.pubchem import cas_to_smiles
@@ -79,6 +85,13 @@ ERBA_BATCH_AD_COLUMNS = (
 
 
 @dataclass(frozen=True)
+class SharedExampleInput:
+    workbook: Path
+    cas: str
+    smiles: str
+
+
+@dataclass(frozen=True)
 class ERBABatchExportResult:
     destination: Path
     count: int
@@ -94,6 +107,81 @@ class ERBABatchExportResult:
     ad_error: str = ""
 
 
+class ERBAReleasedCatalog(dict):
+    """Expose a route default while retaining every approved model for that route."""
+
+    def __init__(self):
+        super().__init__()
+        self._choices: dict[
+            tuple[ERBATask, ERBASubtype], list[ERBAArtifactSpec]
+        ] = {}
+
+    def add(
+        self,
+        task: ERBATask,
+        subtype: ERBASubtype,
+        spec: ERBAArtifactSpec,
+    ) -> None:
+        route = (task, subtype)
+        choices = self._choices.setdefault(route, [])
+        if any(choice.model_id == spec.model_id for choice in choices):
+            raise ValueError(
+                "ERBA catalog contains a duplicate released model ID for one route."
+            )
+        choices.append(spec)
+        self.setdefault(route, spec)
+
+    def choices_for(
+        self,
+        task: ERBATask,
+        subtype: ERBASubtype,
+    ) -> tuple[ERBAArtifactSpec, ...]:
+        return tuple(self._choices.get((task, subtype), ()))
+
+    def model_for(
+        self,
+        task: ERBATask,
+        subtype: ERBASubtype,
+        model_id: str,
+    ) -> ERBAArtifactSpec:
+        for spec in self.choices_for(task, subtype):
+            if spec.model_id == model_id:
+                return spec
+        raise KeyError(model_id)
+
+
+def load_shared_example_input(project_root: str | Path) -> SharedExampleInput:
+    """Read the existing ERTA example used to initialize both endpoint tabs."""
+    workbook = Path(project_root) / "templates" / "ERTA_KRICT_example.xlsx"
+    if not workbook.is_file():
+        return SharedExampleInput(workbook, "", "")
+    try:
+        frame = pd.read_excel(
+            workbook,
+            sheet_name=0,
+            nrows=1,
+            dtype=str,
+            keep_default_na=False,
+        )
+    except Exception:
+        return SharedExampleInput(workbook, "", "")
+    if frame.empty:
+        return SharedExampleInput(workbook, "", "")
+    columns = {
+        re.sub(r"\s+", " ", str(column).strip()).casefold(): column
+        for column in frame.columns
+    }
+    cas_column = columns.get("cas")
+    smiles_column = columns.get("smiles")
+    cas = str(frame.iloc[0][cas_column]).strip() if cas_column is not None else ""
+    smiles = (
+        str(frame.iloc[0][smiles_column]).strip()
+        if smiles_column is not None
+        else ""
+    )
+    return SharedExampleInput(workbook, cas, smiles)
+
+
 def batch_destination_display(input_path: str | Path) -> str:
     """Describe the fixed batch destination without probing or creating directories."""
     if not str(input_path).strip():
@@ -102,14 +190,14 @@ def batch_destination_display(input_path: str | Path) -> str:
 
 
 def load_erba_catalog(path: str | Path):
-    """Parse only released, fixed-catalog routes; malformed entries fail closed."""
+    """Parse released choices while preserving the route-keyed default API."""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("schema_version") != 2:
         raise ValueError("ERBA catalog schema version must be 2.")
     routes = payload.get("routes")
     if not isinstance(routes, list):
         raise ValueError("ERBA catalog routes are missing.")
-    catalog = {}
+    catalog = ERBAReleasedCatalog()
     for route in routes:
         if not isinstance(route, dict) or route.get("release_status") != _RELEASED:
             continue
@@ -125,9 +213,7 @@ def load_erba_catalog(path: str | Path):
             raise ValueError("ERBA catalog contains an invalid released route.") from error
         if task is ERBATask.IC50_REGRESSION and subtype is ERBASubtype.ER_BETA:
             continue
-        if (task, subtype) in catalog:
-            raise ValueError("ERBA catalog contains a duplicate released route.")
-        catalog[(task, subtype)] = spec
+        catalog.add(task, subtype, spec)
     parity = payload.get("regression_parity_approved") is True
     return catalog, parity, payload
 
@@ -288,9 +374,9 @@ def allocate_graph_directory(destination: str | Path) -> Path:
 
 def _binding_display_label(value) -> str:
     normalized = str(value or "").strip().replace("-", "_").replace(" ", "_").casefold()
-    if normalized == "binding":
+    if normalized in {"binding", "1", "1.0"}:
         return "Binding"
-    if normalized in {"non_binding", "nonbinding"}:
+    if normalized in {"non_binding", "nonbinding", "0", "0.0"}:
         return "Non-binding"
     return ""
 
@@ -891,13 +977,43 @@ class ErbaTab(ttk.Frame):
         self.regression_parity_approved = False
         self._request_id = 0
         self._started_at = {}
+        self._request_generations = {}
+        self._request_predictors = {}
+        self._request_specs = {}
+        self._request_ad_calculators = {}
+        self._model_generation = 0
+        self._model_reload_id = 0
+        self._ad_reload_id = 0
+        self.selected_model_spec = None
         self._load_catalog()
+        example = load_shared_example_input(self.project_root)
         self.single_task_var = tk.StringVar(value=ERBATask.CLASSIFICATION.value)
         self.single_subtype_var = tk.StringVar(value=fixed_subtype.value)
         self.batch_task_var = tk.StringVar(value=ERBATask.CLASSIFICATION.value)
         self.batch_subtype_var = tk.StringVar(value=fixed_subtype.value)
-        self.smiles_var = tk.StringVar()
-        self.cas_var = tk.StringVar()
+        self.example_cas = example.cas
+        self.example_smiles = example.smiles
+        self.example_workbook = example.workbook
+        self.smiles_var = tk.StringVar(value=self.example_smiles)
+        self.cas_var = tk.StringVar(value=self.example_cas)
+        model_path = (
+            self.catalog_path.parent / self.selected_model_spec.relative_path
+            if self.selected_model_spec is not None
+            else Path()
+        )
+        ad_path = erba_ad_reference_path(
+            self.project_root,
+            ERBATask.CLASSIFICATION,
+            self.fixed_subtype,
+        )
+        self.model_path_var = tk.StringVar(
+            value=str(model_path) if self.selected_model_spec is not None else ""
+        )
+        self.ad_ref_path_var = tk.StringVar(
+            value=str(ad_path) if ad_path.is_file() else ""
+        )
+        self.loaded_model_path_var = tk.StringVar()
+        self.loaded_ad_ref_path_var = tk.StringVar()
         self.single_status_var = tk.StringVar(value=self.catalog_error or "Ready")
         self.single_prediction_summary_var = tk.StringVar(value="Prediction: -")
         self.single_negative_probability_var = tk.StringVar(value="Non-binding probability: -")
@@ -908,11 +1024,16 @@ class ErbaTab(ttk.Frame):
             value="Applicability domain: Not evaluated"
         )
         self.single_detail_var = tk.StringVar(value="Awaiting prediction.")
-        self.batch_input_var = tk.StringVar()
+        self.batch_input_var = tk.StringVar(value=str(self.example_workbook))
+        default_batch_name = (
+            self.example_workbook.name
+            if self.example_workbook.is_file()
+            else "No input template selected"
+        )
+        self.batch_input_display_var = tk.StringVar(value=default_batch_name)
         self.batch_destination_var = tk.StringVar(
             value=batch_destination_display(self.batch_input_var.get())
         )
-        self.single_evidence_caveat_var = tk.StringVar(value=HISTORICAL_EXPOSURE_CAVEAT_COMPACT)
         self.batch_status_var = tk.StringVar(value=self.catalog_error or "Ready")
         self.batch_progress_var = tk.StringVar(value="0% - 0/0 - Ready")
         self.batch_progress_value = tk.DoubleVar(value=0)
@@ -922,7 +1043,14 @@ class ErbaTab(ttk.Frame):
         self._single_structure_image = None
         self._nearest_reference_structure_image = None
         self._single_ad_graph_image = None
-        self._single_detail_lines = []
+        self._single_detail_lines = [
+            "Awaiting prediction.",
+            "",
+            f"Evidence caveat: {HISTORICAL_EXPOSURE_CAVEAT_COMPACT}",
+        ]
+        self.single_preview_size = (250, 180)
+        self.nearest_reference_preview_size = (250, 180)
+        self.single_ad_preview_size = (520, 300)
         self.erba_ad = ERBAApplicabilityDomain(self.project_root)
         self.options_visible = False
         self._build_ui()
@@ -931,6 +1059,7 @@ class ErbaTab(ttk.Frame):
         self.batch_task_var.trace_add("write", lambda *_: self._route_changed("batch"))
         self.batch_subtype_var.trace_add("write", lambda *_: self._route_changed("batch"))
         self._route_changed()
+        self.after(300, self.load_defaults_on_startup)
 
     def _emit(self, event: str, **fields):
         event_log = getattr(self, "event_log", None)
@@ -951,8 +1080,20 @@ class ErbaTab(ttk.Frame):
     def _load_catalog(self):
         try:
             self.catalog, self.regression_parity_approved, self.catalog_payload = load_erba_catalog(self.catalog_path)
-            self.predictor = ERBAPredictor(self.catalog_path.parent, self.catalog,
-                                           regression_parity_approved=self.regression_parity_approved)
+            choices = self.catalog.choices_for(
+                ERBATask.CLASSIFICATION,
+                self.fixed_subtype,
+            )
+            self.selected_model_spec = choices[0] if choices else None
+            self.predictor = (
+                self._predictor_for_spec(
+                    ERBATask.CLASSIFICATION,
+                    self.fixed_subtype,
+                    self.selected_model_spec,
+                )
+                if self.selected_model_spec is not None
+                else None
+            )
             provenance = {
                 key: value
                 for section in ("metadata", "provenance")
@@ -963,6 +1104,10 @@ class ErbaTab(ttk.Frame):
                 "model.catalog_loaded",
                 workflow="erba",
                 route_count=len(self.catalog),
+                model_count=sum(
+                    len(self.catalog.choices_for(*route))
+                    for route in self.catalog
+                ),
                 status="ok",
                 **provenance,
             )
@@ -978,37 +1123,537 @@ class ErbaTab(ttk.Frame):
                 exception_type=type(error).__name__,
             )
 
+    @staticmethod
+    def _sha256_path(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _trusted_artifacts_for_spec(
+        task: ERBATask,
+        subtype: ERBASubtype,
+        spec: ERBAArtifactSpec,
+    ) -> dict[str, Mapping]:
+        route_id = f"{task.value}:{subtype.value}"
+        for anchor_id, anchor in TRUSTED_ERBA_ARTIFACTS.items():
+            if not (
+                anchor_id == route_id or anchor_id.startswith(f"{route_id}:")
+            ):
+                continue
+            if (
+                isinstance(anchor, Mapping)
+                and anchor.get("release_status") == _RELEASED
+                and anchor.get("model_id") == spec.model_id
+                and anchor.get("sha256") == spec.sha256.lower()
+                and anchor.get("size_bytes") == spec.size_bytes
+            ):
+                return {route_id: anchor}
+        raise ValueError(
+            f"Model {spec.model_id!r} is not approved by the executable release allowlist."
+        )
+
+    def _predictor_for_spec(
+        self,
+        task: ERBATask,
+        subtype: ERBASubtype,
+        spec: ERBAArtifactSpec,
+    ) -> ERBAPredictor:
+        return ERBAPredictor(
+            self.catalog_path.parent,
+            {(task, subtype): spec},
+            regression_parity_approved=self.regression_parity_approved,
+            trusted_artifacts=self._trusted_artifacts_for_spec(task, subtype, spec),
+        )
+
+    def _released_model_for_path(
+        self,
+        path: str | Path,
+    ) -> tuple[ERBATask, ERBASubtype, ERBAArtifactSpec, Path]:
+        candidate = Path(path).expanduser()
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(f"Selected model file does not exist: {candidate}") from error
+        route = self._selected_route("single")
+        choices = self.catalog.choices_for(*route)
+        for spec in choices:
+            expected = (self.catalog_path.parent / spec.relative_path).resolve(
+                strict=True
+            )
+            if resolved != expected:
+                continue
+            self._trusted_artifacts_for_spec(*route, spec)
+            if (
+                resolved.stat().st_size != spec.size_bytes
+                or self._sha256_path(resolved) != spec.sha256.lower()
+            ):
+                raise ValueError(
+                    "Selected released model failed its size or SHA-256 integrity check."
+                )
+            return route[0], route[1], spec, resolved
+        raise ValueError(
+            "Select a released ERalpha model from the bundled model catalog. "
+            "Arbitrary joblib files are not allowed."
+        )
+
+    def _approved_ad_reference_for_path(self, path: str | Path) -> Path:
+        task, subtype = self._selected_route("single")
+        expected = erba_ad_reference_path(self.project_root, task, subtype)
+        try:
+            expected_resolved = expected.resolve(strict=True)
+            selected_resolved = Path(path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(f"Selected AD reference does not exist: {path}") from error
+        if selected_resolved != expected_resolved:
+            raise ValueError(
+                "Select the approved bundled AD reference for the active ERalpha model."
+            )
+        if not selected_resolved.is_file():
+            raise ValueError("Selected AD reference is not a regular file.")
+        return selected_resolved
+
+    def set_status(self, text: str) -> None:
+        self.single_status_var.set(text)
+        self.batch_status_var.set(text)
+
+    def show_error(self, title: str, error: Exception | str) -> None:
+        messagebox.showerror(title, str(error))
+        self.set_status(f"Error: {error}")
+
+    def browse_model(self):
+        path = filedialog.askopenfilename(
+            title="Select model",
+            initialdir=str(self.catalog_path.parent),
+            filetypes=[("Model file", "*.joblib"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            _, _, _, resolved = self._released_model_for_path(path)
+        except Exception as error:
+            self.show_error("Model selection failed", error)
+            return
+        self.model_path_var.set(str(resolved))
+        self.set_status("Released model selected. Click Reload model to activate it.")
+
+    def browse_ad_reference(self):
+        path = filedialog.askopenfilename(
+            title="Select AD reference Excel",
+            filetypes=[("Excel", "*.xlsx *.xls"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            resolved = self._approved_ad_reference_for_path(path)
+        except Exception as error:
+            self.show_error("AD reference selection failed", error)
+            return
+        self.ad_ref_path_var.set(str(resolved))
+        self.set_status("Approved AD reference selected. Click Reload AD to activate it.")
+
+    def _activate_model(
+        self,
+        task: ERBATask,
+        subtype: ERBASubtype,
+        spec: ERBAArtifactSpec,
+        path: Path,
+        predictor: ERBAPredictor,
+    ) -> None:
+        self.model_path_var.set(str(path))
+        self.predictor = predictor
+        self.selected_model_spec = spec
+        self._model_generation += 1
+        self.loaded_model_path_var.set(str(path))
+        approved_ad = erba_ad_reference_path(self.project_root, task, subtype)
+        self.ad_ref_path_var.set(str(approved_ad))
+        self.loaded_ad_ref_path_var.set("")
+        self._active_ad_request_id = None
+        if hasattr(self, "single_prediction_summary_var"):
+            self._clear_single_result("Prediction: -")
+        if hasattr(self, "batch_result"):
+            self._set_text(
+                self.batch_result,
+                "Run a batch to show the completion summary.",
+            )
+            self.batch_progress_value.set(0)
+            self.batch_progress_var.set("0% - 0/0 - Ready")
+        self._route_changed()
+        self.set_status(f"Model loaded: {spec.model_id}")
+
+    def load_model_clicked(self):
+        selected_path = self.model_path_var.get().strip()
+        self._model_reload_id += 1
+        reload_id = self._model_reload_id
+
+        def work():
+            try:
+                task, subtype, spec, path = self._released_model_for_path(
+                    selected_path
+                )
+                predictor = self._predictor_for_spec(task, subtype, spec)
+                preflight = predictor.preflight(task, subtype)
+                if not preflight.ready:
+                    raise RuntimeError(
+                        "ERBA route preflight failed "
+                        f"({preflight.status_code.value}): {preflight.status_message}"
+                    )
+                self.after(
+                    0,
+                    lambda: self._finish_model_reload(
+                        reload_id,
+                        selected_path,
+                        task,
+                        subtype,
+                        spec,
+                        path,
+                        predictor,
+                    ),
+                )
+            except Exception as error:
+                error_text = str(error)
+                self.after(
+                    0,
+                    lambda: self._model_reload_failed(
+                        reload_id,
+                        selected_path,
+                        error_text,
+                    ),
+                )
+
+        self.set_status("Loading model...")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_model_reload(
+        self,
+        reload_id,
+        selected_path,
+        task,
+        subtype,
+        spec,
+        path,
+        predictor,
+    ):
+        if (
+            reload_id != self._model_reload_id
+            or self.model_path_var.get().strip() != selected_path
+        ):
+            return
+        self._activate_model(task, subtype, spec, path, predictor)
+        messagebox.showinfo(
+            "Model loaded",
+            f"Loaded released model:\n{path}\n\nModel ID: {spec.model_id}",
+        )
+
+    def _model_reload_failed(self, reload_id, selected_path, error):
+        if (
+            reload_id == self._model_reload_id
+            and self.model_path_var.get().strip() == selected_path
+        ):
+            self.show_error("Model load failed", error)
+
+    def fit_ad_clicked(self):
+        selected_path = self.ad_ref_path_var.get().strip()
+        task, subtype = self._selected_route("single")
+        generation = self._model_generation
+        self._ad_reload_id += 1
+        reload_id = self._ad_reload_id
+
+        def work():
+            try:
+                path = self._approved_ad_reference_for_path(selected_path)
+                fresh_ad = ERBAApplicabilityDomain(self.project_root)
+                calculator = fresh_ad.calculator_for(task, subtype)
+                calculator.ensure_fitted_from_excel_cached(
+                    str(path),
+                    cache_path=str(
+                        erba_ad_cache_path(self.project_root, task, subtype)
+                    ),
+                    force_refit=True,
+                )
+                self.after(
+                    0,
+                    lambda: self._finish_ad_reload(
+                        reload_id,
+                        selected_path,
+                        path,
+                        fresh_ad,
+                        calculator,
+                        generation,
+                    ),
+                )
+            except Exception as error:
+                error_text = str(error)
+                self.after(
+                    0,
+                    lambda: self._ad_reload_failed(
+                        reload_id,
+                        selected_path,
+                        generation,
+                        error_text,
+                    ),
+                )
+
+        self.set_status("Rebuilding AD reference cache...")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_ad_reload(
+        self,
+        reload_id: int,
+        selected_path: str,
+        path: Path,
+        fresh_ad: ERBAApplicabilityDomain,
+        calculator,
+        generation: int,
+    ) -> None:
+        if (
+            reload_id != self._ad_reload_id
+            or generation != self._model_generation
+            or self.ad_ref_path_var.get().strip() != selected_path
+        ):
+            return
+        self.ad_ref_path_var.set(str(path))
+        self.erba_ad = fresh_ad
+        self.loaded_ad_ref_path_var.set(str(path))
+        cache_status = calculator.last_cache_status or "AD cache status unavailable."
+        self.set_status(f"AD fitted. {cache_status}")
+        messagebox.showinfo(
+            "AD fitted",
+            f"AD reference fitted:\n{path}\n\n{cache_status}",
+        )
+
+    def _ad_reload_failed(
+        self,
+        reload_id,
+        selected_path,
+        generation,
+        error,
+    ):
+        if (
+            reload_id == self._ad_reload_id
+            and generation == self._model_generation
+            and self.ad_ref_path_var.get().strip() == selected_path
+        ):
+            self.show_error("AD fitting failed", error)
+
+    def load_defaults_on_startup(self):
+        if self.catalog_error or self.selected_model_spec is None:
+            return
+        model_selection = self.model_path_var.get().strip()
+        ad_selection = self.ad_ref_path_var.get().strip()
+        generation = self._model_generation
+        self._model_reload_id += 1
+        self._ad_reload_id += 1
+        model_reload_id = self._model_reload_id
+        ad_reload_id = self._ad_reload_id
+
+        def work():
+            try:
+                task, subtype, spec, model_path = self._released_model_for_path(
+                    model_selection
+                )
+                predictor = self._predictor_for_spec(task, subtype, spec)
+                preflight = predictor.preflight(task, subtype)
+                if not preflight.ready:
+                    raise RuntimeError(
+                        "ERBA route preflight failed "
+                        f"({preflight.status_code.value}): {preflight.status_message}"
+                    )
+                ad_path = self._approved_ad_reference_for_path(ad_selection)
+                fresh_ad = ERBAApplicabilityDomain(self.project_root)
+                calculator = fresh_ad.calculator_for(task, subtype)
+                calculator.ensure_fitted_from_excel_cached(
+                    str(ad_path),
+                    cache_path=str(
+                        erba_ad_cache_path(self.project_root, task, subtype)
+                    ),
+                )
+                self.after(
+                    0,
+                    lambda: self._finish_default_loading(
+                        model_reload_id,
+                        ad_reload_id,
+                        model_selection,
+                        ad_selection,
+                        generation,
+                        task,
+                        subtype,
+                        spec,
+                        model_path,
+                        predictor,
+                        ad_path,
+                        fresh_ad,
+                        calculator,
+                    ),
+                )
+            except Exception as error:
+                error_text = str(error)
+                self.after(
+                    0,
+                    lambda: self._default_loading_failed(
+                        model_reload_id,
+                        ad_reload_id,
+                        model_selection,
+                        ad_selection,
+                        generation,
+                        error_text,
+                    ),
+                )
+
+        self.set_status("Loading default model and AD reference...")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _default_loading_is_current(
+        self,
+        model_reload_id,
+        ad_reload_id,
+        model_selection,
+        ad_selection,
+        generation,
+    ):
+        return (
+            model_reload_id == self._model_reload_id
+            and ad_reload_id == self._ad_reload_id
+            and generation == self._model_generation
+            and self.model_path_var.get().strip() == model_selection
+            and self.ad_ref_path_var.get().strip() == ad_selection
+        )
+
+    def _finish_default_loading(
+        self,
+        model_reload_id,
+        ad_reload_id,
+        model_selection,
+        ad_selection,
+        generation,
+        task,
+        subtype,
+        spec,
+        model_path,
+        predictor,
+        ad_path,
+        fresh_ad,
+        calculator,
+    ):
+        if not self._default_loading_is_current(
+            model_reload_id,
+            ad_reload_id,
+            model_selection,
+            ad_selection,
+            generation,
+        ):
+            return
+        self._activate_model(task, subtype, spec, model_path, predictor)
+        self.ad_ref_path_var.set(str(ad_path))
+        self.erba_ad = fresh_ad
+        self.loaded_ad_ref_path_var.set(str(ad_path))
+        self.set_status(
+            f"Ready: {spec.model_id}; "
+            f"{calculator.last_cache_status or 'AD reference fitted.'}"
+        )
+
+    def _default_loading_failed(
+        self,
+        model_reload_id,
+        ad_reload_id,
+        model_selection,
+        ad_selection,
+        generation,
+        error,
+    ):
+        if self._default_loading_is_current(
+            model_reload_id,
+            ad_reload_id,
+            model_selection,
+            ad_selection,
+            generation,
+        ):
+            self.set_status(f"Startup failed: {error}")
+
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
+
         summary = ttk.Frame(self)
         summary.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
         summary.columnconfigure(0, weight=1)
-        ttk.Button(summary, text="Options", command=self.toggle_options).grid(row=0, column=1, sticky="e")
+
+        self.options_button = ttk.Button(
+            summary,
+            text="Options",
+            command=self.toggle_options,
+        )
+        self.options_button.grid(row=0, column=1, sticky="e")
+
         self.options_frame = ttk.LabelFrame(self, text="Options")
         self.options_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 8))
         self.options_frame.columnconfigure(1, weight=1)
-        receptor_name = (
-            "Estrogen receptor alpha (ERα)"
-            if self.fixed_subtype is ERBASubtype.ER_ALPHA
-            else "Estrogen receptor beta (ERβ)"
+
+        ttk.Label(self.options_frame, text="Model").grid(
+            row=0, column=0, sticky="w", padx=6, pady=4
         )
-        ttk.Label(self.options_frame, text="Task").grid(
-            row=0, column=0, sticky="w", padx=6, pady=5
+        self.model_entry = ttk.Entry(
+            self.options_frame,
+            textvariable=self.model_path_var,
         )
-        ttk.Label(self.options_frame, text="Binding classification").grid(
-            row=0, column=1, sticky="w", padx=6, pady=5
+        self.model_entry.grid(
+            row=0, column=1, sticky="ew", padx=6, pady=4
         )
-        ttk.Label(self.options_frame, text="Receptor").grid(
-            row=0, column=2, sticky="w", padx=6, pady=5
+        self.model_browse_button = ttk.Button(
+            self.options_frame,
+            text="Browse",
+            command=self.browse_model,
         )
-        ttk.Label(self.options_frame, text=receptor_name).grid(
-            row=0, column=3, sticky="w", padx=6, pady=5
+        self.model_browse_button.grid(row=0, column=2, padx=6, pady=4)
+        self.model_reload_button = ttk.Button(
+            self.options_frame,
+            text="Reload model",
+            command=self.load_model_clicked,
+        )
+        self.model_reload_button.grid(row=0, column=3, padx=6, pady=4)
+
+        ttk.Label(self.options_frame, text="AD reference").grid(
+            row=1, column=0, sticky="w", padx=6, pady=4
+        )
+        self.ad_entry = ttk.Entry(
+            self.options_frame,
+            textvariable=self.ad_ref_path_var,
+        )
+        self.ad_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        self.ad_browse_button = ttk.Button(
+            self.options_frame,
+            text="Browse",
+            command=self.browse_ad_reference,
+        )
+        self.ad_browse_button.grid(row=1, column=2, padx=6, pady=4)
+        self.ad_reload_button = ttk.Button(
+            self.options_frame,
+            text="Reload AD",
+            command=self.fit_ad_clicked,
+        )
+        self.ad_reload_button.grid(row=1, column=3, padx=6, pady=4)
+
+        ttk.Label(
+            self.options_frame,
+            text=(
+                "AD is fitted automatically at startup. Reload AD only when "
+                "changing the reference file."
+            ),
+        ).grid(
+            row=2,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            padx=6,
+            pady=(0, 4),
         )
         self.options_frame.grid_remove()
+
         self.notebook = ttk.Notebook(self)
         self.notebook.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
+        self.mode_notebook = self.notebook
         self.single_tab = ttk.Frame(self.notebook)
         self.batch_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.single_tab, text="Single prediction")
@@ -1024,6 +1669,7 @@ class ErbaTab(ttk.Frame):
             row=3, column=0, sticky="ew", padx=10, pady=(2, 8)
         )
         self.notebook.bind("<<NotebookTabChanged>>", self._workflow_tab_changed)
+        self._register_parity_widgets()
 
     def toggle_options(self):
         self.options_visible = not self.options_visible
@@ -1032,34 +1678,77 @@ class ErbaTab(ttk.Frame):
         else:
             self.options_frame.grid_remove()
 
-    def _route_controls(self, parent, task_var, subtype_var, row=0):
-        ttk.Label(parent, text="Task").grid(row=row, column=0, sticky="w", padx=6, pady=5)
-        task_combo = ttk.Combobox(
-            parent,
-            textvariable=task_var,
-            state="readonly",
-            width=20,
-            values=[ERBATask.CLASSIFICATION.value, ERBATask.IC50_REGRESSION.value],
-        )
-        task_combo.grid(row=row, column=1, sticky="w", padx=6, pady=5)
-        ttk.Label(parent, text="Subtype").grid(row=row, column=2, sticky="w", padx=6, pady=5)
-        subtype_combo = ttk.Combobox(
-            parent,
-            textvariable=subtype_var,
-            state="readonly",
-            width=14,
-            values=[ERBASubtype.ER_ALPHA.value, ERBASubtype.ER_BETA.value],
-        )
-        subtype_combo.grid(row=row, column=3, sticky="w", padx=6, pady=5)
+    def _register_parity_widgets(self):
+        self.parity_widgets = {
+            "endpoint_tab": self,
+            "options_button": self.options_button,
+            "options_frame": self.options_frame,
+            "model_entry": self.model_entry,
+            "model_browse_button": self.model_browse_button,
+            "model_reload_button": self.model_reload_button,
+            "ad_entry": self.ad_entry,
+            "ad_browse_button": self.ad_browse_button,
+            "ad_reload_button": self.ad_reload_button,
+            "mode_notebook": self.mode_notebook,
+            "single_tab": self.single_tab,
+            "batch_tab": self.batch_tab,
+            "cas_label": self.cas_label,
+            "cas_entry": self.cas_entry,
+            "pubchem_button": self.pubchem_button,
+            "smiles_label": self.smiles_label,
+            "smiles_entry": self.smiles_entry,
+            "example_button": self.example_button,
+            "single_predict_button": self.single_predict_button,
+            "draw_structure_button": self.draw_structure_button,
+            "batch_input_entry": self.batch_input_entry,
+            "batch_browse_button": self.batch_input_button,
+            "batch_destination_entry": self.batch_destination_entry,
+            "batch_example_button": self.download_template_button,
+            "batch_predict_button": self.run_batch_button,
+            "batch_progress": self.batch_progress,
+            "batch_status": self.workflow_status_label,
+            "batch_result": self.batch_result,
+        }
 
     def pubchem_clicked(self):
+        cas = self.cas_var.get()
+
         def work():
             try:
-                self.smiles_var.set(cas_lookup_smiles(self.cas_var.get().strip()))
-                self.single_status_var.set("PubChem search completed.")
+                self.after(0, lambda: self.set_status("Searching PubChem..."))
+                result = cas_to_smiles(cas)
+                smiles = result.get("CanonicalSMILES") or result.get(
+                    "IsomericSMILES"
+                )
+                if not smiles:
+                    raise RuntimeError(
+                        "PubChem did not return a SMILES string."
+                    )
+                self.after(
+                    0,
+                    lambda: self._pubchem_complete(
+                        smiles,
+                        result.get("PubChem_CID"),
+                    ),
+                )
             except Exception as error:
-                self.single_status_var.set(f"PubChem search failed: {error}")
+                error_text = str(error)
+                self.after(
+                    0,
+                    lambda: self.show_error("PubChem search failed", error_text),
+                )
         threading.Thread(target=work, daemon=True).start()
+
+    def _pubchem_complete(self, smiles, cid):
+        self.smiles_var.set(smiles)
+        self.set_status(f"PubChem found CID {cid}")
+
+    def load_example_input(self):
+        self.cas_var.set(self.example_cas)
+        self.smiles_var.set(self.example_smiles)
+        self.single_status_var.set(
+            f"Example input restored from {self.example_workbook.name}."
+        )
 
     def open_jsme_popup(self):
         if self.structure_editor is None:
@@ -1068,22 +1757,54 @@ class ErbaTab(ttk.Frame):
         self.structure_editor(self.smiles_var, self.single_status_var)
 
     def _build_single(self):
-        self.single_tab.columnconfigure(0, weight=1)
-        self.single_tab.columnconfigure(1, weight=1)
+        self.single_tab.columnconfigure(0, weight=1, uniform="single")
+        self.single_tab.columnconfigure(1, weight=1, uniform="single")
         self.single_tab.rowconfigure(1, weight=1)
-        controls = ttk.LabelFrame(self.single_tab, text="Input")
-        controls.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        controls.columnconfigure(1, weight=1)
-        ttk.Label(controls, text="CAS").grid(row=0, column=0, sticky="w", padx=6, pady=5)
-        ttk.Entry(controls, textvariable=self.cas_var).grid(row=0, column=1, sticky="ew", padx=6, pady=5)
-        ttk.Button(controls, text="PubChem search", command=self.pubchem_clicked).grid(row=0, column=2, padx=6, pady=5)
-        ttk.Label(controls, text="SMILES").grid(row=1, column=0, sticky="w", padx=6, pady=5)
-        ttk.Entry(controls, textvariable=self.smiles_var).grid(row=1, column=1, sticky="ew", padx=6, pady=5)
-        self.single_button = ttk.Button(controls, text="Predict", command=self.single_predict_clicked)
-        self.single_button.grid(row=1, column=2, padx=6, pady=5)
-        ttk.Button(controls, text="Draw structure", command=self.open_jsme_popup).grid(row=1, column=3, padx=6, pady=5)
-        self.single_route_reason = ttk.Label(self.options_frame, foreground="#b42318", wraplength=700)
-        self.single_route_reason.grid(row=1, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 5))
+
+        input_frame = ttk.LabelFrame(self.single_tab, text="Input")
+        input_frame.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            padx=8,
+            pady=8,
+        )
+        input_frame.columnconfigure(1, weight=1)
+
+        self.cas_label = ttk.Label(input_frame, text="CAS")
+        self.cas_label.grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        self.cas_entry = ttk.Entry(input_frame, textvariable=self.cas_var)
+        self.cas_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=5)
+        self.pubchem_button = ttk.Button(
+            input_frame,
+            text="PubChem search",
+            command=self.pubchem_clicked,
+        )
+        self.pubchem_button.grid(row=0, column=2, padx=6, pady=5)
+        self.example_button = ttk.Button(
+            input_frame,
+            text="Example input",
+            command=self.load_example_input,
+        )
+        self.example_button.grid(row=0, column=3, padx=6, pady=5)
+
+        self.smiles_label = ttk.Label(input_frame, text="SMILES")
+        self.smiles_label.grid(row=1, column=0, sticky="w", padx=6, pady=5)
+        self.smiles_entry = ttk.Entry(input_frame, textvariable=self.smiles_var)
+        self.smiles_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=5)
+        self.single_predict_button = ttk.Button(
+            input_frame,
+            text="Predict",
+            command=self.single_predict_clicked,
+        )
+        self.single_predict_button.grid(row=1, column=2, padx=6, pady=5)
+        self.draw_structure_button = ttk.Button(
+            input_frame,
+            text="Draw structure",
+            command=self.open_jsme_popup,
+        )
+        self.draw_structure_button.grid(row=1, column=3, padx=6, pady=5)
 
         result_frame = ttk.LabelFrame(self.single_tab, text="Prediction result")
         result_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
@@ -1101,26 +1822,32 @@ class ErbaTab(ttk.Frame):
             summary, textvariable=self.single_ad_domain_var,
             font=("Segoe UI", 13, "bold"), fg="#57606a", anchor="w",
         )
-        self.single_ad_domain_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.single_ad_domain_label.grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=(8, 0),
+        )
 
-        self.single_probability_frame = ttk.Frame(result_frame)
-        self.single_probability_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 8))
-        self.single_probability_frame.columnconfigure(0, weight=1)
-        self.single_prob_canvas = tk.Canvas(self.single_probability_frame, height=92, bg="white", highlightthickness=1, highlightbackground="#d0d7de")
-        self.single_prob_canvas.grid(row=0, column=0, sticky="ew")
+        self.single_prob_canvas = tk.Canvas(
+            result_frame,
+            height=92,
+            bg="white",
+            highlightthickness=1,
+            highlightbackground="#d0d7de",
+        )
+        self.single_prob_canvas.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=8,
+            pady=(4, 8),
+        )
         self.single_prob_canvas.bind("<Configure>", lambda _event: self.draw_probability_graph())
+        self.single_probability_frame = self.single_prob_canvas
+        self.single_regression_frame = None
         self.single_negative_bar = self.single_positive_bar = None
 
-        self.single_regression_frame = ttk.Frame(result_frame)
-        self.single_regression_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
-        ttk.Label(
-            self.single_regression_frame, textvariable=self.single_pic50_var,
-            font=("Segoe UI", 13, "bold"),
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            self.single_regression_frame, textvariable=self.single_ic50_var,
-            font=("Segoe UI", 13, "bold"),
-        ).grid(row=0, column=1, sticky="w", padx=(24, 0))
         ttk.Label(result_frame, text="Details").grid(row=2, column=0, sticky="w", padx=8)
         self.single_result_text = tk.Text(result_frame, height=7, wrap="word", font=("Consolas", 9))
         self.single_result_text.tag_configure(
@@ -1136,6 +1863,7 @@ class ErbaTab(ttk.Frame):
         right_frame = ttk.Frame(self.single_tab)
         right_frame.grid(row=1, column=1, sticky="nsew", padx=8, pady=8)
         right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(0, weight=0)
         right_frame.rowconfigure(1, weight=1)
         molecule_pair = ttk.Frame(right_frame)
         molecule_pair.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -1156,83 +1884,178 @@ class ErbaTab(ttk.Frame):
         self.single_ad_graph_label = ttk.Label(ad_frame, text="AD graph will appear after prediction.")
         self.single_ad_graph_label.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.single_nearest_reference_var = tk.StringVar(value="Nearest training reference: -")
-        ttk.Label(ad_frame, textvariable=self.single_nearest_reference_var, wraplength=420, justify="left").grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.single_nearest_reference_label = ttk.Label(
+            ad_frame,
+            textvariable=self.single_nearest_reference_var,
+            wraplength=420,
+            justify="left",
+        )
+        self.single_nearest_reference_label.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=8,
+            pady=(0, 8),
+        )
 
-        caveat = ttk.Frame(self.single_tab)
-        caveat.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 5))
         ttk.Label(
-            caveat,
-            textvariable=self.single_evidence_caveat_var,
-            foreground="#8a4b00",
-            wraplength=760,
-        ).pack(side="left", fill="x", expand=True)
-        ttk.Button(caveat, text="Evidence details", command=self._show_evidence_details).pack(side="right")
-        ttk.Label(self.single_tab, text="CAS to SMILES requires internet access. Direct SMILES prediction works offline.").grid(row=3, column=0, columnspan=2, sticky="sw", padx=8, pady=8)
+            self.single_tab,
+            text=(
+                "CAS to SMILES requires internet access. "
+                "Direct SMILES prediction works offline."
+            ),
+        ).grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="sw",
+            padx=8,
+            pady=8,
+        )
+        self._render_detail_lines()
 
     def _build_batch(self):
         self.batch_tab.columnconfigure(0, weight=1)
         self.batch_tab.rowconfigure(2, weight=1)
-        controls = ttk.LabelFrame(self.batch_tab, text="Batch")
-        controls.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
-        controls.columnconfigure(1, weight=1)
-        self.batch_input_button = ttk.Button(controls, text="Input xlsx", command=self._choose_batch_input)
+
+        frame = ttk.LabelFrame(self.batch_tab, text="Batch")
+        frame.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        frame.columnconfigure(1, weight=1)
+
+        self.batch_input_button = ttk.Button(
+            frame,
+            text="Input xlsx",
+            command=self.browse_batch_input,
+        )
         self.batch_input_button.grid(
-            row=0, column=0, padx=6, pady=5
+            row=0,
+            column=0,
+            sticky="w",
+            padx=6,
+            pady=4,
         )
-        ttk.Label(controls, textvariable=self.batch_input_var, anchor="w").grid(
-            row=0, column=1, columnspan=3, sticky="ew", padx=6, pady=5
+        self.batch_input_entry = ttk.Entry(
+            frame,
+            textvariable=self.batch_input_display_var,
+            state="readonly",
         )
-        ttk.Label(controls, text="Result folder (same as input)").grid(
-            row=1, column=0, sticky="w", padx=6, pady=5
+        self.batch_input_entry.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=6,
+            pady=4,
         )
-        ttk.Label(controls, textvariable=self.batch_destination_var, anchor="w").grid(
-            row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=5
+
+        ttk.Label(frame, text="Result folder (same as input)").grid(
+            row=1,
+            column=0,
+            sticky="w",
+            padx=6,
+            pady=4,
         )
-        ttk.Label(controls, text="Enter CAS numbers in the required CAS column.").grid(
-            row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2)
+        self.batch_destination_entry = ttk.Entry(
+            frame,
+            textvariable=self.batch_destination_var,
+            state="readonly",
         )
-        self.batch_template_button = ttk.Button(
-            controls, text="Download template", command=self._download_batch_template
+        self.batch_destination_entry.grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=6,
+            pady=4,
         )
-        self.batch_template_button.grid(row=3, column=0, padx=6, pady=5, sticky="w")
-        self.batch_button = ttk.Button(controls, text="Run batch", command=self.batch_predict_clicked)
-        self.batch_button.grid(row=4, column=0, padx=6, pady=5, sticky="w")
-        self.batch_route_reason = ttk.Label(controls, foreground="#b42318", wraplength=700)
-        self.batch_route_reason.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 5))
+
+        ttk.Label(
+            frame,
+            text="Enter CAS numbers in the required CAS column.",
+        ).grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            padx=6,
+            pady=(3, 1),
+        )
+        self.download_template_button = ttk.Button(
+            frame,
+            text="Download template",
+            command=self.download_template_clicked,
+        )
+        self.download_template_button.grid(
+            row=3,
+            column=0,
+            sticky="w",
+            padx=6,
+            pady=(1, 4),
+        )
+        self.run_batch_button = ttk.Button(
+            frame,
+            text="Run batch",
+            command=self.batch_predict_clicked,
+        )
+        self.run_batch_button.grid(
+            row=4,
+            column=0,
+            sticky="w",
+            padx=6,
+            pady=(0, 5),
+        )
+
         progress = ttk.Frame(self.batch_tab)
         progress.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
         progress.columnconfigure(0, weight=1)
-        self.batch_progress_bar = ttk.Progressbar(
-            progress, maximum=100, mode="determinate", variable=self.batch_progress_value,
+        self.batch_progress = ttk.Progressbar(
+            progress,
+            maximum=100,
+            variable=self.batch_progress_value,
+            mode="determinate",
         )
-        self.batch_progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.batch_progress.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(0, 8),
+        )
         ttk.Label(progress, textvariable=self.batch_progress_var, anchor="w").grid(
             row=0, column=1, sticky="w"
         )
+
         result_frame = ttk.LabelFrame(self.batch_tab, text="Prediction result")
         result_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
         result_frame.columnconfigure(0, weight=1)
         result_frame.rowconfigure(0, weight=1)
-        self.batch_result = tk.Text(result_frame, height=12, wrap="word", state="disabled")
+        self.batch_result = tk.Text(
+            result_frame,
+            height=12,
+            wrap="word",
+            state="disabled",
+        )
         self.batch_result.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self._set_text(
+            self.batch_result,
+            "Run a batch to show the completion summary.",
+        )
 
     def _selected_route(self, workflow: str):
         return ERBATask.CLASSIFICATION, self.fixed_subtype
 
     def _route_available(self, task, subtype):
+        if self.catalog_error:
+            return False, self.catalog_error
         if task is ERBATask.IC50_REGRESSION and subtype is ERBASubtype.ER_BETA:
             return False, "ERbeta IC50 regression is not supported."
         if task is ERBATask.IC50_REGRESSION and not self.regression_parity_approved:
             return False, "IC50 regression is disabled until catalog parity approval is recorded."
         if (task, subtype) not in self.catalog:
             return False, "This ERBA route is not released in the bundled catalog."
+        selected = getattr(self, "selected_model_spec", None)
+        if selected is None or selected not in self.catalog.choices_for(task, subtype):
+            return False, "Select and reload a released ERalpha model."
+        if self.predictor is None:
+            return False, "The selected ERalpha model is unavailable."
         return True, ""
-
-    def _show_evidence_details(self):
-        route = self._selected_route("single")
-        classification = bool(route and route[0] is ERBATask.CLASSIFICATION)
-        details = HISTORICAL_EXPOSURE_CAVEAT_FULL if classification else REGRESSION_EVIDENCE_CAVEAT_FULL
-        messagebox.showinfo("ERBA evidence caveat", details)
 
     def _route_changed(self, workflow: str | None = None):
         workflows = (workflow,) if workflow else ("single", "batch")
@@ -1241,34 +2064,27 @@ class ErbaTab(ttk.Frame):
             ok, reason = self._route_available(*route) if route else (False, "Invalid ERBA route.")
             if current == "single":
                 self._configure_single_result_task(route[0] if route else None)
-                classification = bool(route and route[0] is ERBATask.CLASSIFICATION)
-                self.single_evidence_caveat_var.set(
-                    HISTORICAL_EXPOSURE_CAVEAT_COMPACT
-                    if classification
-                    else REGRESSION_EVIDENCE_CAVEAT_COMPACT
-                )
-                self.single_route_reason.configure(text=reason)
                 state = "disabled" if self._active_single_request_id is not None else ("normal" if ok else "disabled")
-                self.single_button.configure(state=state)
+                self.single_predict_button.configure(state=state)
+                if reason and self._active_single_request_id is None:
+                    self.single_status_var.set(reason)
             else:
-                self.batch_route_reason.configure(text=reason)
                 state = "disabled" if self._active_batch_request_id is not None else ("normal" if ok else "disabled")
-                self.batch_button.configure(state=state)
+                self.run_batch_button.configure(state=state)
                 if self._active_batch_request_id is None:
                     self.batch_input_button.configure(state="normal")
-                    self.batch_template_button.configure(state="normal")
+                    self.download_template_button.configure(state="normal")
+                    if reason:
+                        self.batch_status_var.set(reason)
 
     def _configure_single_result_task(self, task):
         probability_frame = getattr(self, "single_probability_frame", None)
-        regression_frame = getattr(self, "single_regression_frame", None)
-        if probability_frame is None or regression_frame is None:
+        if probability_frame is None:
             return
         if task is ERBATask.CLASSIFICATION:
-            regression_frame.grid_remove()
             probability_frame.grid()
         else:
             probability_frame.grid_remove()
-            regression_frame.grid()
 
     def _snapshot(self, workflow: str):
         route = self._selected_route(workflow)
@@ -1281,13 +2097,27 @@ class ErbaTab(ttk.Frame):
             status.set(reason or self.catalog_error)
             return None
         self._request_id += 1
-        self._started_at[self._request_id] = time.perf_counter()
-        return self._request_id, task, subtype, self.catalog[(task, subtype)].model_id
+        request_id = self._request_id
+        self._started_at[request_id] = time.perf_counter()
+        self._request_generations[request_id] = self._model_generation
+        self._request_predictors[request_id] = self.predictor
+        self._request_specs[request_id] = self.selected_model_spec
+        self._request_ad_calculators[request_id] = self.erba_ad
+        return request_id, task, subtype, self.selected_model_spec.model_id
 
     def _finish_duration_ms(self, request_id: int) -> int:
         started_at = getattr(self, "_started_at", {})
         started = started_at.pop(request_id, time.perf_counter())
         return max(0, int((time.perf_counter() - started) * 1000))
+
+    def _forget_request(self, request_id: int) -> None:
+        for name in (
+            "_request_generations",
+            "_request_predictors",
+            "_request_specs",
+            "_request_ad_calculators",
+        ):
+            getattr(self, name, {}).pop(request_id, None)
 
     def single_predict_clicked(self):
         snapshot = self._snapshot("single")
@@ -1296,8 +2126,13 @@ class ErbaTab(ttk.Frame):
         request_id, task, subtype, model_id = snapshot
         direct_smiles, cas = self.smiles_var.get().strip(), self.cas_var.get().strip()
         self._active_single_request_id = request_id
-        self.single_button.configure(state="disabled")
+        self.single_predict_button.configure(state="disabled")
         self.single_status_var.set("Predicting ERBA route...")
+        predictor = getattr(self, "_request_predictors", {}).get(
+            request_id,
+            self.predictor,
+        )
+
         def work():
             smiles = direct_smiles
             if not smiles and cas:
@@ -1323,24 +2158,29 @@ class ErbaTab(ttk.Frame):
                         ),
                     )
                     return
-            result = self.predictor.predict(ERBARequest(smiles=smiles, task=task, subtype=subtype))
+            result = predictor.predict(
+                ERBARequest(smiles=smiles, task=task, subtype=subtype)
+            )
             self.after(0, lambda: self._single_complete(request_id, task, subtype, model_id, result, "", smiles))
         threading.Thread(target=work, daemon=True).start()
 
     def _single_complete(self, request_id, task, subtype, model_id, result, error, smiles=""):
         duration_ms = self._finish_duration_ms(request_id)
         if request_id != self._active_single_request_id:
+            self._forget_request(request_id)
             self._emit("model.inference_stale", workflow="erba", task=task.value, subtype=subtype.value,
                        model_id=model_id, correlation_id=request_id, duration_ms=duration_ms)
             return
         self._active_single_request_id = None
         if not self._snapshot_is_current("single", request_id, task, subtype, model_id):
+            self._forget_request(request_id)
             self._route_changed("single")
             self._emit("model.inference_stale", workflow="erba", task=task.value, subtype=subtype.value,
                        model_id=model_id, correlation_id=request_id, duration_ms=duration_ms)
             return
         self._route_changed("single")
         if error:
+            self._forget_request(request_id)
             self._clear_single_result("Prediction failed")
             self.single_status_var.set(error)
             self._emit("model.inference_complete", workflow="erba", task=task.value, subtype=subtype.value,
@@ -1360,10 +2200,20 @@ class ErbaTab(ttk.Frame):
                 args=(request_id, task, subtype, result.model_smiles or smiles),
                 daemon=True,
             ).start()
+        else:
+            self._forget_request(request_id)
 
     def _evaluate_single_ad(self, request_id, task, subtype, smiles):
         try:
-            calculator, ad_result, fingerprint = self.erba_ad.evaluate(task, subtype, smiles)
+            route_ad = getattr(self, "_request_ad_calculators", {}).get(
+                request_id,
+                self.erba_ad,
+            )
+            calculator, ad_result, fingerprint = route_ad.evaluate(
+                task,
+                subtype,
+                smiles,
+            )
             graph_path = save_single_ad_plot(calculator, fingerprint, str(validate_mutable_directory(self.output_root) / "erba_ad"))
             self.after(
                 0,
@@ -1385,11 +2235,23 @@ class ErbaTab(ttk.Frame):
     ):
         if (
             request_id != self._active_ad_request_id
-            or self._selected_route("single") != (task, subtype)
+            or not self._snapshot_is_current(
+                "single",
+                request_id,
+                task,
+                subtype,
+                getattr(
+                    getattr(self, "_request_specs", {}).get(request_id),
+                    "model_id",
+                    "",
+                ),
+            )
         ):
+            self._forget_request(request_id)
             return
         self._active_ad_request_id = None
         if error:
+            self._forget_request(request_id)
             self.single_ad_domain_var.set(f"Applicability domain: AD error — {error}")
             self._single_detail_lines.append(f"Applicability domain: Error: {error}")
             self._render_detail_lines()
@@ -1413,21 +2275,29 @@ class ErbaTab(ttk.Frame):
         self._render_detail_lines()
         self._draw_nearest_reference_structure(ref)
         if PIL_AVAILABLE and graph_path:
-            with Image.open(graph_path) as image:
-                image.thumbnail((520, 300))
-                self._single_ad_graph_image = ImageTk.PhotoImage(image.copy())
+            self._single_ad_graph_image = self._make_preview_photo(
+                graph_path,
+                self.single_ad_preview_size,
+            )
             self.single_ad_graph_label.configure(image=self._single_ad_graph_image, text="")
+        self._forget_request(request_id)
 
     def _clear_single_result(self, summary):
         if hasattr(self, "_active_ad_request_id"):
             self._active_ad_request_id = None
         self.single_prediction_summary_var.set(summary)
+        if hasattr(self, "single_prediction_label"):
+            self.single_prediction_label.configure(fg="#57606a")
         self.single_negative_probability_var.set("Non-binding probability: -")
         self.single_positive_probability_var.set("Binding probability: -")
         self.single_pic50_var.set("pIC50: -")
         self.single_ic50_var.set("IC50: - nM")
         self.single_detail_var.set("No prediction result is available.")
-        self._single_detail_lines = [f"Status: {summary}"]
+        self._single_detail_lines = [
+            f"Status: {summary}",
+            "",
+            f"Evidence caveat: {HISTORICAL_EXPOSURE_CAVEAT_COMPACT}",
+        ]
         self._single_positive_probability = None
         self.draw_probability_graph()
         for name in ("single_negative_bar", "single_positive_bar"):
@@ -1442,10 +2312,19 @@ class ErbaTab(ttk.Frame):
             self.single_ad_domain_var.set("Applicability domain: Not evaluated")
         if hasattr(self, "single_nearest_reference_var"):
             self.single_nearest_reference_var.set("Nearest training reference: -")
+        reference_structure = getattr(
+            self,
+            "single_nearest_reference_structure_label",
+            None,
+        )
+        if reference_structure is not None:
+            reference_structure.configure(text="No reference", image="")
+        self._nearest_reference_structure_image = None
         if hasattr(self, "single_ad_graph_label"):
             self.single_ad_graph_label.configure(
                 text="AD graph will appear after prediction.", image=""
             )
+        self._single_ad_graph_image = None
         self._render_detail_lines()
 
     def _render_single_result(self, result):
@@ -1460,12 +2339,24 @@ class ErbaTab(ttk.Frame):
                 f"Model ID: {result.model_id or ''}",
                 f"Preprocessing policy ID: {result.preprocessing_policy_id or ''}",
                 f"Evidence scope: {result.evidence_scope or ''}",
+                f"Evidence caveat: {result.evidence_caveat or HISTORICAL_EXPOSURE_CAVEAT_COMPACT}",
             ]
             self._render_detail_lines()
             return
         if result.task is ERBATask.CLASSIFICATION:
             label = _binding_display_label(result.binding_label) or "Unknown"
             self.single_prediction_summary_var.set(f"Binding prediction: {label}")
+            prediction_label = getattr(self, "single_prediction_label", None)
+            if prediction_label is not None:
+                prediction_label.configure(
+                    fg=(
+                        "#cf222e"
+                        if label == "Binding"
+                        else "#1a7f37"
+                        if label == "Non-binding"
+                        else "#57606a"
+                    )
+                )
             negative = float(result.non_binding_probability or 0)
             positive = float(result.binding_probability or 0)
             self.single_negative_probability_var.set(f"Non-binding probability: {negative:.1%}")
@@ -1508,6 +2399,7 @@ class ErbaTab(ttk.Frame):
             f"Model SHA256: {result.model_sha256 or ''}",
             f"Preprocessing policy ID: {result.preprocessing_policy_id or ''}",
             f"Evidence scope: {result.evidence_scope or ''}",
+            f"Evidence caveat: {result.evidence_caveat or HISTORICAL_EXPOSURE_CAVEAT_COMPACT}",
         ]
         self._draw_single_structure(result.model_smiles)
         self._render_detail_lines()
@@ -1552,12 +2444,27 @@ class ErbaTab(ttk.Frame):
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / f"{self.fixed_subtype.value}_nearest_reference.png"
             save_molecule_image(smiles, str(path), size=(260, 200))
-            with Image.open(path) as image:
-                image.thumbnail((260, 200))
-                self._nearest_reference_structure_image = ImageTk.PhotoImage(image.copy())
+            self._nearest_reference_structure_image = self._make_preview_photo(
+                path,
+                self.nearest_reference_preview_size,
+            )
+            label_parts = []
+            for key in ("label", "Label", "Activity", "active", "inactive"):
+                if reference.get(key):
+                    label = _binding_display_label(reference.get(key))
+                    label_parts.append(
+                        f"label: {label or reference.get(key)}"
+                    )
+                    break
+            for key in ("CID", "PubChem_CID"):
+                if reference.get(key):
+                    label_parts.append(f"CID: {reference.get(key)}")
+                    break
             widget.configure(
                 image=self._nearest_reference_structure_image,
-                text="",
+                text=" / ".join(label_parts) or "Nearest reference",
+                compound="top",
+                wraplength=180,
             )
         except Exception as error:
             widget.configure(text=f"Reference preview unavailable: {error}", image="")
@@ -1569,20 +2476,42 @@ class ErbaTab(ttk.Frame):
         canvas = self.single_prob_canvas
         canvas.delete("all")
         positive = getattr(self, "_single_positive_probability", None)
-        width, margin, label_width, bar_h = max(canvas.winfo_width(), 360), 18, 94, 18
-        bar_x, bar_w = margin + label_width, max(width - margin - label_width - 48, 120)
-        def bar(y, label, value, color):
-            canvas.create_text(margin, y + bar_h / 2, text=label, anchor="w")
+        width = max(canvas.winfo_width(), 360)
+        margin = 18
+        label_width = 94
+        bar_x = margin + label_width
+        bar_w = max(width - bar_x - margin - 48, 120)
+        inactive_y = 22
+        active_y = 58
+        bar_h = 18
+
+        def draw_bar(y, label, value, color):
+            value = max(0.0, min(1.0, float(value)))
+            canvas.create_text(
+                margin,
+                y + bar_h / 2,
+                text=label,
+                anchor="w",
+                fill="#24292f",
+            )
             canvas.create_rectangle(bar_x, y, bar_x + bar_w, y + bar_h, fill="#eef2f7", outline="#d0d7de")
             canvas.create_rectangle(bar_x, y, bar_x + bar_w * value, y + bar_h, fill=color, outline=color)
-            canvas.create_text(bar_x + bar_w + 8, y + bar_h / 2, text=f"{value:.3f}", anchor="w")
+            canvas.create_text(
+                bar_x + bar_w + 8,
+                y + bar_h / 2,
+                text=f"{value:.3f}",
+                anchor="w",
+                fill="#24292f",
+            )
+
         if positive is None:
-            bar(22, "Non-binding", 0, "#2da44e")
-            bar(58, "Binding", 0, "#cf222e")
+            draw_bar(inactive_y, "Non-binding", 0.0, "#2da44e")
+            draw_bar(active_y, "Binding", 0.0, "#cf222e")
             canvas.create_text(bar_x, 8, text="Run prediction to show probabilities", anchor="w", fill="#57606a")
             return
-        bar(22, "Non-binding", 1 - positive, "#2da44e")
-        bar(58, "Binding", positive, "#cf222e")
+        positive = max(0.0, min(1.0, float(positive)))
+        draw_bar(inactive_y, "Non-binding", 1.0 - positive, "#2da44e")
+        draw_bar(active_y, "Binding", positive, "#cf222e")
 
     def _draw_single_structure(self, smiles):
         structure = getattr(self, "single_structure_label", None)
@@ -1600,19 +2529,34 @@ class ErbaTab(ttk.Frame):
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / "erba_single_structure.png"
             save_molecule_image(smiles, str(path), size=(260, 200))
-            with Image.open(path) as image:
-                image.thumbnail((260, 200))
-                self._single_structure_image = ImageTk.PhotoImage(image.copy())
+            self._single_structure_image = self._make_preview_photo(
+                path,
+                self.single_preview_size,
+            )
             structure.configure(image=self._single_structure_image, text="")
         except Exception as error:
             structure.configure(text=f"Structure preview unavailable: {error}", image="")
             self._single_structure_image = None
 
-    def _choose_batch_input(self):
-        path = filedialog.askopenfilename(title="Select ERBA input", filetypes=[("Excel", "*.xlsx")])
+    @staticmethod
+    def _make_preview_photo(path: str | Path, size: tuple[int, int]):
+        image = Image.open(path).convert("RGB")
+        image.thumbnail(size)
+        canvas = Image.new("RGB", size, "white")
+        x = (size[0] - image.width) // 2
+        y = (size[1] - image.height) // 2
+        canvas.paste(image, (x, y))
+        return ImageTk.PhotoImage(canvas)
+
+    def browse_batch_input(self):
+        path = filedialog.askopenfilename(
+            title="Select input Excel",
+            filetypes=[("Excel", "*.xlsx *.xls"), ("All files", "*.*")],
+        )
         if path:
             source = Path(path).expanduser().resolve(strict=False)
             self.batch_input_var.set(str(source))
+            self.batch_input_display_var.set(source.name)
             try:
                 destination = validate_mutable_directory(
                     source.parent,
@@ -1632,41 +2576,45 @@ class ErbaTab(ttk.Frame):
                 f"Result workbook will be saved beside the input: {destination}"
             )
 
-    def _download_batch_template(self):
-        path = filedialog.asksaveasfilename(
-            title="Save ERalpha batch template",
-            defaultextension=".xlsx",
-            filetypes=[("Excel", "*.xlsx")],
-            initialfile="ERalpha_batch_template.xlsx",
-        )
-        if not path:
-            return
-        destination = Path(path).expanduser().resolve(strict=False)
+    def download_template_clicked(self):
         try:
+            path = filedialog.asksaveasfilename(
+                title="Download batch template",
+                defaultextension=".xlsx",
+                initialfile="Template.xlsx",
+                filetypes=[("Excel", "*.xlsx")],
+            )
+            if not path:
+                return
+            destination = Path(path).expanduser().resolve(strict=False)
             validate_mutable_directory(
                 destination.parent,
                 forbidden_roots=(self.project_root, self.install_root),
             )
             pd.DataFrame(columns=["CAS"]).to_excel(destination, index=False)
         except Exception as error:
-            messagebox.showerror(
-                "Template download failed",
+            message = (
                 "Save the template in a writable folder outside the application files. "
-                f"Details: {error}",
+                f"Details: {error}"
             )
+            self.batch_status_var.set(message)
+            messagebox.showerror("Template download failed", message)
             return
         self.batch_input_var.set(str(destination))
+        self.batch_input_display_var.set(destination.name)
         self.batch_destination_var.set(batch_destination_display(destination))
-        self.batch_status_var.set(
-            f"Template saved. Result workbook will be saved beside it: {destination.parent}"
+        self.batch_status_var.set(f"Template downloaded: {destination}")
+        messagebox.showinfo(
+            "Template downloaded",
+            f"Saved:\n{destination}\n\nEnter CAS values, save the file, then run batch.",
         )
 
-    def _set_batch_controls_running(self, running: bool):
-        state = "disabled" if running else "normal"
+    def _set_batch_controls_active(self, active: bool):
+        state = "disabled" if active else "normal"
         for widget in (
             self.batch_input_button,
-            self.batch_template_button,
-            self.batch_button,
+            self.download_template_button,
+            self.run_batch_button,
         ):
             widget.configure(state=state)
 
@@ -1686,6 +2634,7 @@ class ErbaTab(ttk.Frame):
                 f"Batch prediction failed.\n\nTechnical details: {message}",
             )
         self._started_at.pop(request_id, None)
+        self._forget_request(request_id)
 
     def batch_predict_clicked(self):
         snapshot = self._snapshot("batch")
@@ -1714,7 +2663,11 @@ class ErbaTab(ttk.Frame):
             )
             return
         try:
-            preflight = self.predictor.preflight(task, subtype)
+            predictor = getattr(self, "_request_predictors", {}).get(
+                request_id,
+                self.predictor,
+            )
+            preflight = predictor.preflight(task, subtype)
             if not preflight.ready:
                 raise RuntimeError(
                     f"ERBA route preflight failed ({preflight.status_code.value}): {preflight.status_message}"
@@ -1724,7 +2677,7 @@ class ErbaTab(ttk.Frame):
             return
         input_path = str(source)
         self.batch_destination_var.set(str(output_dir))
-        self._set_batch_controls_running(True)
+        self._set_batch_controls_active(True)
         self._active_batch_request_id = request_id
         self._set_batch_progress(request_id, "Ready to read input", 0, 0, 0)
         self.batch_status_var.set("Running ERBA batch...")
@@ -1744,6 +2697,13 @@ class ErbaTab(ttk.Frame):
     def _set_batch_progress(self, request_id, stage, current, total, percent):
         if request_id != getattr(self, "_active_batch_request_id", None):
             return
+        current_generation = getattr(self, "_model_generation", 0)
+        request_generation = getattr(self, "_request_generations", {}).get(
+            request_id,
+            current_generation,
+        )
+        if request_generation != current_generation:
+            return
         percent = max(0, min(100, int(percent)))
         detail = f"{current}/{total}" if total else "0/0"
         progress_var = getattr(self, "batch_progress_var", None)
@@ -1755,13 +2715,25 @@ class ErbaTab(ttk.Frame):
 
     def _batch_work(self, request_id, task, subtype, model_id, input_path):
         try:
+            predictor = getattr(self, "_request_predictors", {}).get(
+                request_id,
+                self.predictor,
+            )
+            route_ad = getattr(self, "_request_ad_calculators", {}).get(
+                request_id,
+                self.erba_ad,
+            )
+            spec = getattr(self, "_request_specs", {}).get(request_id)
+            if spec is None:
+                selected = getattr(self, "selected_model_spec", None)
+                spec = selected or self.catalog[(task, subtype)]
             export_result = export_erba_batch(
                 input_path,
                 task,
                 subtype,
-                self.predictor,
-                self.erba_ad,
-                self.catalog[(task, subtype)],
+                predictor,
+                route_ad,
+                spec,
                 self.catalog_payload,
                 progress_callback=lambda stage, current, total, percent: self._batch_progress_from_worker(
                     request_id, stage, current, total, percent
@@ -1788,8 +2760,23 @@ class ErbaTab(ttk.Frame):
     ):
         duration_ms = self._finish_duration_ms(request_id)
         if request_id != self._active_batch_request_id:
+            self._forget_request(request_id)
             if self._active_batch_request_id is None:
                 self._route_changed("batch")
+            self._emit("batch.inference_stale", workflow="erba", task=task.value, subtype=subtype.value,
+                       model_id=model_id, correlation_id=request_id, duration_ms=duration_ms)
+            return
+        if not self._snapshot_is_current(
+            "batch",
+            request_id,
+            task,
+            subtype,
+            model_id,
+        ):
+            self._active_batch_request_id = None
+            self._set_batch_controls_active(False)
+            self._forget_request(request_id)
+            self._route_changed("batch")
             self._emit("batch.inference_stale", workflow="erba", task=task.value, subtype=subtype.value,
                        model_id=model_id, correlation_id=request_id, duration_ms=duration_ms)
             return
@@ -1801,12 +2788,8 @@ class ErbaTab(ttk.Frame):
             100,
         )
         self._active_batch_request_id = None
-        self._set_batch_controls_running(False)
-        if not self._snapshot_is_current("batch", request_id, task, subtype, model_id):
-            self._route_changed("batch")
-            self._emit("batch.inference_stale", workflow="erba", task=task.value, subtype=subtype.value,
-                       model_id=model_id, correlation_id=request_id, duration_ms=duration_ms)
-            return
+        self._set_batch_controls_active(False)
+        self._forget_request(request_id)
         self._route_changed("batch")
         if error:
             self.batch_status_var.set(f"ERBA batch failed: {error}")
@@ -1868,12 +2851,22 @@ class ErbaTab(ttk.Frame):
         active_id = (
             self._active_single_request_id if workflow == "single" else self._active_batch_request_id
         )
+        selected = getattr(self, "selected_model_spec", None)
+        if selected is None:
+            selected = self.catalog.get((task, subtype))
+        generation = getattr(self, "_model_generation", 0)
+        request_generation = getattr(self, "_request_generations", {}).get(
+            request_id,
+            generation,
+        )
         return (
             active_id in (None, request_id)
             and self._selected_route(workflow) == (task, subtype)
-            and self.catalog.get((task, subtype), None) is not None
-            and self.catalog[(task, subtype)].model_id == model_id
+            and selected is not None
+            and selected.model_id == model_id
+            and request_generation == generation
         )
+
     @staticmethod
     def _set_text(widget, text):
         widget.configure(state="normal")

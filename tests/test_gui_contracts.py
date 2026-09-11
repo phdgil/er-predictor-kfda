@@ -22,6 +22,7 @@ from core.contracts import (
 from gui.erba_tab import (
     ERBA_BATCH_AD_COLUMNS,
     ERBABatchExportResult,
+    ERBAReleasedCatalog,
     ErbaTab,
     allocate_output_path,
     batch_destination_display as erba_batch_destination_display,
@@ -29,6 +30,7 @@ from gui.erba_tab import (
     canonicalize_batch_input,
     export_erba_batch,
     load_erba_catalog,
+    load_shared_example_input,
     metadata_row,
     save_erba_batch_graphs,
 )
@@ -59,6 +61,15 @@ class GuiContractTests(unittest.TestCase):
         self.assertIn("Applicability domain: Not evaluated", erba_source)
         self.assertIn("Non-binding probability", erba_source)
         self.assertIn("Binding probability", erba_source)
+        self.assertIn('text="Model"', erba_source)
+        self.assertIn("command=self.browse_model", erba_source)
+        self.assertIn("command=self.load_model_clicked", erba_source)
+        self.assertIn("command=self.browse_ad_reference", erba_source)
+        self.assertIn("command=self.fit_ad_clicked", erba_source)
+        self.assertNotIn('text="Task"', erba_source)
+        self.assertNotIn('text="Receptor"', erba_source)
+        self.assertNotIn("single_route_reason", erba_source)
+        self.assertNotIn("batch_route_reason", erba_source)
         self.assertNotIn("Negative probability", erba_source)
         self.assertNotIn("Positive probability", erba_source)
         self.assertIn('"detail_key"', erba_source)
@@ -81,6 +92,49 @@ class GuiContractTests(unittest.TestCase):
             erba_source,
         )
 
+    def test_parity_widget_contract_has_identical_complete_key_sets(self):
+        keys = (
+            "endpoint_tab",
+            "options_button",
+            "options_frame",
+            "model_entry",
+            "model_browse_button",
+            "model_reload_button",
+            "ad_entry",
+            "ad_browse_button",
+            "ad_reload_button",
+            "mode_notebook",
+            "single_tab",
+            "batch_tab",
+            "cas_label",
+            "cas_entry",
+            "pubchem_button",
+            "smiles_label",
+            "smiles_entry",
+            "example_button",
+            "single_predict_button",
+            "draw_structure_button",
+            "batch_input_entry",
+            "batch_browse_button",
+            "batch_destination_entry",
+            "batch_example_button",
+            "batch_predict_button",
+            "batch_progress",
+            "batch_status",
+            "batch_result",
+        )
+        for source_path in ("gui/main_window.py", "gui/erba_tab.py"):
+            source = Path(source_path).read_text(encoding="utf-8")
+            for key in keys:
+                self.assertEqual(
+                    source.count(f'"{key}":'),
+                    1,
+                    f"{source_path} must expose exactly one {key!r} parity handle",
+                )
+            self.assertIn('text="Example input"', source)
+            self.assertIn('text="Download template"', source)
+            self.assertIn('uniform="single"', source)
+
     def test_catalog_releases_only_approved_routes_and_keeps_beta_regression_disabled(self):
         payload = {
             "schema_version": 2,
@@ -100,8 +154,57 @@ class GuiContractTests(unittest.TestCase):
             catalog, parity, _ = load_erba_catalog(path)
         self.assertTrue(parity)
         self.assertIn((ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA), catalog)
+        self.assertEqual(
+            [
+                spec.model_id
+                for spec in catalog.choices_for(
+                    ERBATask.CLASSIFICATION,
+                    ERBASubtype.ER_ALPHA,
+                )
+            ],
+            ["alpha"],
+        )
         self.assertNotIn((ERBATask.IC50_REGRESSION, ERBASubtype.ER_BETA), catalog)
         self.assertNotIn((ERBATask.CLASSIFICATION, ERBASubtype.ER_BETA), catalog)
+
+    def test_catalog_retains_multiple_released_model_choices_for_one_route(self):
+        payload = {
+            "schema_version": 2,
+            "regression_parity_approved": False,
+            "routes": [
+                {
+                    "task": "classification",
+                    "subtype": "er_alpha",
+                    "release_status": "released",
+                    "relative_path": "alpha-v7.joblib",
+                    "size_bytes": 10,
+                    "sha256": "a" * 64,
+                    "model_id": "alpha-v7",
+                },
+                {
+                    "task": "classification",
+                    "subtype": "er_alpha",
+                    "release_status": "released",
+                    "relative_path": "alpha-v8.joblib",
+                    "size_bytes": 20,
+                    "sha256": "b" * 64,
+                    "model_id": "alpha-v8",
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "catalog.v2.json")
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            catalog, _, _ = load_erba_catalog(path)
+
+        route = (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA)
+        self.assertIsInstance(catalog, ERBAReleasedCatalog)
+        self.assertEqual(catalog[route].model_id, "alpha-v7")
+        self.assertEqual(
+            [spec.model_id for spec in catalog.choices_for(*route)],
+            ["alpha-v7", "alpha-v8"],
+        )
+        self.assertEqual(catalog.model_for(*route, "alpha-v8").size_bytes, 20)
 
     def test_output_names_are_reserved_without_overwriting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -111,6 +214,65 @@ class GuiContractTests(unittest.TestCase):
             self.assertTrue(second.exists())
             self.assertNotEqual(first, second)
 
+    def test_both_endpoints_use_and_independently_restore_the_erta_example(self):
+        example = load_shared_example_input(Path.cwd())
+        source = pd.read_excel(
+            example.workbook,
+            sheet_name=0,
+            nrows=1,
+            dtype=str,
+            keep_default_na=False,
+        )
+        self.assertEqual(example.cas, source.loc[0, "CAS"])
+        self.assertEqual(example.smiles, source.loc[0, "SMILES"])
+        self.assertTrue(example.cas)
+        self.assertTrue(example.smiles)
+
+        class Variable:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        erta = MainWindow.__new__(MainWindow)
+        eralpha = ErbaTab.__new__(ErbaTab)
+        for endpoint in (erta, eralpha):
+            endpoint.example_cas = example.cas
+            endpoint.example_smiles = example.smiles
+            endpoint.example_workbook = example.workbook
+            endpoint.cas_var = Variable("changed-cas")
+            endpoint.smiles_var = Variable("changed-smiles")
+        erta.set_status = lambda _text: None
+        eralpha.single_status_var = Variable()
+
+        erta.load_example_input()
+        eralpha.load_example_input()
+
+        self.assertEqual(
+            (erta.cas_var.get(), erta.smiles_var.get()),
+            (example.cas, example.smiles),
+        )
+        self.assertEqual(
+            (eralpha.cas_var.get(), eralpha.smiles_var.get()),
+            (example.cas, example.smiles),
+        )
+        erta.cas_var.set("ERTA-only")
+        self.assertEqual(eralpha.cas_var.get(), example.cas)
+        main_source = Path("gui/main_window.py").read_text(encoding="utf-8")
+        eralpha_source = Path("gui/erba_tab.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "self.batch_input_var = tk.StringVar(value=str(self.example_workbook))",
+            main_source,
+        )
+        self.assertIn(
+            "self.batch_input_var = tk.StringVar(value=str(self.example_workbook))",
+            eralpha_source,
+        )
+
 
 
 class _Variable:
@@ -119,6 +281,9 @@ class _Variable:
 
     def get(self):
         return self.value
+
+    def set(self, value):
+        self.value = value
 
 
 class _StartupPredictor:
@@ -148,11 +313,14 @@ class StartupLoadingContractTests(unittest.TestCase):
         window = MainWindow.__new__(MainWindow)
         window.model_path_var = _Variable(model_path)
         window.ad_ref_path_var = _Variable(ad_path)
+        window.loaded_model_path_var = _Variable()
+        window.loaded_ad_ref_path_var = _Variable()
         window.predictor = predictor or _StartupPredictor()
         window.ad_calculator = ad_calculator or _StartupADCalculator()
         window.statuses = []
         window.set_status = window.statuses.append
         window.run_threaded = lambda job: job()
+        window.ui = lambda callback, *args: callback(*args)
         return window
 
     def test_startup_reports_blank_or_missing_model_path_and_does_not_claim_ready(self):
@@ -247,6 +415,351 @@ class StartupLoadingContractTests(unittest.TestCase):
             window.statuses,
             ["Loading default model...", "Loading default AD reference...", "Ready"],
         )
+
+
+class EralphaModelSelectionContractTests(unittest.TestCase):
+    class Variable:
+        def __init__(self, value=""):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    def _catalog_tab(self):
+        tab = ErbaTab.__new__(ErbaTab)
+        tab.project_root = Path.cwd()
+        tab.fixed_subtype = ERBASubtype.ER_ALPHA
+        tab.catalog_path = (
+            tab.project_root / "models" / "erba" / "catalog.v2.json"
+        )
+        (
+            tab.catalog,
+            tab.regression_parity_approved,
+            tab.catalog_payload,
+        ) = load_erba_catalog(tab.catalog_path)
+        return tab
+
+    def test_approved_released_model_browse_selects_catalogued_bytes(self):
+        tab = self._catalog_tab()
+        route = (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA)
+        spec = tab.catalog[route]
+        approved = (tab.catalog_path.parent / spec.relative_path).resolve()
+        tab.model_path_var = self.Variable()
+        tab.single_status_var = self.Variable()
+        tab.batch_status_var = self.Variable()
+
+        with patch(
+            "gui.erba_tab.filedialog.askopenfilename",
+            return_value=str(approved),
+        ):
+            tab.browse_model()
+
+        self.assertEqual(tab.model_path_var.get(), str(approved))
+        self.assertIn("Reload model", tab.single_status_var.get())
+        selected = tab._released_model_for_path(approved)
+        self.assertEqual(selected[:3], (*route, spec))
+
+    def test_reload_activates_the_selected_released_model_and_binds_its_ad_route(self):
+        tab = self._catalog_tab()
+        route = (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA)
+        spec = tab.catalog[route]
+        approved = (tab.catalog_path.parent / spec.relative_path).resolve()
+        selected_text = str(approved.relative_to(Path.cwd())).replace("\\", "/")
+        tab.model_path_var = self.Variable(selected_text)
+        tab.ad_ref_path_var = self.Variable()
+        tab.loaded_model_path_var = self.Variable()
+        tab.loaded_ad_ref_path_var = self.Variable()
+        tab.single_status_var = self.Variable()
+        tab.batch_status_var = self.Variable()
+        tab._model_generation = 0
+        tab._model_reload_id = 0
+        tab._route_changed = lambda *_args: None
+        tab.after = lambda _delay, callback: callback()
+
+        class Predictor:
+            def preflight(self, task, subtype):
+                return ERBARoutePreflight(task, subtype, ERBAStatusCode.OK)
+
+        predictor = Predictor()
+
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch.object(
+            tab,
+            "_predictor_for_spec",
+            return_value=predictor,
+        ), patch("gui.erba_tab.threading.Thread", ImmediateThread), patch(
+            "gui.erba_tab.messagebox.showinfo"
+        ):
+            tab.load_model_clicked()
+
+        self.assertIs(tab.predictor, predictor)
+        self.assertEqual(tab.selected_model_spec, spec)
+        self.assertEqual(tab.loaded_model_path_var.get(), str(approved))
+        self.assertEqual(
+            Path(tab.ad_ref_path_var.get()).name,
+            "classification_er_alpha_reference.xlsx",
+        )
+        self.assertEqual(tab._model_generation, 1)
+        self.assertEqual(tab._model_reload_id, 1)
+
+    def test_late_model_reload_completion_and_failure_cannot_replace_newer_success(self):
+        tab = self._catalog_tab()
+        route = (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA)
+        spec = tab.catalog[route]
+        approved = (tab.catalog_path.parent / spec.relative_path).resolve()
+        selected_text = str(approved.relative_to(Path.cwd())).replace("\\", "/")
+        tab.model_path_var = self.Variable(selected_text)
+        tab.ad_ref_path_var = self.Variable()
+        tab.loaded_model_path_var = self.Variable()
+        tab.loaded_ad_ref_path_var = self.Variable()
+        tab.single_status_var = self.Variable()
+        tab.batch_status_var = self.Variable()
+        tab._model_reload_id = 2
+        tab._model_generation = 0
+        tab._route_changed = lambda *_args: None
+        older_predictor, newer_predictor = object(), object()
+
+        with patch("gui.erba_tab.messagebox.showinfo") as show_info, patch(
+            "gui.erba_tab.messagebox.showerror"
+        ) as show_error:
+            tab._finish_model_reload(
+                2,
+                selected_text,
+                *route,
+                spec,
+                approved,
+                newer_predictor,
+            )
+            status_after_newer = tab.single_status_var.get()
+            tab._finish_model_reload(
+                1,
+                selected_text,
+                *route,
+                spec,
+                approved,
+                older_predictor,
+            )
+            tab._model_reload_failed(1, selected_text, "obsolete failure")
+
+        self.assertIs(tab.predictor, newer_predictor)
+        self.assertEqual(tab._model_generation, 1)
+        self.assertEqual(tab.single_status_var.get(), status_after_newer)
+        show_info.assert_called_once()
+        show_error.assert_not_called()
+
+    def test_unapproved_model_browse_is_rejected_before_predictor_construction(self):
+        tab = self._catalog_tab()
+        original = "approved-selection-remains"
+        tab.model_path_var = self.Variable(original)
+        tab.single_status_var = self.Variable()
+        tab.batch_status_var = self.Variable()
+        with tempfile.TemporaryDirectory() as directory:
+            unapproved = Path(directory, "unapproved.joblib")
+            unapproved.write_bytes(b"not an approved model")
+            with patch(
+                "gui.erba_tab.filedialog.askopenfilename",
+                return_value=str(unapproved),
+            ), patch("gui.erba_tab.messagebox.showerror") as show_error, patch(
+                "gui.erba_tab.ERBAPredictor"
+            ) as predictor_constructor:
+                tab.browse_model()
+
+        predictor_constructor.assert_not_called()
+        show_error.assert_called_once()
+        self.assertEqual(tab.model_path_var.get(), original)
+        self.assertIn("Arbitrary joblib files are not allowed", str(show_error.call_args))
+
+    def test_ad_browse_and_reload_use_only_the_approved_eralpha_reference(self):
+        tab = self._catalog_tab()
+        approved = (
+            tab.project_root
+            / "models"
+            / "erba"
+            / "ad"
+            / "classification_er_alpha_reference.xlsx"
+        ).resolve()
+        tab.ad_ref_path_var = self.Variable()
+        tab.loaded_ad_ref_path_var = self.Variable()
+        tab.single_status_var = self.Variable()
+        tab.batch_status_var = self.Variable()
+        tab._model_generation = 0
+        tab._ad_reload_id = 0
+        calls = []
+
+        class Calculator:
+            last_cache_status = "cache rebuilt"
+
+            def ensure_fitted_from_excel_cached(self, path, **kwargs):
+                calls.append((path, kwargs))
+
+        calculator = Calculator()
+        previous_ad = SimpleNamespace()
+        fresh_ad = SimpleNamespace(
+            calculator_for=lambda task, subtype: (
+                calls.append((task, subtype)) or calculator
+            )
+        )
+        tab.erba_ad = previous_ad
+        tab._request_ad_calculators = {99: previous_ad}
+        tab.after = lambda _delay, callback: callback()
+
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch(
+            "gui.erba_tab.filedialog.askopenfilename",
+            return_value=str(approved),
+        ):
+            tab.browse_ad_reference()
+        self.assertEqual(tab.ad_ref_path_var.get(), str(approved))
+        tab.ad_ref_path_var.set(
+            str(approved.relative_to(Path.cwd())).replace("\\", "/")
+        )
+
+        with patch(
+            "gui.erba_tab.ERBAApplicabilityDomain",
+            return_value=fresh_ad,
+        ), patch("gui.erba_tab.threading.Thread", ImmediateThread), patch(
+            "gui.erba_tab.messagebox.showinfo"
+        ):
+            tab.fit_ad_clicked()
+
+        self.assertEqual(
+            calls[0],
+            (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA),
+        )
+        self.assertEqual(calls[1][0], str(approved))
+        self.assertTrue(calls[1][1]["force_refit"])
+        self.assertEqual(tab.loaded_ad_ref_path_var.get(), str(approved))
+        self.assertEqual(tab._ad_reload_id, 1)
+        self.assertIs(tab.erba_ad, fresh_ad)
+        self.assertIsNot(tab.erba_ad, previous_ad)
+        self.assertIs(tab._request_ad_calculators[99], previous_ad)
+
+        with tempfile.TemporaryDirectory() as directory:
+            unapproved = Path(directory, "other-reference.xlsx")
+            unapproved.touch()
+            with patch(
+                "gui.erba_tab.filedialog.askopenfilename",
+                return_value=str(unapproved),
+            ), patch("gui.erba_tab.messagebox.showerror") as show_error:
+                tab.browse_ad_reference()
+        show_error.assert_called_once()
+        self.assertEqual(tab.ad_ref_path_var.get(), str(approved))
+
+    def test_late_ad_reload_completion_and_failure_cannot_replace_newer_manager(self):
+        tab = self._catalog_tab()
+        approved = (
+            tab.project_root
+            / "models"
+            / "erba"
+            / "ad"
+            / "classification_er_alpha_reference.xlsx"
+        ).resolve()
+        selected_text = str(approved.relative_to(Path.cwd())).replace("\\", "/")
+        tab.ad_ref_path_var = self.Variable(selected_text)
+        tab.loaded_ad_ref_path_var = self.Variable()
+        tab.single_status_var = self.Variable()
+        tab.batch_status_var = self.Variable()
+        tab._model_generation = 4
+        tab._ad_reload_id = 2
+        previous_ad, older_ad, newer_ad = object(), object(), object()
+        tab.erba_ad = previous_ad
+        calculator = SimpleNamespace(last_cache_status="fresh")
+
+        with patch("gui.erba_tab.messagebox.showinfo") as show_info, patch(
+            "gui.erba_tab.messagebox.showerror"
+        ) as show_error:
+            tab._finish_ad_reload(
+                1,
+                selected_text,
+                approved,
+                older_ad,
+                calculator,
+                4,
+            )
+            self.assertIs(tab.erba_ad, previous_ad)
+            tab._finish_ad_reload(
+                2,
+                selected_text,
+                approved,
+                newer_ad,
+                calculator,
+                4,
+            )
+            status_after_newer = tab.single_status_var.get()
+            tab._ad_reload_failed(
+                1,
+                selected_text,
+                4,
+                "obsolete failure",
+            )
+
+        self.assertIs(tab.erba_ad, newer_ad)
+        self.assertEqual(tab.single_status_var.get(), status_after_newer)
+        show_info.assert_called_once()
+        show_error.assert_not_called()
+
+    def test_model_change_snapshots_model_predictor_and_ad_without_state_leakage(self):
+        task, subtype = ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA
+        first = ERBAArtifactSpec("first.joblib", 1, "a" * 64, "first")
+        second = ERBAArtifactSpec("second.joblib", 1, "b" * 64, "second")
+        catalog = ERBAReleasedCatalog()
+        catalog.add(task, subtype, first)
+        catalog.add(task, subtype, second)
+
+        tab = ErbaTab.__new__(ErbaTab)
+        tab.fixed_subtype = subtype
+        tab.catalog = catalog
+        tab.catalog_error = ""
+        tab.regression_parity_approved = False
+        tab._request_id = 0
+        tab._started_at = {}
+        tab._request_generations = {}
+        tab._request_predictors = {}
+        tab._request_specs = {}
+        tab._request_ad_calculators = {}
+        tab._model_generation = 0
+        tab._active_single_request_id = None
+        tab._active_batch_request_id = None
+        tab.single_status_var = self.Variable()
+        tab.batch_status_var = self.Variable()
+        first_predictor, second_predictor = object(), object()
+        first_ad, second_ad = object(), object()
+        tab.selected_model_spec = first
+        tab.predictor = first_predictor
+        tab.erba_ad = first_ad
+
+        first_snapshot = tab._snapshot("single")
+        tab.selected_model_spec = second
+        tab.predictor = second_predictor
+        tab.erba_ad = second_ad
+        tab._model_generation += 1
+        second_snapshot = tab._snapshot("batch")
+        tab._active_batch_request_id = second_snapshot[0]
+
+        self.assertEqual(first_snapshot[1:], (task, subtype, "first"))
+        self.assertEqual(second_snapshot[1:], (task, subtype, "second"))
+        self.assertIs(tab._request_predictors[first_snapshot[0]], first_predictor)
+        self.assertIs(tab._request_predictors[second_snapshot[0]], second_predictor)
+        self.assertIs(tab._request_ad_calculators[first_snapshot[0]], first_ad)
+        self.assertIs(tab._request_ad_calculators[second_snapshot[0]], second_ad)
+        self.assertFalse(tab._snapshot_is_current("single", *first_snapshot))
+        self.assertTrue(tab._snapshot_is_current("batch", *second_snapshot))
+
 
 class _Predictor:
     def __init__(self, status=ERBAStatusCode.OK):
@@ -569,7 +1082,7 @@ class ErbaExcelContractTests(unittest.TestCase):
         predictor = _Predictor()
         tab.predictor = predictor
         tab.smiles_var, tab.cas_var = _Variable(), _Variable("50-00-0")
-        tab.single_button, tab.single_status_var = _Widget(), _Variable()
+        tab.single_predict_button, tab.single_status_var = _Widget(), _Variable()
         tab.single_prediction_summary_var = _Variable()
         tab.single_negative_probability_var = _Variable()
         tab.single_positive_probability_var = _Variable()
@@ -724,6 +1237,93 @@ class ErbaExcelContractTests(unittest.TestCase):
         self.assertNotIn("0.900", tab.single_prob_canvas.text)
         self.assertEqual(tab.single_prob_canvas.text.count("0.000"), 2)
         self.assertIn("Run prediction to show probabilities", tab.single_prob_canvas.text)
+        self.assertTrue(
+            any(
+                "historically exposed" in line
+                for line in tab._single_detail_lines
+            )
+        )
+
+    def test_single_result_reset_clears_reference_image_and_preserves_caveat(self):
+        class Variable:
+            def __init__(self, value=""):
+                self.value = value
+
+            def set(self, value):
+                self.value = value
+
+        class Widget:
+            def __init__(self):
+                self.options = {}
+
+            def configure(self, **kwargs):
+                self.options.update(kwargs)
+
+        tab = ErbaTab.__new__(ErbaTab)
+        for name in (
+            "single_prediction_summary_var",
+            "single_negative_probability_var",
+            "single_positive_probability_var",
+            "single_pic50_var",
+            "single_ic50_var",
+            "single_detail_var",
+            "single_ad_domain_var",
+            "single_nearest_reference_var",
+        ):
+            setattr(tab, name, Variable())
+        tab.single_negative_bar = None
+        tab.single_positive_bar = None
+        tab.draw_probability_graph = lambda: None
+        tab._render_detail_lines = lambda: None
+        tab.single_structure_label = Widget()
+        tab.single_nearest_reference_structure_label = Widget()
+        tab.single_ad_graph_label = Widget()
+        tab._nearest_reference_structure_image = object()
+        tab._single_ad_graph_image = object()
+
+        tab._clear_single_result("Prediction: -")
+
+        self.assertEqual(
+            tab.single_nearest_reference_structure_label.options,
+            {"text": "No reference", "image": ""},
+        )
+        self.assertIsNone(tab._nearest_reference_structure_image)
+        self.assertIsNone(tab._single_ad_graph_image)
+        self.assertTrue(
+            any("historically exposed" in line for line in tab._single_detail_lines)
+        )
+
+    def test_reference_preview_matches_erta_caption_compound_and_wrapping(self):
+        class Widget:
+            def __init__(self):
+                self.options = {}
+
+            def configure(self, **kwargs):
+                self.options.update(kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            tab = ErbaTab.__new__(ErbaTab)
+            tab.fixed_subtype = ERBASubtype.ER_ALPHA
+            tab.output_root = Path(directory)
+            tab.nearest_reference_preview_size = (250, 180)
+            tab.single_nearest_reference_structure_label = Widget()
+            tab._make_preview_photo = lambda _path, _size: "photo"
+            with patch("gui.erba_tab.PIL_AVAILABLE", True), patch(
+                "gui.erba_tab.save_molecule_image"
+            ):
+                tab._draw_nearest_reference_structure(
+                    {"SMILES": "CCO", "label": "binding", "CID": 702}
+                )
+
+        self.assertEqual(
+            tab.single_nearest_reference_structure_label.options,
+            {
+                "image": "photo",
+                "text": "label: Binding / CID: 702",
+                "compound": "top",
+                "wraplength": 180,
+            },
+        )
 
     def test_deferred_single_failure_callbacks_capture_error_text(self):
         class _Variable:
@@ -755,7 +1355,7 @@ class ErbaExcelContractTests(unittest.TestCase):
         tab = ErbaTab.__new__(ErbaTab)
         tab.smiles_var = _Variable()
         tab.cas_var = _Variable("50-00-0")
-        tab.single_button = _Control()
+        tab.single_predict_button = _Control()
         tab.single_status_var = _Variable()
         tab.single_prediction_summary_var = _Variable()
         tab.single_negative_probability_var = _Variable()
@@ -765,6 +1365,11 @@ class ErbaExcelContractTests(unittest.TestCase):
         tab.single_detail_var = _Variable()
         tab.single_negative_bar = None
         tab.single_positive_bar = None
+        tab.predictor = SimpleNamespace(
+            predict=lambda _request: self.fail(
+                "predictor must not run after CAS lookup failure"
+            )
+        )
         tab._snapshot = lambda _workflow: (
             1,
             ERBATask.CLASSIFICATION,
@@ -773,7 +1378,7 @@ class ErbaExcelContractTests(unittest.TestCase):
         )
         tab._finish_duration_ms = lambda _request_id: 0
         tab._snapshot_is_current = lambda *_args: True
-        tab._route_changed = lambda _workflow: tab.single_button.configure(state="normal")
+        tab._route_changed = lambda _workflow: tab.single_predict_button.configure(state="normal")
         tab._emit = lambda *_args, **_kwargs: None
         tab.after = lambda _delay, callback: scheduled.append(callback)
 
@@ -783,10 +1388,10 @@ class ErbaExcelContractTests(unittest.TestCase):
         ):
             tab.single_predict_clicked()
 
-        self.assertEqual(tab.single_button.state, "disabled")
+        self.assertEqual(tab.single_predict_button.state, "disabled")
         self.assertEqual(len(scheduled), 1)
         scheduled.pop()()
-        self.assertEqual(tab.single_button.state, "normal")
+        self.assertEqual(tab.single_predict_button.state, "normal")
         self.assertIn("lookup offline", tab.single_status_var.value)
 
         tab._active_ad_request_id = 2
@@ -857,6 +1462,8 @@ class ErbaExcelContractTests(unittest.TestCase):
 
         tab = ErbaTab.__new__(ErbaTab)
         tab._active_batch_request_id = 7
+        tab._model_generation = 0
+        tab._request_generations = {7: 0}
         tab.batch_progress_var = _Variable()
         tab.batch_progress_value = _Variable()
         scheduled = []
@@ -865,6 +1472,12 @@ class ErbaExcelContractTests(unittest.TestCase):
         self.assertEqual(len(scheduled), 1)
         self.assertEqual(tab.batch_progress_var.value, None)
         scheduled[0][1]()
+        self.assertEqual(tab.batch_progress_value.value, 61)
+        self.assertEqual(tab.batch_progress_var.value, "61% - 3/10 - Predicting")
+
+        tab._model_generation = 1
+        tab._batch_progress_from_worker(7, "Writing workbook", 9, 10, 90)
+        scheduled[1][1]()
         self.assertEqual(tab.batch_progress_value.value, 61)
         self.assertEqual(tab.batch_progress_var.value, "61% - 3/10 - Predicting")
 
@@ -1147,8 +1760,9 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
         tab.project_root = Path.cwd() / "project-root"
         tab.install_root = Path.cwd() / "install-root"
         tab.batch_input_button = self._Widget()
-        tab.batch_template_button = self._Widget()
-        tab.batch_button = self._Widget()
+        tab.download_template_button = self._Widget()
+        tab.run_batch_button = self._Widget()
+        tab.batch_input_display_var = self._Variable()
         return tab
 
     def test_batch_destination_is_read_only_and_tracks_selected_input_parent(self):
@@ -1182,7 +1796,7 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
                 "gui.erba_tab.filedialog.askopenfilename",
                 return_value=str(input_path),
             ):
-                tab._choose_batch_input()
+                tab.browse_batch_input()
             self.assertEqual(tab.batch_input_var.value, str(input_path))
             self.assertEqual(
                 tab.batch_destination_var.value,
@@ -1208,7 +1822,7 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
                 "gui.erba_tab.validate_mutable_directory",
                 side_effect=RuntimeError("read-only resources"),
             ):
-                tab._choose_batch_input()
+                tab.browse_batch_input()
             self.assertEqual(tab.batch_input_var.value, str(input_path.resolve()))
             self.assertIn("Unavailable", tab.batch_destination_var.value)
             self.assertIn(str(input_path.resolve().parent), tab.batch_destination_var.value)
@@ -1250,7 +1864,7 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
                 "gui.erba_tab.filedialog.askopenfilename",
                 return_value=str(input_path),
             ):
-                tab._choose_batch_input()
+                tab.browse_batch_input()
             self.assertIn("Unavailable", tab.batch_destination_var.value)
 
             with patch("gui.erba_tab.threading.Thread") as worker:
@@ -1261,7 +1875,7 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
                 "gui.erba_tab.filedialog.asksaveasfilename",
                 return_value=str(template_path),
             ), patch("gui.erba_tab.messagebox.showerror") as show_error:
-                tab._download_batch_template()
+                tab.download_template_clicked()
 
             show_error.assert_called_once()
             self.assertIn("read-only resources", str(show_error.call_args))
@@ -1278,7 +1892,8 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory, "ERalpha_batch_template.xlsx")
             with patch("gui.erba_tab.filedialog.asksaveasfilename", return_value=str(destination)):
-                tab._download_batch_template()
+                with patch("gui.erba_tab.messagebox.showinfo"):
+                    tab.download_template_clicked()
             template = pd.read_excel(destination, dtype=str, keep_default_na=False)
         self.assertEqual(template.columns.tolist(), ["CAS"])
         self.assertTrue(template.empty)
@@ -1420,7 +2035,9 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
         self.assertTrue(all(
             widget.state == "normal"
             for widget in (
-                tab.batch_input_button, tab.batch_template_button, tab.batch_button,
+                tab.batch_input_button,
+                tab.download_template_button,
+                tab.run_batch_button,
             )
         ))
 
@@ -1450,13 +2067,15 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
         self.assertTrue(all(
             widget.state == "normal"
             for widget in (
-                tab.batch_input_button, tab.batch_template_button, tab.batch_button,
+                tab.batch_input_button,
+                tab.download_template_button,
+                tab.run_batch_button,
             )
         ))
 
-        tab._set_batch_controls_running(True)
+        tab._set_batch_controls_active(True)
         tab._active_batch_request_id = None
-        tab._route_changed = lambda _workflow: tab._set_batch_controls_running(False)
+        tab._route_changed = lambda _workflow: tab._set_batch_controls_active(False)
         tab._batch_complete(
             2,
             ERBATask.CLASSIFICATION,
@@ -1468,9 +2087,44 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
         self.assertTrue(all(
             widget.state == "normal"
             for widget in (
-                tab.batch_input_button, tab.batch_template_button, tab.batch_button,
+                tab.batch_input_button,
+                tab.download_template_button,
+                tab.run_batch_button,
             )
         ))
+
+    def test_generation_stale_completion_restores_controls_without_terminal_progress(self):
+        tab = self._tab_with_batch_controls()
+        tab._set_batch_controls_active(True)
+        tab._active_batch_request_id = 7
+        tab._finish_duration_ms = lambda _request_id: 0
+        progress_calls = []
+        tab._set_batch_progress = lambda *args: progress_calls.append(args)
+        tab._snapshot_is_current = lambda *args: False
+        tab._route_changed = lambda _workflow: None
+        tab._emit = lambda *args, **kwargs: None
+
+        tab._batch_complete(
+            7,
+            ERBATask.CLASSIFICATION,
+            ERBASubtype.ER_ALPHA,
+            "old-model",
+            None,
+            "obsolete completion",
+        )
+
+        self.assertEqual(progress_calls, [])
+        self.assertIsNone(tab._active_batch_request_id)
+        self.assertTrue(
+            all(
+                widget.state == "normal"
+                for widget in (
+                    tab.batch_input_button,
+                    tab.download_template_button,
+                    tab.run_batch_button,
+                )
+            )
+        )
 
 class _ErtaBatchVariable:
     def __init__(self, value=None):

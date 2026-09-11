@@ -21,7 +21,11 @@ from core.molecule_image import save_molecule_image
 from core.predictor import KerasPredictor
 from core.pubchem import cas_to_smiles
 from core.paths import validate_mutable_directory
-from gui.erba_tab import ErbaTab, batch_destination_display
+from gui.erba_tab import (
+    ErbaTab,
+    batch_destination_display,
+    load_shared_example_input,
+)
 
 try:
     from PIL import Image, ImageTk
@@ -81,17 +85,23 @@ class MainWindow(tk.Tk):
         self.main_thread = threading.current_thread()
         self.options_visible = False
 
+        example = load_shared_example_input(self.project_root)
+        self.example_cas = example.cas
+        self.example_smiles = example.smiles
+        self.example_workbook = example.workbook
         self.model_path_var = tk.StringVar(value=self.default_model_path())
         self.ad_ref_path_var = tk.StringVar(value=self.default_ad_reference_path())
-        self.cas_var = tk.StringVar()
-        self.smiles_var = tk.StringVar()
+        self.loaded_model_path_var = tk.StringVar()
+        self.loaded_ad_ref_path_var = tk.StringVar()
+        self.cas_var = tk.StringVar(value=self.example_cas)
+        self.smiles_var = tk.StringVar(value=self.example_smiles)
         self.status_var = tk.StringVar(value="Starting...")
         self.prediction_summary_var = tk.StringVar(value="Prediction: -")
         self.active_probability_var = tk.StringVar(value="Probability Positive: -")
         self.inactive_probability_var = tk.StringVar(value="Probability Negative: -")
         self.ad_domain_var = tk.StringVar(value="Applicability domain: Not evaluated")
         self.nearest_reference_var = tk.StringVar(value="Nearest training reference: -")
-        self.batch_input_var = tk.StringVar(value=os.path.join(self.project_root, "templates", "ERTA_KRICT_example.xlsx"))
+        self.batch_input_var = tk.StringVar(value=str(self.example_workbook))
         default_batch_name = os.path.basename(self.batch_input_var.get()) if os.path.exists(self.batch_input_var.get()) else "No input template selected"
         self.batch_input_display_var = tk.StringVar(value=default_batch_name)
         self.batch_destination_var = tk.StringVar(
@@ -156,6 +166,7 @@ class MainWindow(tk.Tk):
         self._build_header()
         self._build_notebook()
         self._build_status_bar()
+        self._register_parity_widgets()
 
     def _top_level_tab_changed(self, _event=None):
         if self.event_log is None:
@@ -169,7 +180,12 @@ class MainWindow(tk.Tk):
         summary.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
         summary.columnconfigure(0, weight=1)
 
-        ttk.Button(summary, text="Options", command=self.toggle_options).grid(row=0, column=1, sticky="e")
+        self.options_button = ttk.Button(
+            summary,
+            text="Options",
+            command=self.toggle_options,
+        )
+        self.options_button.grid(row=0, column=1, sticky="e")
 
         frame = ttk.LabelFrame(self.erta_tab, text="Options")
         self.options_frame = frame
@@ -177,15 +193,37 @@ class MainWindow(tk.Tk):
         frame.grid_remove()
         frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="Model (.keras)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(frame, textvariable=self.model_path_var).grid(row=0, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Button(frame, text="Browse", command=self.browse_model).grid(row=0, column=2, padx=6, pady=4)
-        ttk.Button(frame, text="Reload model", command=self.load_model_clicked).grid(row=0, column=3, padx=6, pady=4)
+        ttk.Label(frame, text="Model").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.model_entry = ttk.Entry(frame, textvariable=self.model_path_var)
+        self.model_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+        self.model_browse_button = ttk.Button(
+            frame,
+            text="Browse",
+            command=self.browse_model,
+        )
+        self.model_browse_button.grid(row=0, column=2, padx=6, pady=4)
+        self.model_reload_button = ttk.Button(
+            frame,
+            text="Reload model",
+            command=self.load_model_clicked,
+        )
+        self.model_reload_button.grid(row=0, column=3, padx=6, pady=4)
 
         ttk.Label(frame, text="AD reference").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(frame, textvariable=self.ad_ref_path_var).grid(row=1, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Button(frame, text="Browse", command=self.browse_ad_reference).grid(row=1, column=2, padx=6, pady=4)
-        ttk.Button(frame, text="Reload AD", command=self.fit_ad_clicked).grid(row=1, column=3, padx=6, pady=4)
+        self.ad_entry = ttk.Entry(frame, textvariable=self.ad_ref_path_var)
+        self.ad_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        self.ad_browse_button = ttk.Button(
+            frame,
+            text="Browse",
+            command=self.browse_ad_reference,
+        )
+        self.ad_browse_button.grid(row=1, column=2, padx=6, pady=4)
+        self.ad_reload_button = ttk.Button(
+            frame,
+            text="Reload AD",
+            command=self.fit_ad_clicked,
+        )
+        self.ad_reload_button.grid(row=1, column=3, padx=6, pady=4)
 
         note = ttk.Label(frame, text="AD is fitted automatically at startup. Reload AD only when changing the reference file.")
         note.grid(row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
@@ -193,6 +231,7 @@ class MainWindow(tk.Tk):
     def _build_notebook(self):
         self.erta_notebook = ttk.Notebook(self.erta_tab)
         self.erta_notebook.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
+        self.mode_notebook = self.erta_notebook
 
         self.single_tab = ttk.Frame(self.erta_notebook)
         self.batch_tab = ttk.Frame(self.erta_notebook)
@@ -203,26 +242,61 @@ class MainWindow(tk.Tk):
         self._build_batch_tab()
 
     def _build_status_bar(self):
-        bar = ttk.Label(self.erta_tab, textvariable=self.status_var, anchor="w")
-        bar.grid(row=3, column=0, sticky="ew", padx=10, pady=(2, 8))
+        self.workflow_status_label = ttk.Label(
+            self.erta_tab,
+            textvariable=self.status_var,
+            anchor="w",
+        )
+        self.workflow_status_label.grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            padx=10,
+            pady=(2, 8),
+        )
 
     def _build_single_tab(self):
-        self.single_tab.columnconfigure(0, weight=1)
-        self.single_tab.columnconfigure(1, weight=1)
+        self.single_tab.columnconfigure(0, weight=1, uniform="single")
+        self.single_tab.columnconfigure(1, weight=1, uniform="single")
         self.single_tab.rowconfigure(1, weight=1)
 
         input_frame = ttk.LabelFrame(self.single_tab, text="Input")
         input_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
         input_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(input_frame, text="CAS").grid(row=0, column=0, sticky="w", padx=6, pady=5)
-        ttk.Entry(input_frame, textvariable=self.cas_var).grid(row=0, column=1, sticky="ew", padx=6, pady=5)
-        ttk.Button(input_frame, text="PubChem search", command=self.pubchem_clicked).grid(row=0, column=2, padx=6, pady=5)
+        self.cas_label = ttk.Label(input_frame, text="CAS")
+        self.cas_label.grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        self.cas_entry = ttk.Entry(input_frame, textvariable=self.cas_var)
+        self.cas_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=5)
+        self.pubchem_button = ttk.Button(
+            input_frame,
+            text="PubChem search",
+            command=self.pubchem_clicked,
+        )
+        self.pubchem_button.grid(row=0, column=2, padx=6, pady=5)
+        self.example_button = ttk.Button(
+            input_frame,
+            text="Example input",
+            command=self.load_example_input,
+        )
+        self.example_button.grid(row=0, column=3, padx=6, pady=5)
 
-        ttk.Label(input_frame, text="SMILES").grid(row=1, column=0, sticky="w", padx=6, pady=5)
-        ttk.Entry(input_frame, textvariable=self.smiles_var).grid(row=1, column=1, sticky="ew", padx=6, pady=5)
-        ttk.Button(input_frame, text="Predict", command=self.single_predict_clicked).grid(row=1, column=2, padx=6, pady=5)
-        ttk.Button(input_frame, text="Draw structure", command=self.open_jsme_popup).grid(row=1, column=3, padx=6, pady=5)
+        self.smiles_label = ttk.Label(input_frame, text="SMILES")
+        self.smiles_label.grid(row=1, column=0, sticky="w", padx=6, pady=5)
+        self.smiles_entry = ttk.Entry(input_frame, textvariable=self.smiles_var)
+        self.smiles_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=5)
+        self.single_predict_button = ttk.Button(
+            input_frame,
+            text="Predict",
+            command=self.single_predict_clicked,
+        )
+        self.single_predict_button.grid(row=1, column=2, padx=6, pady=5)
+        self.draw_structure_button = ttk.Button(
+            input_frame,
+            text="Draw structure",
+            command=self.open_jsme_popup,
+        )
+        self.draw_structure_button.grid(row=1, column=3, padx=6, pady=5)
 
         result_frame = ttk.LabelFrame(self.single_tab, text="Prediction result")
         result_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
@@ -235,7 +309,7 @@ class MainWindow(tk.Tk):
 
         self.prediction_label = tk.Label(summary_frame, textvariable=self.prediction_summary_var, font=("Segoe UI", 14, "bold"), anchor="w")
         self.prediction_label.grid(row=0, column=0, sticky="w")
-        self.ad_domain_label = tk.Label(summary_frame, textvariable=self.ad_domain_var, font=("Segoe UI", 13, "bold"), anchor="w")
+        self.ad_domain_label = tk.Label(summary_frame, textvariable=self.ad_domain_var, font=("Segoe UI", 13, "bold"), fg="#57606a", anchor="w")
         self.ad_domain_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
 
         self.prob_canvas = tk.Canvas(result_frame, height=92, bg="white", highlightthickness=1, highlightbackground="#d0d7de")
@@ -291,13 +365,33 @@ class MainWindow(tk.Tk):
 
         self.batch_input_button = ttk.Button(frame, text="Input xlsx", command=self.browse_batch_input)
         self.batch_input_button.grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Label(frame, textvariable=self.batch_input_display_var, anchor="w").grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+        self.batch_input_entry = ttk.Entry(
+            frame,
+            textvariable=self.batch_input_display_var,
+            state="readonly",
+        )
+        self.batch_input_entry.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=6,
+            pady=4,
+        )
 
         ttk.Label(frame, text="Result folder (same as input)").grid(
             row=1, column=0, sticky="w", padx=6, pady=4
         )
-        ttk.Label(frame, textvariable=self.batch_destination_var, anchor="w").grid(
-            row=1, column=1, sticky="ew", padx=6, pady=4
+        self.batch_destination_entry = ttk.Entry(
+            frame,
+            textvariable=self.batch_destination_var,
+            state="readonly",
+        )
+        self.batch_destination_entry.grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=6,
+            pady=4,
         )
 
         ttk.Label(frame, text="Enter CAS numbers in the required CAS column.").grid(
@@ -336,6 +430,45 @@ class MainWindow(tk.Tk):
         self._set_erta_batch_result("Run a batch to show the completion summary.")
 
     # ---------- UI helpers ----------
+    def _register_parity_widgets(self):
+        self.parity_widgets = {
+            "endpoint_tab": self.erta_tab,
+            "options_button": self.options_button,
+            "options_frame": self.options_frame,
+            "model_entry": self.model_entry,
+            "model_browse_button": self.model_browse_button,
+            "model_reload_button": self.model_reload_button,
+            "ad_entry": self.ad_entry,
+            "ad_browse_button": self.ad_browse_button,
+            "ad_reload_button": self.ad_reload_button,
+            "mode_notebook": self.mode_notebook,
+            "single_tab": self.single_tab,
+            "batch_tab": self.batch_tab,
+            "cas_label": self.cas_label,
+            "cas_entry": self.cas_entry,
+            "pubchem_button": self.pubchem_button,
+            "smiles_label": self.smiles_label,
+            "smiles_entry": self.smiles_entry,
+            "example_button": self.example_button,
+            "single_predict_button": self.single_predict_button,
+            "draw_structure_button": self.draw_structure_button,
+            "batch_input_entry": self.batch_input_entry,
+            "batch_browse_button": self.batch_input_button,
+            "batch_destination_entry": self.batch_destination_entry,
+            "batch_example_button": self.download_template_button,
+            "batch_predict_button": self.run_batch_button,
+            "batch_progress": self.batch_progress,
+            "batch_status": self.workflow_status_label,
+            "batch_result": self.batch_result,
+        }
+
+    def load_example_input(self):
+        self.cas_var.set(self.example_cas)
+        self.smiles_var.set(self.example_smiles)
+        self.set_status(
+            f"Example input restored from {self.example_workbook.name}."
+        )
+
     def ui(self, func, *args, **kwargs):
         if threading.current_thread() is self.main_thread:
             return func(*args, **kwargs)
@@ -372,9 +505,9 @@ class MainWindow(tk.Tk):
 
         canvas = self.prob_canvas
         canvas.delete("all")
-        width = max(canvas.winfo_width(), 320)
+        width = max(canvas.winfo_width(), 360)
         margin = 18
-        label_width = 72
+        label_width = 94
         bar_x = margin + label_width
         bar_w = max(width - bar_x - margin - 48, 120)
         inactive_y = 22
@@ -546,6 +679,7 @@ class MainWindow(tk.Tk):
                 try:
                     self.set_status("Loading default model...")
                     self.predictor.load_model(model_path)
+                    self.ui(self.loaded_model_path_var.set, model_path)
                 except Exception as e:
                     failures.append(f"model load failed: {e}")
 
@@ -558,6 +692,7 @@ class MainWindow(tk.Tk):
                 try:
                     self.set_status("Loading default AD reference...")
                     self.ensure_ad_fitted(ad_path)
+                    self.ui(self.loaded_ad_ref_path_var.set, ad_path)
                 except Exception as e:
                     failures.append(f"AD fit failed: {e}")
 
@@ -566,7 +701,10 @@ class MainWindow(tk.Tk):
         self.run_threaded(job)
 
     def browse_model(self):
-        path = filedialog.askopenfilename(title="Select Keras model", filetypes=[("Keras model", "*.keras *.h5"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(
+            title="Select model",
+            filetypes=[("Model file", "*.keras *.h5"), ("All files", "*.*")],
+        )
         if path:
             self.model_path_var.set(path)
 
@@ -672,6 +810,10 @@ class MainWindow(tk.Tk):
             try:
                 self.set_status("Loading model...")
                 self.predictor.load_model(self.model_path_var.get())
+                self.ui(
+                    self.loaded_model_path_var.set,
+                    self.predictor.model_path,
+                )
                 self.set_status(f"Model loaded: {self.predictor.model_name}, input shape={self.predictor.input_shape}")
                 self.ui(messagebox.showinfo, "Model loaded", f"Loaded model:\n{self.predictor.model_path}\n\nInput shape: {self.predictor.input_shape}")
             except Exception as e:
@@ -686,6 +828,10 @@ class MainWindow(tk.Tk):
                     self.ad_ref_path_var.get(),
                     force_refit=True,
                 )
+                self.ui(
+                    self.loaded_ad_ref_path_var.set,
+                    self.ad_ref_path_var.get(),
+                )
                 cache_status = self.ad_calculator.last_cache_status or "AD cache status unavailable."
                 self.set_status(f"AD fitted. kNN 95% mean-distance threshold={self.ad_calculator.threshold:.4f}, Similarity cutoff={self.ad_calculator.similarity_threshold:.2f}. {cache_status}")
                 self.ui(messagebox.showinfo, "AD fitted", f"AD reference fitted.\nkNN 95% mean-distance threshold: {self.ad_calculator.threshold:.4f}\nSimilarity cutoff: {self.ad_calculator.similarity_threshold:.2f}\n\n{cache_status}")
@@ -694,10 +840,12 @@ class MainWindow(tk.Tk):
         self.run_threaded(job)
 
     def pubchem_clicked(self):
+        cas = self.cas_var.get()
+
         def job():
             try:
                 self.set_status("Searching PubChem...")
-                res = cas_to_smiles(self.cas_var.get())
+                res = cas_to_smiles(cas)
                 smiles = res.get("CanonicalSMILES") or res.get("IsomericSMILES")
                 if not smiles:
                     raise RuntimeError("PubChem did not return a SMILES string.")
