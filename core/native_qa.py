@@ -14,7 +14,13 @@ import traceback
 from openpyxl import Workbook, load_workbook
 
 from core.contracts import (
+    CLASSIFICATION_PARENT_POLICY_ID,
+    CLASSIFICATION_OUTPUT_COLUMNS,
     ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID,
+    ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS,
+    ERBA_CLASSIFICATION_METADATA_COLUMNS,
+    ERBA_CLASSIFICATION_PREDICTION_COLUMNS,
+    ERBA_CLASSIFICATION_PUBCHEM_COLUMNS,
     ERBASubtype,
     ERBATask,
     HISTORICAL_EXPOSURE_CAVEAT_COMPACT,
@@ -64,6 +70,42 @@ BATCH_RECOGNITION_CRITERIA = {
     ),
 }
 BATCH_UNAVAILABLE_LABEL = "Not predicted"
+ERALPHA_AD_COLUMNS = (
+    "AD",
+    "AD_MeanDistance",
+    "AD_DistanceThreshold",
+    "AD_Distance_InDomain",
+    "AD_SimilarityMax",
+    "AD_SimilarityThreshold",
+    "AD_Similarity_InDomain",
+    "AD_PC1",
+    "AD_PC2",
+)
+ERALPHA_PRIMARY_TRUSTED_COLUMNS = (
+    *ERBA_CLASSIFICATION_PREDICTION_COLUMNS,
+    *ERALPHA_AD_COLUMNS,
+    *ERBA_CLASSIFICATION_PUBCHEM_COLUMNS,
+)
+ERALPHA_WORKBOOK_SHEET_ORDER = (
+    "Predictions",
+    "Guide",
+    "Diagnostics",
+    "Input",
+    "Metadata",
+)
+ERALPHA_PRIMARY_FORBIDDEN_COLUMNS = tuple(
+    dict.fromkeys(
+        (
+            *CLASSIFICATION_OUTPUT_COLUMNS,
+            *ERBA_CLASSIFICATION_METADATA_COLUMNS,
+            *(
+                column
+                for column in ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS
+                if column not in {"Row_ID", "CAS"}
+            ),
+        )
+    )
+)
 
 
 def _sha256_path(path: Path) -> str:
@@ -2005,17 +2047,7 @@ class NativePackageQa:
     MOCK_CAS = "50-00-0"
     MOCK_SMILES = "C=O"
     MOCK_UNAVAILABLE_CAS_VALUES = ("7732-18-5", "58-08-2")
-    ERBA_BATCH_AD_COLUMNS = (
-        "AD",
-        "AD_MeanDistance",
-        "AD_DistanceThreshold",
-        "AD_Distance_InDomain",
-        "AD_SimilarityMax",
-        "AD_SimilarityThreshold",
-        "AD_Similarity_InDomain",
-        "AD_PC1",
-        "AD_PC2",
-    )
+    ERBA_BATCH_AD_COLUMNS = ERALPHA_AD_COLUMNS
     ERBA_BATCH_GRAPH_FILES = {
         "binding_class_count.png",
         "binding_probability_histogram.png",
@@ -2143,6 +2175,106 @@ class NativePackageQa:
         if not condition:
             raise AssertionError(message)
 
+    def _require_eralpha_primary_headers(
+        self,
+        headers: list,
+        passthrough_headers: tuple[str, ...],
+        context: str,
+    ) -> None:
+        expected = [
+            *passthrough_headers,
+            *ERALPHA_PRIMARY_TRUSTED_COLUMNS,
+        ]
+        self._require(
+            headers == expected,
+            f"{context} primary header order drift: {headers}",
+        )
+        self._require(
+            len(headers) == len(set(headers))
+            and set(headers).isdisjoint(
+                ERALPHA_PRIMARY_FORBIDDEN_COLUMNS
+            ),
+            f"{context} repeats technical diagnostics, model provenance, "
+            "or evidence caveats in Predictions",
+        )
+
+    def _require_eralpha_diagnostics(
+        self,
+        headers: list,
+        diagnostic_rows: list[dict],
+        prediction_rows: list[dict],
+        context: str,
+    ) -> None:
+        self._require(
+            headers == list(ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS),
+            f"{context} Diagnostics header order drift: {headers}",
+        )
+        self._require(
+            len(diagnostic_rows) == len(prediction_rows)
+            and [
+                row["row_index"] for row in diagnostic_rows
+            ]
+            == list(range(len(prediction_rows)))
+            and [
+                str(row["CAS"] or "") for row in diagnostic_rows
+            ]
+            == [
+                str(row["CAS"] or "") for row in prediction_rows
+            ]
+            and all(
+                str(row[column] or "").strip()
+                for row in diagnostic_rows
+                for column in (
+                    "Row_ID",
+                    "Status_Code",
+                    "SMILES_Provenance",
+                    "Result_Status",
+                    "Reason_Category",
+                    "Reason_Description",
+                    "Recommended_Action",
+                )
+            ),
+            f"{context} Diagnostics rows are not one-to-one, ordered, "
+            "reasoned mappings of Predictions",
+        )
+
+    @staticmethod
+    def _eralpha_prediction_is_consistent(row: dict) -> bool:
+        negative = row["Probability_Negative_0"]
+        positive = row["Probability_Positive_1"]
+        prediction = row["Prediction"]
+        if (
+            isinstance(negative, bool)
+            or not isinstance(negative, (int, float))
+            or isinstance(positive, bool)
+            or not isinstance(positive, (int, float))
+            or isinstance(prediction, bool)
+            or prediction not in {0, 1}
+        ):
+            return False
+        expected_prediction = 1 if positive >= 0.5 else 0
+        return (
+            0.0 <= negative <= 1.0
+            and 0.0 <= positive <= 1.0
+            and abs((negative + positive) - 1.0) <= 1e-6
+            and prediction == expected_prediction
+            and row["Prediction_label"]
+            == ("Binding" if prediction == 1 else "Non-binding")
+        )
+
+    @staticmethod
+    def _eralpha_prediction_payload_is_blank(row: dict) -> bool:
+        return all(
+            row[column] is None
+            for column in (
+                "Probability_Negative_0",
+                "Probability_Positive_1",
+                "Prediction",
+                "Prediction_label",
+                *ERALPHA_AD_COLUMNS,
+            )
+        )
+
     def _patch(self, owner: object, name: str, replacement: object) -> None:
         self.patches.append((owner, name, getattr(owner, name)))
         setattr(owner, name, replacement)
@@ -2224,7 +2356,11 @@ class NativePackageQa:
                 )
             if normalized not in self.mock_cas_values:
                 raise RuntimeError(f"unexpected deterministic QA CAS: {cas}")
-            return {"CanonicalSMILES": self.MOCK_SMILES, "PubChem_CID": "712"}
+            return {
+                "CanonicalSMILES": self.MOCK_SMILES,
+                "PubChem_CID": "712",
+                "PubChem_status": "Found",
+            }
 
         self._patch(main_window, "cas_to_smiles", mocked_cas_to_smiles)
         self._patch(erba_tab, "cas_to_smiles", mocked_cas_to_smiles)
@@ -4146,8 +4282,7 @@ class NativePackageQa:
                 try:
                     sheet_names = workbook.sheetnames
                     self._require(
-                        sheet_names
-                        == ["Predictions", "Guide", "Input", "Metadata"]
+                        sheet_names == list(ERALPHA_WORKBOOK_SHEET_ORDER)
                         and workbook.active.title == "Predictions",
                         "ERalpha batch workbook is not Predictions-first and active",
                     )
@@ -4155,16 +4290,25 @@ class NativePackageQa:
                     prediction_headers = [
                         cell.value for cell in prediction_sheet[1]
                     ]
-                    self._require(
-                        all(
-                            column in prediction_headers
-                            for column in self.ERBA_BATCH_AD_COLUMNS
-                        ),
-                        "ERalpha batch workbook is missing applicability-domain columns",
+                    self._require_eralpha_primary_headers(
+                        prediction_headers,
+                        (),
+                        "ERalpha shared-example workbook",
                     )
                     prediction_rows = [
                         dict(zip(prediction_headers, row))
                         for row in prediction_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    ]
+                    diagnostics_sheet = workbook["Diagnostics"]
+                    diagnostics_headers = [
+                        cell.value for cell in diagnostics_sheet[1]
+                    ]
+                    diagnostics_rows = [
+                        dict(zip(diagnostics_headers, row))
+                        for row in diagnostics_sheet.iter_rows(
                             min_row=2,
                             values_only=True,
                         )
@@ -4187,17 +4331,19 @@ class NativePackageQa:
                     metadata_headers = [
                         cell.value for cell in metadata_sheet[1]
                     ]
-                    metadata_values = [
-                        cell.value
-                        for cell in next(
-                            metadata_sheet.iter_rows(
-                                min_row=2,
-                                max_row=2,
-                            )
+                    metadata_rows = list(
+                        metadata_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
                         )
-                    ]
+                    )
+                    self._require(
+                        len(metadata_rows) == 1,
+                        "ERalpha shared-example Metadata must contain "
+                        "one execution-level row",
+                    )
                     metadata = dict(
-                        zip(metadata_headers, metadata_values)
+                        zip(metadata_headers, metadata_rows[0])
                     )
                 finally:
                     workbook.close()
@@ -4214,23 +4360,49 @@ class NativePackageQa:
                 )
                 self._require(
                     len(prediction_rows) == 25
-                    and [str(row["CARSRN"]) for row in prediction_rows]
-                    == expected_cas
                     and [str(row["CAS"]) for row in prediction_rows]
                     == expected_cas,
-                    "ERalpha primary predictions lost CARSRN input order or CAS alias mapping",
+                    "ERalpha primary predictions lost CARSRN-to-CAS row order",
+                )
+                self._require_eralpha_diagnostics(
+                    diagnostics_headers,
+                    diagnostics_rows,
+                    prediction_rows,
+                    "ERalpha shared-example workbook",
                 )
                 self._require(
                     all(
-                        row["Result_Status"] == "Predicted"
-                        and row["binding_label"]
-                        in {"binding", "non_binding"}
-                        and row["non_binding_probability"] is not None
-                        and row["binding_probability"] is not None
+                        row["SMILES"] == self.MOCK_SMILES
+                        and row["Canonical_SMILES"] == self.MOCK_SMILES
+                        and row["Mol_valid"] is True
+                        and self._eralpha_prediction_is_consistent(row)
                         and row["AD"] in {"In-domain", "Out-of-domain"}
+                        and str(row["PubChem_CID"]) == "712"
+                        and row["PubChem_status"] == "Found"
                         for row in prediction_rows
                     ),
-                    "ERalpha shared CARSRN example did not yield 25 nonblank predictions",
+                    "ERalpha shared CARSRN example did not preserve its "
+                    "numeric binding predictions or captured PubChem fields",
+                )
+                self._require(
+                    [
+                        row["Row_ID"] for row in diagnostics_rows
+                    ]
+                    == [str(index) for index in range(25)]
+                    and [
+                        str(row["CAS"]) for row in diagnostics_rows
+                    ]
+                    == expected_cas
+                    and all(
+                        row["Status_Code"] == "ok"
+                        and not row["Status_Message"]
+                        and row["SMILES_Provenance"]
+                        == "pubchem_lookup"
+                        and row["Result_Status"] == "Predicted"
+                        for row in diagnostics_rows
+                    ),
+                    "ERalpha shared-example Diagnostics lost successful "
+                    "row status or PubChem provenance",
                 )
                 self._require(
                     guide_rows
@@ -4247,10 +4419,19 @@ class NativePackageQa:
                 ]
                 hex_digits = set("0123456789abcdef")
                 self._require(
-                    metadata.get("Excel_Contract_ID")
+                    metadata_headers
+                    == list(ERBA_CLASSIFICATION_METADATA_COLUMNS)
+                    and metadata.get("Excel_Contract_ID")
                     == ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID
+                    and metadata.get("Workflow") == "erba"
+                    and metadata.get("Task") == "classification"
+                    and metadata.get("Subtype") == "er_alpha"
+                    and metadata.get("Decision_rule")
+                    == "binding_probability>=0.5"
                     and metadata.get("Model_ID") == expected_spec.model_id
                     and metadata.get("Model_SHA256") == expected_spec.sha256
+                    and metadata.get("Preprocessing_Policy_ID")
+                    == CLASSIFICATION_PARENT_POLICY_ID
                     and metadata.get("Performance_Evidence_Scope")
                     == "internal_historically_exposed"
                     and bool(metadata.get("Evidence_Caveat"))
@@ -4264,13 +4445,16 @@ class NativePackageQa:
                 )
 
                 binding_count = sum(
-                    row["binding_label"] == "binding" for row in prediction_rows
+                    row["Prediction_label"] == "Binding"
+                    for row in prediction_rows
                 )
                 non_binding_count = sum(
-                    row["binding_label"] == "non_binding" for row in prediction_rows
+                    row["Prediction_label"] == "Non-binding"
+                    for row in prediction_rows
                 )
                 not_predicted_count = sum(
-                    row["Result_Status"] != "Predicted" for row in prediction_rows
+                    row["Result_Status"] != "Predicted"
+                    for row in diagnostics_rows
                 )
                 self._require(
                     binding_count + non_binding_count == 25
@@ -4339,12 +4523,12 @@ class NativePackageQa:
                     total_count=len(prediction_rows),
                     available_count=sum(
                         row["Result_Status"] == "Predicted"
-                        for row in prediction_rows
+                        for row in diagnostics_rows
                     ),
                     unavailable_count=not_predicted_count,
                     workbook_unavailable_count=sum(
                         row["Result_Status"] != "Predicted"
-                        for row in prediction_rows
+                        for row in diagnostics_rows
                     ),
                     fresh_output_count=1,
                     screenshot=True,
@@ -4355,6 +4539,14 @@ class NativePackageQa:
                     output=str(output),
                     sheets=sheet_names,
                     prediction_headers=prediction_headers,
+                    diagnostics_headers=diagnostics_headers,
+                    diagnostics_status_codes=[
+                        row["Status_Code"] for row in diagnostics_rows
+                    ],
+                    smiles_provenance=[
+                        row["SMILES_Provenance"]
+                        for row in diagnostics_rows
+                    ],
                     preserved_input_rows=[list(row) for row in input_rows],
                     input_header="CARSRN",
                     metadata=metadata,
@@ -4501,8 +4693,7 @@ class NativePackageQa:
                 try:
                     sheet_names = workbook.sheetnames
                     self._require(
-                        sheet_names
-                        == ["Predictions", "Guide", "Input", "Metadata"]
+                        sheet_names == list(ERALPHA_WORKBOOK_SHEET_ORDER)
                         and workbook.active.title == "Predictions",
                         "ERalpha mixed workbook is not Predictions-first and active",
                     )
@@ -4510,9 +4701,25 @@ class NativePackageQa:
                     prediction_headers = [
                         cell.value for cell in prediction_sheet[1]
                     ]
+                    self._require_eralpha_primary_headers(
+                        prediction_headers,
+                        ("Row_ID", "Analyst_Note"),
+                        "ERalpha mixed workbook",
+                    )
                     prediction_rows = [
                         dict(zip(prediction_headers, row))
                         for row in prediction_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    ]
+                    diagnostics_sheet = workbook["Diagnostics"]
+                    diagnostics_headers = [
+                        cell.value for cell in diagnostics_sheet[1]
+                    ]
+                    diagnostics_rows = [
+                        dict(zip(diagnostics_headers, row))
+                        for row in diagnostics_sheet.iter_rows(
                             min_row=2,
                             values_only=True,
                         )
@@ -4534,27 +4741,22 @@ class NativePackageQa:
                     metadata_headers = [
                         cell.value for cell in metadata_sheet[1]
                     ]
-                    metadata_values = [
-                        cell.value
-                        for cell in next(
-                            metadata_sheet.iter_rows(
-                                min_row=2,
-                                max_row=2,
-                            )
+                    metadata_rows = list(
+                        metadata_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
                         )
-                    ]
+                    )
+                    self._require(
+                        len(metadata_rows) == 1,
+                        "ERalpha mixed Metadata must contain one "
+                        "execution-level row",
+                    )
                     metadata = dict(
-                        zip(metadata_headers, metadata_values)
+                        zip(metadata_headers, metadata_rows[0])
                     )
                 finally:
                     workbook.close()
-                self._require(
-                    all(
-                        column in prediction_headers
-                        for column in self.ERBA_BATCH_AD_COLUMNS
-                    ),
-                    "ERalpha mixed workbook is missing AD columns",
-                )
                 self._require(
                     len(prediction_rows) == 2
                     and prediction_rows[0]["Analyst_Note"]
@@ -4563,28 +4765,53 @@ class NativePackageQa:
                     == "preserve-invalid",
                     "ERalpha mixed Predictions lost passthrough fields or order",
                 )
+                self._require_eralpha_diagnostics(
+                    diagnostics_headers,
+                    diagnostics_rows,
+                    prediction_rows,
+                    "ERalpha mixed workbook",
+                )
                 self._require(
-                    prediction_rows[0]["Result_Status"] == "Predicted"
+                    self._eralpha_prediction_is_consistent(
+                        prediction_rows[0]
+                    )
+                    and prediction_rows[0]["Mol_valid"] is True
                     and prediction_rows[0]["AD"]
                     in {"In-domain", "Out-of-domain"}
-                    and prediction_rows[1]["Result_Status"]
-                    == "Not predicted"
-                    and prediction_rows[1]["Reason_Category"]
-                    == "Invalid or ambiguous SMILES"
-                    and prediction_rows[1]["Reason_Description"]
-                    and prediction_rows[1]["Recommended_Action"]
-                    and prediction_rows[1][
-                        "non_binding_probability"
-                    ]
-                    is None
-                    and prediction_rows[1]["binding_probability"]
-                    is None
-                    and prediction_rows[1]["binding_label"] is None
-                    and all(
-                        prediction_rows[1][column] is None
-                        for column in self.ERBA_BATCH_AD_COLUMNS
-                    ),
+                    and prediction_rows[0]["PubChem_CID"] is None
+                    and prediction_rows[0]["PubChem_status"] is None
+                    and prediction_rows[1]["SMILES"] == "[*]CC"
+                    and prediction_rows[1]["Canonical_SMILES"] is None
+                    and prediction_rows[1]["Mol_valid"] is True
+                    and self._eralpha_prediction_payload_is_blank(
+                        prediction_rows[1]
+                    )
+                    and prediction_rows[1]["PubChem_CID"] is None
+                    and prediction_rows[1]["PubChem_status"] is None,
                     "ERalpha mixed predicted/not-predicted row mapping is incorrect",
+                )
+                self._require(
+                    diagnostics_rows[0]["Row_ID"] == "native-valid"
+                    and diagnostics_rows[0]["Status_Code"] == "ok"
+                    and diagnostics_rows[0]["SMILES_Provenance"]
+                    == "direct_input"
+                    and diagnostics_rows[0]["Result_Status"]
+                    == "Predicted"
+                    and diagnostics_rows[1]["Row_ID"]
+                    == "native-invalid"
+                    and diagnostics_rows[1]["Status_Code"]
+                    == "wildcard_smiles"
+                    and diagnostics_rows[1]["Status_Message"]
+                    and diagnostics_rows[1]["SMILES_Provenance"]
+                    == "direct_input"
+                    and diagnostics_rows[1]["Result_Status"]
+                    == "Not predicted"
+                    and diagnostics_rows[1]["Reason_Category"]
+                    == "Invalid or ambiguous SMILES"
+                    and diagnostics_rows[1]["Reason_Description"]
+                    and diagnostics_rows[1]["Recommended_Action"],
+                    "ERalpha mixed Diagnostics lost the invalid-row reason "
+                    "or stable technical status",
                 )
                 self._require(
                     input_headers
@@ -4623,12 +4850,21 @@ class NativePackageQa:
                 ]
                 hex_digits = set("0123456789abcdef")
                 self._require(
-                    metadata.get("Excel_Contract_ID")
+                    metadata_headers
+                    == list(ERBA_CLASSIFICATION_METADATA_COLUMNS)
+                    and metadata.get("Excel_Contract_ID")
                     == ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID
+                    and metadata.get("Workflow") == "erba"
+                    and metadata.get("Task") == "classification"
+                    and metadata.get("Subtype") == "er_alpha"
+                    and metadata.get("Decision_rule")
+                    == "binding_probability>=0.5"
                     and metadata.get("Model_ID")
                     == expected_spec.model_id
                     and metadata.get("Model_SHA256")
                     == expected_spec.sha256
+                    and metadata.get("Preprocessing_Policy_ID")
+                    == CLASSIFICATION_PARENT_POLICY_ID
                     and metadata.get("Performance_Evidence_Scope")
                     == "internal_historically_exposed"
                     and bool(metadata.get("Evidence_Caveat"))
@@ -4641,16 +4877,16 @@ class NativePackageQa:
                     "ERalpha mixed Metadata lost catalog provenance",
                 )
                 binding_count = sum(
-                    row["binding_label"] == "binding"
+                    row["Prediction_label"] == "Binding"
                     for row in prediction_rows
                 )
                 non_binding_count = sum(
-                    row["binding_label"] == "non_binding"
+                    row["Prediction_label"] == "Non-binding"
                     for row in prediction_rows
                 )
                 not_predicted_count = sum(
                     row["Result_Status"] != "Predicted"
-                    for row in prediction_rows
+                    for row in diagnostics_rows
                 )
                 mixed_summary = tab.batch_result.get(
                     "1.0", "end"
@@ -4711,7 +4947,7 @@ class NativePackageQa:
                     unavailable_count=not_predicted_count,
                     workbook_unavailable_count=sum(
                         row["Result_Status"] != "Predicted"
-                        for row in prediction_rows
+                        for row in diagnostics_rows
                     ),
                     fresh_output_count=1,
                 )
@@ -4721,6 +4957,7 @@ class NativePackageQa:
                     output=str(mixed_output),
                     sheets=sheet_names,
                     prediction_headers=prediction_headers,
+                    diagnostics_headers=diagnostics_headers,
                     preserved_input_rows=[
                         list(row) for row in input_rows
                     ],
@@ -4730,8 +4967,11 @@ class NativePackageQa:
                     binding_count=binding_count,
                     non_binding_count=non_binding_count,
                     not_predicted_count=not_predicted_count,
-                    invalid_reason_category=prediction_rows[1][
+                    invalid_reason_category=diagnostics_rows[1][
                         "Reason_Category"
+                    ],
+                    invalid_status_code=diagnostics_rows[1][
+                        "Status_Code"
                     ],
                     batch_summary=mixed_summary,
                     completion_dialog=completion_dialog,
@@ -4853,10 +5093,22 @@ class NativePackageQa:
                     data_only=True,
                 )
                 try:
+                    unavailable_sheet_names = workbook.sheetnames
+                    self._require(
+                        unavailable_sheet_names
+                        == list(ERALPHA_WORKBOOK_SHEET_ORDER)
+                        and workbook.active.title == "Predictions",
+                        "ERalpha all-unavailable workbook sheet order drift",
+                    )
                     prediction_sheet = workbook["Predictions"]
                     unavailable_headers = [
                         cell.value for cell in prediction_sheet[1]
                     ]
+                    self._require_eralpha_primary_headers(
+                        unavailable_headers,
+                        ("Row_ID",),
+                        "ERalpha all-unavailable workbook",
+                    )
                     unavailable_rows = [
                         dict(zip(unavailable_headers, row))
                         for row in prediction_sheet.iter_rows(
@@ -4864,16 +5116,64 @@ class NativePackageQa:
                             values_only=True,
                         )
                     ]
-                    unavailable_input_rows = list(
-                        workbook["Input"].iter_rows(
+                    diagnostics_sheet = workbook["Diagnostics"]
+                    unavailable_diagnostics_headers = [
+                        cell.value for cell in diagnostics_sheet[1]
+                    ]
+                    unavailable_diagnostics_rows = [
+                        dict(
+                            zip(
+                                unavailable_diagnostics_headers,
+                                row,
+                            )
+                        )
+                        for row in diagnostics_sheet.iter_rows(
                             min_row=2,
                             values_only=True,
+                        )
+                    ]
+                    unavailable_input_sheet = workbook["Input"]
+                    unavailable_input_headers = [
+                        cell.value for cell in unavailable_input_sheet[1]
+                    ]
+                    unavailable_input_rows = list(
+                        unavailable_input_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    )
+                    unavailable_metadata_sheet = workbook["Metadata"]
+                    unavailable_metadata_headers = [
+                        cell.value
+                        for cell in unavailable_metadata_sheet[1]
+                    ]
+                    unavailable_metadata_rows = list(
+                        unavailable_metadata_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    )
+                    self._require(
+                        len(unavailable_metadata_rows) == 1,
+                        "ERalpha all-unavailable Metadata must contain "
+                        "one execution-level row",
+                    )
+                    unavailable_metadata = dict(
+                        zip(
+                            unavailable_metadata_headers,
+                            unavailable_metadata_rows[0],
                         )
                     )
                 finally:
                     workbook.close()
                 unavailable_count = len(
                     self.MOCK_UNAVAILABLE_CAS_VALUES
+                )
+                self._require_eralpha_diagnostics(
+                    unavailable_diagnostics_headers,
+                    unavailable_diagnostics_rows,
+                    unavailable_rows,
+                    "ERalpha all-unavailable workbook",
                 )
                 self._require(
                     len(unavailable_rows) == unavailable_count
@@ -4882,6 +5182,7 @@ class NativePackageQa:
                         for row in unavailable_rows
                     ]
                     == list(self.MOCK_UNAVAILABLE_CAS_VALUES)
+                    and unavailable_input_headers == ["Row_ID", "CAS"]
                     and unavailable_input_rows
                     == [
                         (f"unavailable-{index}", cas)
@@ -4891,15 +5192,52 @@ class NativePackageQa:
                         )
                     ]
                     and all(
-                        row["Result_Status"] == "Not predicted"
-                        and row["Reason_Category"]
-                        == "PubChem lookup unavailable"
-                        and row["binding_probability"] is None
-                        and row["binding_label"] is None
+                        row["SMILES"] is None
+                        and row["Canonical_SMILES"] is None
+                        and row["Mol_valid"] is False
+                        and self._eralpha_prediction_payload_is_blank(
+                            row
+                        )
+                        and row["PubChem_CID"] is None
+                        and row["PubChem_status"] is None
                         for row in unavailable_rows
+                    )
+                    and all(
+                        diagnostic["Row_ID"]
+                        == f"unavailable-{index}"
+                        and diagnostic["Status_Code"]
+                        == "prediction_failed"
+                        and diagnostic["Status_Message"]
+                        and diagnostic["SMILES_Provenance"]
+                        == "pubchem_lookup_failed"
+                        and diagnostic["Result_Status"]
+                        == "Not predicted"
+                        and diagnostic["Reason_Category"]
+                        == "PubChem lookup unavailable"
+                        and diagnostic["Reason_Description"]
+                        and diagnostic["Recommended_Action"]
+                        for index, diagnostic in enumerate(
+                            unavailable_diagnostics_rows,
+                            1,
+                        )
                     ),
                     "ERalpha all-unavailable result did not retain its "
                     "reasoned blank-prediction rows",
+                )
+                expected_spec = tab.catalog[
+                    (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA)
+                ]
+                self._require(
+                    unavailable_metadata_headers
+                    == list(ERBA_CLASSIFICATION_METADATA_COLUMNS)
+                    and unavailable_metadata.get("Excel_Contract_ID")
+                    == ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID
+                    and unavailable_metadata.get("Model_ID")
+                    == expected_spec.model_id
+                    and unavailable_metadata.get("Model_SHA256")
+                    == expected_spec.sha256,
+                    "ERalpha all-unavailable Metadata lost the v3 "
+                    "contract or model provenance",
                 )
                 unavailable_summary = self._batch_result_value(tab)
                 unavailable_dialog = self._terminal_dialog(
@@ -4939,7 +5277,7 @@ class NativePackageQa:
                     unavailable_count=unavailable_count,
                     workbook_unavailable_count=sum(
                         row["Result_Status"] != "Predicted"
-                        for row in unavailable_rows
+                        for row in unavailable_diagnostics_rows
                     ),
                     fresh_output_count=1,
                 )
@@ -4949,6 +5287,11 @@ class NativePackageQa:
                     "row_count": unavailable_count,
                     "unavailable_count": unavailable_count,
                     "rows": unavailable_rows,
+                    "diagnostics": unavailable_diagnostics_rows,
+                    "diagnostics_headers": (
+                        unavailable_diagnostics_headers
+                    ),
+                    "metadata": unavailable_metadata,
                     "preserved_input_rows": [
                         list(row)
                         for row in unavailable_input_rows
@@ -5187,10 +5530,12 @@ class NativePackageQa:
                 self._require(
                     required_checks <= set(check_names)
                     and len(self.BASELINE_CHECKS) == 22
+                    and len(BATCH_RECOGNITION_CRITERIA) == 9
                     and len(check_names)
                     == 26 + int(bool(self.external_driver_gate)),
                     "native QA check inventory does not retain the 22 baseline "
-                    "checks plus shared-example and batch-failure contracts",
+                    "checks, shared-example/batch-failure contracts, and nine "
+                    "recognition criteria",
                 )
                 self.transcript["check_contract"] = {
                     "baseline_check_count": 22,
@@ -5208,6 +5553,9 @@ class NativePackageQa:
                     ),
                     "batch_recognition_gate": {
                         "gate_id": BATCH_RECOGNITION_GATE_ID,
+                        "criteria_count": len(
+                            BATCH_RECOGNITION_CRITERIA
+                        ),
                         "criteria_ids": list(
                             BATCH_RECOGNITION_CRITERIA
                         ),

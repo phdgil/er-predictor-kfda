@@ -48,11 +48,15 @@ installer\ER_Predictor_Setup_x64.exe
 - ERalpha 분류는 승인된 0.5 기준과 직접 결합 확률/라벨을 사용합니다.
 - `Binding`과 `Non-binding`은 직접 ERα 수용체 결합 분류만 뜻합니다. 전사 활성, 작용제/길항제 활성, 신호 전달, 공동활성인자 모집 또는 일반 내분비계 장애를 뜻하지 않습니다.
 - ERalpha AD는 ERTA와 같은 계산 코드를 사용하지만 ERα 전용 학습 참조와 캐시만 사용합니다.
-- ERalpha batch 결과 workbook은 `Predictions`, `Guide`, `Input`, `Metadata` 순서이며, 열 때 `Predictions`가 첫 시트이자 활성 시트입니다. `Guide`, 변경하지 않은 원본 `Input`, 추적용 `Metadata`도 그대로 유지됩니다.
-- ERalpha workbook의 모든 시트는 색 채우기, 결과별 강조, 임의 열 너비 같은 장식 서식을 추가하지 않습니다. 특히 기본 `Predictions` 데이터 셀 서식은 ERTA가 pandas/openpyxl로 생성하는 평문 worksheet와 동일합니다. 이 서식 단순화는 결과 열, 결합 의미, `Guide`, 원본 `Input`, 모델·근거 provenance가 있는 `Metadata`를 제거하거나 변경하지 않습니다.
-- `Predictions`에는 원본 입력 열이 원래 순서대로 먼저 나오고, `non_binding_probability`, `binding_probability`, `binding_label`을 포함한 신뢰된 결합 분류 결과/상태/모델 추적 열과 ERalpha 전용 AD 열 9개가 이어집니다. 이름을 정규화했을 때 입력 열과 결과 열이 충돌하면 신뢰된 결과 열을 사용하며, 원본 값과 머리글은 `Input` 시트에서 확인할 수 있습니다.
+- ERalpha batch 결과 workbook은 `Predictions`, `Guide`, `Diagnostics`, `Input`, `Metadata` 순서이며, 열 때 `Predictions`가 첫 시트이자 활성 시트입니다. `Guide`, 행별 기술 상태를 담은 `Diagnostics`, 변경하지 않은 원본 `Input`, 실행 단위 provenance를 담은 `Metadata`를 함께 유지합니다.
+- ERalpha workbook의 모든 시트는 색 채우기, 결과별 강조, 임의 열 너비 같은 장식 서식을 추가하지 않습니다. 특히 기본 `Predictions` 데이터 셀 서식은 ERTA가 pandas/openpyxl로 생성하는 평문 worksheet와 동일합니다. 같은 열 이름은 읽기 편의를 위한 표현 일치이며 endpoint의 과학적 의미까지 같다는 뜻은 아닙니다.
+- `Predictions`에는 충돌하지 않는 원본 입력 열이 원래 순서대로 먼저 나오고, 신뢰된 열이 정확히 `CAS`, `SMILES`, `Canonical_SMILES`, `Mol_valid`, `Probability_Negative_0`, `Probability_Positive_1`, `Prediction`, `Prediction_label`, 아래 AD 열 9개, `PubChem_CID`, `PubChem_status` 순서로 이어집니다. `Prediction`은 숫자 `0`/`1`, `Prediction_label`은 각각 `Non-binding`/`Binding`입니다. 직접 입력했거나 PubChem 응답에 값이 없으면 PubChem provenance 셀은 비어 있으며, CID나 조회 상태를 추정하거나 다시 조회하여 채우지 않습니다.
+- ERalpha에서 `Probability_Negative_0`은 **Non-binding**, `Probability_Positive_1`은 **Binding** 확률입니다. ERTA의 같은 평문 열 이름에서 `Negative`/`Positive`는 전사 활성 분류를 뜻하므로 ERalpha의 직접 수용체 결합 결과와 서로 바꾸어 해석할 수 없습니다.
 - ERalpha AD 열은 `AD`, `AD_MeanDistance`, `AD_DistanceThreshold`, `AD_Distance_InDomain`, `AD_SimilarityMax`, `AD_SimilarityThreshold`, `AD_Similarity_InDomain`, `AD_PC1`, `AD_PC2`입니다. 모두 ERalpha 경로의 학습 참조와 캐시로 계산하며 ERTA AD 데이터를 섞지 않습니다.
-- `Guide`는 각 시트, 빈 예측값, 제외 사유와 권장 조치를 설명합니다. `Predictions`의 확률/라벨이 빈 행은 `Result_Status`, `Reason_Category`, `Reason_Description`, `Recommended_Action`을 확인하십시오.
+- 예측하지 못한 행은 `Predictions`의 두 확률, `Prediction`, `Prediction_label`, AD 값이 모두 빈 셀입니다. 같은 순서의 `Diagnostics` 행에서 `Row_ID`, `CAS`, 0부터 시작하는 `row_index`, `Status_Code`, `Status_Message`, `SMILES_Provenance`, `Result_Status`, `Reason_Category`, `Reason_Description`, `Recommended_Action`을 확인하십시오.
+- 실행마다 일정한 `Workflow`, `Task`, `Subtype`, `Decision_rule`, `Model_ID`, `Model_SHA256`, `Preprocessing_Policy_ID`, protocol/source/split/CV/report/caveat hash, 근거 범위와 caveat는 한 행짜리 `Metadata`에만 기록됩니다. 이 값들을 각 `Predictions` 행에 반복하지 않습니다. 분류 workbook 계약 ID는 `erba.binding.classification.excel.v3`입니다.
+- workbook을 자동 처리하는 코드는 v3 `Predictions` 이름을 직접 사용하고, 행 상태/사유는 같은 데이터 행 위치(또는 0부터 시작하는 `row_index`)의 `Diagnostics`에서, 모델 SHA-256과 실행 provenance는 한 행짜리 `Metadata`에서 읽어야 합니다. v2의 소문자 `raw_smiles`, `model_smiles`, `non_binding_probability`, `binding_probability`, `binding_label`이나 기본 시트의 행별 model/hash/caveat 열은 더 이상 제공하지 않습니다.
+- `Guide`는 기본 결과 열, 빈 예측값, `Diagnostics`의 제외 사유·권장 조치, 원본 `Input`, 실행 단위 `Metadata`를 설명하고 전체/사유별 행 수를 제공합니다. 이름을 정규화했을 때 입력 열과 신뢰된 결과·진단·metadata 열이 충돌하면 해당 입력 열은 `Predictions`에서 제외하고 지정된 시트의 생성 값을 신뢰합니다. 원본 값과 머리글은 `Input` 시트에서 확인할 수 있습니다.
 - 이 workbook/AD 보고 개선을 위해 새 모델을 도입하거나 승인하지 않았습니다. 기존에 승인된 V7 ERalpha 분류 모델과 그 과학적 한계가 그대로 적용됩니다.
 
 **ERBA 분류 근거는 과거에 노출된 개발 행을 사용한 내부 평가입니다. 신선한 독립/외부/시간적/모집단 검증 또는 규제 검증이 아니며, 규제 용도로 사용할 수 없습니다.**

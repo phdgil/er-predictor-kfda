@@ -46,11 +46,12 @@ MODEL_SCHEMA_ID = RAW_SMILES_PIPELINE_SCHEMA_ID
 ARTIFACT_SCHEMA_VERSION = 1
 CLASSIFICATION_FEATURE_SCHEMA_ID = "rdkit_fp_2048"
 REGRESSION_FEATURE_SCHEMA_ID = "avalon_fp_2048"
-ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID = "erba.binding.classification.excel.v2"
+ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID = "erba.binding.classification.excel.v3"
 ERBA_ERALPHA_IC50_EXCEL_CONTRACT_ID = "erba.eralpha.ic50.excel.v1"
 ERTA_LEGACY_EXCEL_CONTRACT_ID = "erta.legacy.excel.v1"
 ERBA_INPUT_SHEET_NAME = "Input"
 ERBA_PREDICTIONS_SHEET_NAME = "Predictions"
+ERBA_DIAGNOSTICS_SHEET_NAME = "Diagnostics"
 ERBA_METADATA_SHEET_NAME = "Metadata"
 ERBA_GUIDE_SHEET_NAME = "Guide"
 ERBA_CANONICAL_INPUT_COLUMNS = ("Row_ID", "CAS", "SMILES")
@@ -61,6 +62,14 @@ ERBA_INPUT_HEADER_ALIASES = {
 }
 ERBA_METADATA_COLUMNS = (
     "Excel_Contract_ID", "Model_ID", "Model_SHA256", "Protocol_SHA256",
+    "Source_Manifest_SHA256", "Historical_Exposure_Manifest_SHA256",
+    "Split_Manifest_SHA256", "Nested_CV_SHA256", "Internal_Resplit_SHA256",
+    "Preprocessing_Parity_SHA256", "Report_SHA256", "Caveat_SHA256",
+    "Performance_Evidence_Scope", "Evidence_Caveat",
+)
+ERBA_CLASSIFICATION_METADATA_COLUMNS = (
+    "Excel_Contract_ID", "Workflow", "Task", "Subtype", "Decision_rule",
+    "Model_ID", "Model_SHA256", "Preprocessing_Policy_ID", "Protocol_SHA256",
     "Source_Manifest_SHA256", "Historical_Exposure_Manifest_SHA256",
     "Split_Manifest_SHA256", "Nested_CV_SHA256", "Internal_Resplit_SHA256",
     "Preprocessing_Parity_SHA256", "Report_SHA256", "Caveat_SHA256",
@@ -100,7 +109,17 @@ REGRESSION_OUTPUT_COLUMNS = (
     "preprocessing_policy_id", "evidence_caveat",
     "Result_Status", "Reason_Category", "Reason_Description", "Recommended_Action",
 )
-ERBA_CLASSIFICATION_PREDICTION_COLUMNS = ("Row_ID", "CAS", *CLASSIFICATION_OUTPUT_COLUMNS)
+ERBA_CLASSIFICATION_PREDICTION_COLUMNS = (
+    "CAS", "SMILES", "Canonical_SMILES", "Mol_valid",
+    "Probability_Negative_0", "Probability_Positive_1",
+    "Prediction", "Prediction_label",
+)
+ERBA_CLASSIFICATION_PUBCHEM_COLUMNS = ("PubChem_CID", "PubChem_status")
+ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS = (
+    "Row_ID", "CAS", "row_index", "Status_Code", "Status_Message",
+    "SMILES_Provenance",
+    "Result_Status", "Reason_Category", "Reason_Description", "Recommended_Action",
+)
 ERBA_REGRESSION_PREDICTION_COLUMNS = ("Row_ID", "CAS", *REGRESSION_OUTPUT_COLUMNS)
 
 SUPPORTED_COMBINATIONS = frozenset({

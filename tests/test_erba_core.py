@@ -270,6 +270,28 @@ class ERBACoreTests(unittest.TestCase):
             self.assertEqual([request.smiles for request in predictor.calls], ["C=O"])
             self.assertEqual(erba_ad.calls, [(task, subtype, "C=O")])
             lookup.assert_called_once_with("50-00-0")
+            predictions = pd.read_excel(
+                export_result.destination,
+                sheet_name="Predictions",
+                dtype=str,
+                keep_default_na=False,
+            )
+            diagnostics = pd.read_excel(
+                export_result.destination,
+                sheet_name="Diagnostics",
+                dtype=str,
+                keep_default_na=False,
+            )
+            self.assertEqual(predictions.loc[0, "SMILES"], "C=O")
+            self.assertEqual(predictions.loc[0, "Canonical_SMILES"], "C=O")
+            self.assertEqual(predictions.loc[0, "PubChem_CID"], "712")
+            self.assertEqual(predictions.loc[0, "Prediction"], "1")
+            self.assertEqual(predictions.loc[0, "Prediction_label"], "Binding")
+            self.assertEqual(diagnostics.loc[0, "Status_Code"], "ok")
+            self.assertEqual(
+                diagnostics.loc[0, "SMILES_Provenance"],
+                "pubchem_lookup",
+            )
         with patch("gui.erba_tab.cas_to_smiles", return_value={"IsomericSMILES": "C[C@H](O)F"}):
             self.assertEqual(cas_lookup_smiles("75-05-8"), "C[C@H](O)F")
         with patch("gui.erba_tab.cas_to_smiles", return_value={"PubChem_CID": 1}):
@@ -310,7 +332,11 @@ class ERBACoreTests(unittest.TestCase):
             pd.DataFrame({"CARSRN": cas_values}).to_excel(input_path, index=False)
             with patch(
                 "gui.erba_tab.cas_to_smiles",
-                return_value={"CanonicalSMILES": "CCO", "PubChem_CID": 702},
+                return_value={
+                    "CanonicalSMILES": "CCO",
+                    "PubChem_CID": 702,
+                    "PubChem_status": "Found",
+                },
             ) as lookup, patch(
                 "gui.erba_tab.save_erba_batch_graphs",
                 return_value=((), None),
@@ -330,6 +356,12 @@ class ERBACoreTests(unittest.TestCase):
                 dtype=str,
                 keep_default_na=False,
             )
+            diagnostics = pd.read_excel(
+                export_result.destination,
+                sheet_name="Diagnostics",
+                dtype=str,
+                keep_default_na=False,
+            )
 
         self.assertEqual(export_result.count, 25)
         self.assertEqual(
@@ -337,9 +369,16 @@ class ERBACoreTests(unittest.TestCase):
             cas_values,
         )
         self.assertEqual([request.smiles for request in predictor.calls], ["CCO"] * 25)
-        self.assertEqual(predictions["CARSRN"].tolist(), cas_values)
+        self.assertNotIn("CARSRN", predictions)
         self.assertEqual(predictions["CAS"].tolist(), cas_values)
-        self.assertEqual(predictions["Result_Status"].tolist(), ["Predicted"] * 25)
+        self.assertEqual(predictions["SMILES"].tolist(), ["CCO"] * 25)
+        self.assertEqual(predictions["PubChem_CID"].tolist(), ["702"] * 25)
+        self.assertEqual(predictions["PubChem_status"].tolist(), ["Found"] * 25)
+        self.assertEqual(diagnostics["Result_Status"].tolist(), ["Predicted"] * 25)
+        self.assertEqual(
+            diagnostics["SMILES_Provenance"].tolist(),
+            ["pubchem_lookup"] * 25,
+        )
 
     def test_regression_remains_separate_and_parity_gated(self):
         with tempfile.TemporaryDirectory() as root:

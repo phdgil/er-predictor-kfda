@@ -22,12 +22,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from rdkit import Chem
 
 from core.contracts import (
+    CLASSIFICATION_OUTPUT_COLUMNS,
+    CLASSIFICATION_PARENT_POLICY_ID,
     ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID,
+    ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS,
+    ERBA_CLASSIFICATION_METADATA_COLUMNS,
     ERBA_CLASSIFICATION_PREDICTION_COLUMNS,
+    ERBA_CLASSIFICATION_PUBCHEM_COLUMNS,
     ERBA_REGRESSION_PREDICTION_COLUMNS,
     ERBA_CANONICAL_INPUT_COLUMNS,
+    ERBA_DIAGNOSTICS_SHEET_NAME,
     ERBA_FATAL_ARTIFACT_STATUS_CODES,
     ERBA_INPUT_HEADER_ALIASES,
     ERBA_INPUT_SHEET_NAME,
@@ -40,6 +47,7 @@ from core.contracts import (
     ERBA_ERALPHA_IC50_EXCEL_CONTRACT_ID,
     HISTORICAL_EXPOSURE_CAVEAT_COMPACT,
     HISTORICAL_EXPOSURE_CAVEAT_FULL,
+    REGRESSION_OUTPUT_COLUMNS,
     REGRESSION_EVIDENCE_CAVEAT_COMPACT,
     REGRESSION_EVIDENCE_CAVEAT_FULL,
     ERBAArtifactSpec,
@@ -47,6 +55,7 @@ from core.contracts import (
     ERBAStatusCode,
     ERBASubtype,
     ERBATask,
+    ERBAWorkflow,
     output_columns,
 )
 from core.erba_predictor import ERBAPredictor
@@ -391,6 +400,8 @@ def allocate_output_path(output_dir: str | Path, task: ERBATask, subtype: ERBASu
         os.close(fd)
         return candidate
     raise RuntimeError("Could not allocate a non-overwriting ERBA output filename.")
+
+
 def validate_cas(cas: str) -> bool:
     """Accept only a syntactically valid CAS Registry Number with a valid check digit."""
     value = cas.strip()
@@ -398,18 +409,41 @@ def validate_cas(cas: str) -> bool:
         return False
     digits = value.replace("-", "")
     return sum(int(digit) * factor for factor, digit in enumerate(reversed(digits[:-1]), 1)) % 10 == int(digits[-1])
-def cas_lookup_smiles(cas: str) -> str:
-    """Extract a usable SMILES string from the PubChem mapping contract."""
+
+
+def _trusted_pubchem_cid(value):
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return value if value > 0 else ""
+    text = str(value).strip()
+    return text if text.isdecimal() and int(text) > 0 else ""
+
+
+def _cas_lookup_details(cas: str) -> tuple[str, object, str]:
+    """Extract a SMILES and only provenance explicitly returned by PubChem."""
     lookup = cas_to_smiles(cas)
     if not isinstance(lookup, Mapping):
         raise ValueError("CAS lookup returned an invalid response.")
+    smiles = ""
     for field in ("CanonicalSMILES", "IsomericSMILES"):
         value = lookup.get(field)
         if isinstance(value, str) and value.strip():
-            return value.strip()
-    raise ValueError("CAS lookup returned neither CanonicalSMILES nor IsomericSMILES.")
+            smiles = value.strip()
+            break
+    if not smiles:
+        raise ValueError("CAS lookup returned neither CanonicalSMILES nor IsomericSMILES.")
+    status = lookup.get("PubChem_status", "")
+    return (
+        smiles,
+        _trusted_pubchem_cid(lookup.get("PubChem_CID")),
+        status.strip() if isinstance(status, str) else "",
+    )
 
 
+def cas_lookup_smiles(cas: str) -> str:
+    """Extract a usable SMILES string from the PubChem mapping contract."""
+    return _cas_lookup_details(cas)[0]
 
 
 def read_batch_input(path: str | Path) -> pd.DataFrame:
@@ -456,19 +490,42 @@ def build_primary_predictions(
     input_rows: pd.DataFrame,
     trusted_predictions: pd.DataFrame,
     ad_rows: pd.DataFrame,
+    pubchem_rows: pd.DataFrame,
 ) -> pd.DataFrame:
     """Prefix safe input fields while preventing them from spoofing trusted output fields."""
-    if not (len(input_rows) == len(trusted_predictions) == len(ad_rows)):
+    if not (
+        len(input_rows)
+        == len(trusted_predictions)
+        == len(ad_rows)
+        == len(pubchem_rows)
+    ):
         raise ValueError("ERBA batch result rows are not aligned.")
     reserved = {
         _normalized_header(column)
-        for column in (*trusted_predictions.columns, *ad_rows.columns)
+        for column in (
+            *trusted_predictions.columns,
+            *ad_rows.columns,
+            *pubchem_rows.columns,
+            *CLASSIFICATION_OUTPUT_COLUMNS,
+            *REGRESSION_OUTPUT_COLUMNS,
+            *(
+                column
+                for column in ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS
+                if column != "Row_ID"
+            ),
+            *ERBA_CLASSIFICATION_METADATA_COLUMNS,
+        )
+    }
+    represented_input_aliases = {
+        _normalized_header(alias)
+        for target in ("CAS", "SMILES")
+        for alias in _BATCH_INPUT_HEADER_ALIASES[target]
     }
     used = set(reserved)
     passthrough = []
     for position, header in enumerate(input_rows.columns):
         normalized = _normalized_header(header)
-        if normalized in reserved:
+        if normalized in reserved or normalized in represented_input_aliases:
             continue
         base = str(header).strip() or f"Input_{position + 1}"
         candidate = base
@@ -490,6 +547,7 @@ def build_primary_predictions(
             passthrough_frame,
             trusted_predictions.reset_index(drop=True),
             ad_rows.reset_index(drop=True),
+            pubchem_rows.reset_index(drop=True),
         ),
         axis=1,
     )
@@ -627,7 +685,12 @@ def excel_contract_id(task: ERBATask) -> str:
     return ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID if task is ERBATask.CLASSIFICATION else ERBA_ERALPHA_IC50_EXCEL_CONTRACT_ID
 
 
-def metadata_row(task: ERBATask, spec: ERBAArtifactSpec, catalog_payload: dict) -> dict:
+def metadata_row(
+    task: ERBATask,
+    subtype: ERBASubtype,
+    spec: ERBAArtifactSpec,
+    catalog_payload: dict,
+) -> dict:
     shared = dict(catalog_payload.get("metadata") or {})
     shared.update(catalog_payload.get("provenance") or {})
     route_metadata = (catalog_payload.get("route_metadata") or {}).get(spec.model_id, {})
@@ -644,7 +707,7 @@ def metadata_row(task: ERBATask, spec: ERBAArtifactSpec, catalog_payload: dict) 
     if missing:
         raise ValueError(f"ERBA catalog provenance is incomplete: {', '.join(missing)}")
     classification = task is ERBATask.CLASSIFICATION
-    return {
+    row = {
         "Excel_Contract_ID": excel_contract_id(task), "Model_ID": spec.model_id, "Model_SHA256": spec.sha256,
         "Protocol_SHA256": provenance.get("protocol_sha256", ""),
         "Source_Manifest_SHA256": provenance["source_manifest_sha256"],
@@ -659,6 +722,15 @@ def metadata_row(task: ERBATask, spec: ERBAArtifactSpec, catalog_payload: dict) 
         ),
         "Evidence_Caveat": HISTORICAL_EXPOSURE_CAVEAT_FULL if classification else "",
     }
+    if classification:
+        row.update({
+            "Workflow": ERBAWorkflow.ERBA.value,
+            "Task": task.value,
+            "Subtype": subtype.value,
+            "Decision_rule": "binding_probability>=0.5",
+            "Preprocessing_Policy_ID": CLASSIFICATION_PARENT_POLICY_ID,
+        })
+    return row
 
 
 def result_row(result, task: ERBATask, row_id: str, cas: str) -> dict:
@@ -670,6 +742,59 @@ def result_row(result, task: ERBATask, row_id: str, cas: str) -> dict:
                 row[column] = ""
     row.update(result_explanation(result))
     return row
+
+
+def _rdkit_mol_valid(smiles) -> bool:
+    text = smiles.strip() if isinstance(smiles, str) else ""
+    if not text:
+        return False
+    try:
+        return Chem.MolFromSmiles(text, sanitize=True) is not None
+    except Exception:
+        return False
+
+
+def classification_prediction_row(result, cas: str) -> dict[str, object]:
+    available = result.status_code is ERBAStatusCode.OK
+    label = _binding_display_label(result.binding_label) if available else ""
+    prediction = {"Non-binding": 0, "Binding": 1}.get(label, "")
+    return {
+        "CAS": cas,
+        "SMILES": result.raw_smiles or "",
+        "Canonical_SMILES": result.model_smiles or "",
+        "Mol_valid": _rdkit_mol_valid(result.raw_smiles),
+        "Probability_Negative_0": (
+            result.non_binding_probability if available else ""
+        ),
+        "Probability_Positive_1": (
+            result.binding_probability if available else ""
+        ),
+        "Prediction": prediction,
+        "Prediction_label": label,
+    }
+
+
+def diagnostic_row(
+    result,
+    row_id: str,
+    cas: str,
+    smiles_provenance: str,
+) -> dict[str, object]:
+    explanation = result_explanation(result)
+    status_code = result.status_code
+    return {
+        "Row_ID": row_id,
+        "CAS": cas,
+        "row_index": result.row_index,
+        "Status_Code": (
+            status_code.value
+            if isinstance(status_code, ERBAStatusCode)
+            else str(status_code or "")
+        ),
+        "Status_Message": result.status_message or "",
+        "SMILES_Provenance": smiles_provenance,
+        **explanation,
+    }
 
 
 def fatal_artifact_failure(results) -> bool:
@@ -750,6 +875,7 @@ def _progress(callback, stage: str, current: int, total: int, percent: int) -> N
 def _format_workbook(
     writer,
     predictions: pd.DataFrame,
+    diagnostics: pd.DataFrame | None,
     task: ERBATask,
     graph_paths: tuple[Path, ...],
     graph_directory: Path | None,
@@ -758,6 +884,7 @@ def _format_workbook(
 ) -> None:
     """Write supporting content while retaining ERTA's plain pandas workbook style."""
     classification = task is ERBATask.CLASSIFICATION
+    status_rows = diagnostics if diagnostics is not None else predictions
     guide_rows = [
         (
             "ERalpha batch prediction guide",
@@ -773,8 +900,8 @@ def _format_workbook(
         (
             "Unavailable predictions",
             (
-                "Binding probabilities, binding label, and AD values are blank when Result_Status is Not predicted; "
-                "the reason and recommended action remain on the same row."
+                "Probability, Prediction, Prediction_label, and AD values are blank when the Diagnostics "
+                "Result_Status is Not predicted; the row-level reason and recommended action remain in Diagnostics."
                 if classification
                 else "pIC50 and IC50 values are blank when Result_Status is Not predicted; "
                 "the reason and recommended action remain on the same row."
@@ -789,8 +916,77 @@ def _format_workbook(
                 else "Batch AD fields are not part of this regression workbook contract."
             ),
         ),
+    ]
+    if classification:
+        guide_rows.extend([
+            (
+                "Endpoint semantics",
+                "This workbook predicts direct ER receptor binding, not ERTA transactivation. "
+                "Shared ERTA-style column names do not make the biological endpoints equivalent.",
+            ),
+            (
+                "Probability_Negative_0",
+                "Model probability for class 0, Non-binding, at the direct-binding endpoint.",
+            ),
+            (
+                "Probability_Positive_1",
+                "Model probability for class 1, Binding, at the direct-binding endpoint.",
+            ),
+            (
+                "Prediction",
+                "Numeric direct-binding class: 0 = Non-binding and 1 = Binding; blank when not predicted.",
+            ),
+            (
+                "Prediction_label",
+                "Direct-binding label, Binding or Non-binding; blank when not predicted.",
+            ),
+            (
+                "Decision_rule",
+                "Metadata records the ERBA-specific binding_probability>=0.5 threshold; "
+                "this is not the ERTA higher_probability rule.",
+            ),
+            (
+                "CAS and SMILES",
+                "CAS is the recognized input CAS identifier. SMILES is the direct input structure or the "
+                "single PubChem-resolved structure submitted to ERBA preprocessing.",
+            ),
+            (
+                "SMILES_Provenance",
+                "Diagnostics uses direct_input, pubchem_lookup, pubchem_lookup_failed, or unavailable "
+                "to record how each row's SMILES resolution was handled.",
+            ),
+            (
+                "Mol_valid",
+                "Whether RDKit can parse and sanitize SMILES. True does not mean the structure is supported "
+                "by the ERBA preprocessing policy or that a prediction is available.",
+            ),
+            (
+                "Canonical_SMILES",
+                "ERBA route-normalized model input after route-specific parent preprocessing; blank when no model "
+                "input is available. It does not assert preprocessing equivalence with ERTA.",
+            ),
+            (
+                "PubChem provenance",
+                "PubChem_CID and PubChem_status are populated only when those values were returned by the "
+                "single CAS lookup used for the row; otherwise they are blank.",
+            ),
+            (
+                "Diagnostics",
+                "Rows are one-to-one with Predictions in the same order; zero-based row_index matches the "
+                "Predictions data-row position. SMILES provenance, prediction availability, technical status, "
+                "failure reason, and recommended action are retained here.",
+            ),
+        ])
+    guide_rows.extend([
         ("Input", "Original first-sheet input, retained in its original row order."),
-        ("Metadata", "Model identity, integrity hashes, and evidence caveat for this export."),
+        (
+            "Metadata",
+            (
+                "Workflow, endpoint, decision rule, model identity, integrity hashes, policy, and evidence caveat."
+                if classification
+                else "Model identity, integrity hashes, and evidence scope for this export."
+            ),
+        ),
         ("Graph files", str(len(graph_paths))),
         (
             "Graph directory",
@@ -813,11 +1009,19 @@ def _format_workbook(
             else REGRESSION_EVIDENCE_CAVEAT_FULL,
         ),
         ("Total rows", str(len(predictions))),
-        ("Predicted rows", str((predictions["Result_Status"] == "Predicted").sum())),
-        ("Not predicted rows", str((predictions["Result_Status"] != "Predicted").sum())),
+        ("Predicted rows", str((status_rows["Result_Status"] == "Predicted").sum())),
+        ("Not predicted rows", str((status_rows["Result_Status"] != "Predicted").sum())),
         ("Reason counts", "Counts below include not-predicted categories only."),
-    ]
-    if "binding_label" in predictions:
+    ])
+    if "Prediction_label" in predictions:
+        labels = predictions["Prediction_label"].map(_binding_display_label)
+        guide_rows.extend(
+            (
+                ("Binding rows", str((labels == "Binding").sum())),
+                ("Non-binding rows", str((labels == "Non-binding").sum())),
+            )
+        )
+    elif "binding_label" in predictions:
         labels = predictions["binding_label"].map(_binding_display_label)
         guide_rows.extend(
             (
@@ -836,7 +1040,7 @@ def _format_workbook(
     if ad_error:
         guide_rows.append(("AD evaluation warning", ad_error))
     for category, count in (
-        predictions.loc[predictions["Result_Status"] != "Predicted", "Reason_Category"]
+        status_rows.loc[status_rows["Result_Status"] != "Predicted", "Reason_Category"]
         .value_counts()
         .sort_index()
         .items()
@@ -846,12 +1050,17 @@ def _format_workbook(
         writer, sheet_name=ERBA_GUIDE_SHEET_NAME, index=False
     )
 
-    writer.book._sheets = [
+    ordered_sheets = [
         writer.book[ERBA_PREDICTIONS_SHEET_NAME],
         writer.book[ERBA_GUIDE_SHEET_NAME],
+    ]
+    if diagnostics is not None:
+        ordered_sheets.append(writer.book[ERBA_DIAGNOSTICS_SHEET_NAME])
+    ordered_sheets.extend([
         writer.book[ERBA_INPUT_SHEET_NAME],
         writer.book[ERBA_METADATA_SHEET_NAME],
-    ]
+    ])
+    writer.book._sheets = ordered_sheets
     writer.book.active = writer.book[ERBA_PREDICTIONS_SHEET_NAME]
 
 
@@ -888,12 +1097,16 @@ def export_erba_batch(
     canonical_rows, input_rows = canonicalize_batch_input(frame)
     total = len(canonical_rows)
     resolved_rows = []
+    pubchem_rows = []
+    smiles_provenance_rows = []
     _progress(progress_callback, "Resolving CAS/SMILES", 0, total, 10)
     for position, (_, values) in enumerate(canonical_rows.iterrows()):
         row_id, cas, direct_smiles = (
             str(values[column]).strip() for column in ERBA_CANONICAL_INPUT_COLUMNS
         )
         lookup_error, smiles = "", direct_smiles
+        pubchem_cid, pubchem_status = "", ""
+        smiles_provenance = "direct_input" if direct_smiles else "unavailable"
         if not smiles and cas:
             if not validate_cas(cas):
                 lookup_error = "CAS is invalid: expected a valid CAS Registry Number check digit."
@@ -903,10 +1116,17 @@ def export_erba_batch(
                         status_callback(
                             batch_pubchem_status(position + 1, total, cas)
                         )
-                    smiles = cas_lookup_smiles(cas)
+                    smiles, pubchem_cid, pubchem_status = _cas_lookup_details(cas)
+                    smiles_provenance = "pubchem_lookup"
                 except Exception as error:
                     lookup_error = f"CAS lookup failed: {error}"
+                    smiles_provenance = "pubchem_lookup_failed"
         resolved_rows.append((position, row_id, cas, smiles, lookup_error))
+        smiles_provenance_rows.append(smiles_provenance)
+        pubchem_rows.append({
+            "PubChem_CID": pubchem_cid,
+            "PubChem_status": pubchem_status,
+        })
         _progress(
             progress_callback,
             "Resolving CAS/SMILES",
@@ -940,14 +1160,14 @@ def export_erba_batch(
     if fatal_artifact_failure([result for result, _, _ in results]):
         raise RuntimeError("ERBA artifact validation failed; no output was published.")
 
-    prediction_columns = (
-        ERBA_CLASSIFICATION_PREDICTION_COLUMNS
+    technical_columns = (
+        ("Row_ID", "CAS", *CLASSIFICATION_OUTPUT_COLUMNS)
         if task is ERBATask.CLASSIFICATION
         else ERBA_REGRESSION_PREDICTION_COLUMNS
     )
     trusted_predictions = pd.DataFrame(
         [result_row(result, task, row_id, cas) for result, row_id, cas in results],
-        columns=prediction_columns,
+        columns=technical_columns,
     )
 
     ad_rows = [_blank_ad_row() for _ in range(total)]
@@ -986,12 +1206,37 @@ def export_erba_batch(
         )
 
     ad_frame = pd.DataFrame(ad_rows, columns=ERBA_BATCH_AD_COLUMNS)
-    predictions = (
-        build_primary_predictions(input_rows, trusted_predictions, ad_frame)
-        if task is ERBATask.CLASSIFICATION
-        and subtype is ERBASubtype.ER_ALPHA
-        else trusted_predictions
-    )
+    if task is ERBATask.CLASSIFICATION:
+        classification_predictions = pd.DataFrame(
+            [
+                classification_prediction_row(result, cas)
+                for result, _row_id, cas in results
+            ],
+            columns=ERBA_CLASSIFICATION_PREDICTION_COLUMNS,
+        )
+        diagnostics = pd.DataFrame(
+            [
+                diagnostic_row(result, row_id, cas, smiles_provenance)
+                for (result, row_id, cas), smiles_provenance in zip(
+                    results,
+                    smiles_provenance_rows,
+                )
+            ],
+            columns=ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS,
+        )
+        pubchem_frame = pd.DataFrame(
+            pubchem_rows,
+            columns=ERBA_CLASSIFICATION_PUBCHEM_COLUMNS,
+        )
+        predictions = build_primary_predictions(
+            input_rows,
+            classification_predictions,
+            ad_frame,
+            pubchem_frame,
+        )
+    else:
+        diagnostics = None
+        predictions = trusted_predictions
     unique_ad_errors = list(dict.fromkeys(ad_errors))
     ad_error = "; ".join(unique_ad_errors[:3])
     if len(unique_ad_errors) > 3:
@@ -1003,7 +1248,7 @@ def export_erba_batch(
     graph_error = ""
     if ad_positions:
         try:
-            graph_predictions = predictions.iloc[ad_positions].reset_index(drop=True)
+            graph_predictions = trusted_predictions.iloc[ad_positions].reset_index(drop=True)
             graph_paths, graph_directory = save_erba_batch_graphs(
                 graph_predictions,
                 destination,
@@ -1025,15 +1270,27 @@ def export_erba_batch(
         os.close(temp_fd)
         with pd.ExcelWriter(temp_name, engine="openpyxl") as writer:
             predictions.to_excel(writer, sheet_name=ERBA_PREDICTIONS_SHEET_NAME, index=False)
+            if diagnostics is not None:
+                diagnostics.to_excel(
+                    writer,
+                    sheet_name=ERBA_DIAGNOSTICS_SHEET_NAME,
+                    index=False,
+                )
             input_rows.to_excel(writer, sheet_name=ERBA_INPUT_SHEET_NAME, index=False)
+            metadata_columns = (
+                ERBA_CLASSIFICATION_METADATA_COLUMNS
+                if task is ERBATask.CLASSIFICATION
+                else ERBA_METADATA_COLUMNS
+            )
             metadata = pd.DataFrame(
-                [metadata_row(task, spec, catalog_payload)],
-                columns=ERBA_METADATA_COLUMNS,
+                [metadata_row(task, subtype, spec, catalog_payload)],
+                columns=metadata_columns,
             )
             metadata.to_excel(writer, sheet_name=ERBA_METADATA_SHEET_NAME, index=False)
             _format_workbook(
                 writer,
                 predictions,
+                diagnostics,
                 task,
                 graph_paths,
                 graph_directory,

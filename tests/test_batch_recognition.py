@@ -2,10 +2,18 @@ from copy import deepcopy
 
 import pytest
 
+from core.contracts import (
+    ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS,
+    ERBA_CLASSIFICATION_METADATA_COLUMNS,
+)
 from core.native_qa import (
     BATCH_RECOGNITION_CRITERIA,
     BATCH_RECOGNITION_GATE_ID,
     BATCH_UNAVAILABLE_LABEL,
+    ERALPHA_PRIMARY_FORBIDDEN_COLUMNS,
+    ERALPHA_PRIMARY_TRUSTED_COLUMNS,
+    ERALPHA_WORKBOOK_SHEET_ORDER,
+    NativePackageQa,
     evaluate_batch_recognition_contract,
 )
 
@@ -20,6 +28,98 @@ _DISABLED_CONTROLS = {
     "template": "disabled",
     "run": "disabled",
 }
+
+
+def test_native_qa_locks_v3_primary_contract_and_gate_counts():
+    assert ERALPHA_WORKBOOK_SHEET_ORDER == (
+        "Predictions",
+        "Guide",
+        "Diagnostics",
+        "Input",
+        "Metadata",
+    )
+    assert ERALPHA_PRIMARY_TRUSTED_COLUMNS == (
+        "CAS",
+        "SMILES",
+        "Canonical_SMILES",
+        "Mol_valid",
+        "Probability_Negative_0",
+        "Probability_Positive_1",
+        "Prediction",
+        "Prediction_label",
+        "AD",
+        "AD_MeanDistance",
+        "AD_DistanceThreshold",
+        "AD_Distance_InDomain",
+        "AD_SimilarityMax",
+        "AD_SimilarityThreshold",
+        "AD_Similarity_InDomain",
+        "AD_PC1",
+        "AD_PC2",
+        "PubChem_CID",
+        "PubChem_status",
+    )
+    assert ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS == (
+        "Row_ID",
+        "CAS",
+        "row_index",
+        "Status_Code",
+        "Status_Message",
+        "SMILES_Provenance",
+        "Result_Status",
+        "Reason_Category",
+        "Reason_Description",
+        "Recommended_Action",
+    )
+    assert ERBA_CLASSIFICATION_METADATA_COLUMNS == (
+        "Excel_Contract_ID",
+        "Workflow",
+        "Task",
+        "Subtype",
+        "Decision_rule",
+        "Model_ID",
+        "Model_SHA256",
+        "Preprocessing_Policy_ID",
+        "Protocol_SHA256",
+        "Source_Manifest_SHA256",
+        "Historical_Exposure_Manifest_SHA256",
+        "Split_Manifest_SHA256",
+        "Nested_CV_SHA256",
+        "Internal_Resplit_SHA256",
+        "Preprocessing_Parity_SHA256",
+        "Report_SHA256",
+        "Caveat_SHA256",
+        "Performance_Evidence_Scope",
+        "Evidence_Caveat",
+    )
+    assert len(ERALPHA_PRIMARY_TRUSTED_COLUMNS) == len(
+        set(ERALPHA_PRIMARY_TRUSTED_COLUMNS)
+    )
+    assert set(ERALPHA_PRIMARY_TRUSTED_COLUMNS).isdisjoint(
+        ERBA_CLASSIFICATION_METADATA_COLUMNS
+    )
+    assert set(ERALPHA_PRIMARY_TRUSTED_COLUMNS).isdisjoint(
+        set(ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS) - {"CAS"}
+    )
+    assert {
+        "model_sha256",
+        "evidence_caveat",
+        "Model_SHA256",
+        "Protocol_SHA256",
+        "Evidence_Caveat",
+        "Status_Code",
+        "Status_Message",
+        "Reason_Category",
+    } <= set(ERALPHA_PRIMARY_FORBIDDEN_COLUMNS)
+    assert len(NativePackageQa.BASELINE_CHECKS) == 22
+    assert len(NativePackageQa.SHARED_EXAMPLE_BATCH_CHECKS) == 2
+    assert len(NativePackageQa.BATCH_FEEDBACK_CHECKS) == 2
+    assert len(
+        NativePackageQa.BASELINE_CHECKS
+        | NativePackageQa.SHARED_EXAMPLE_BATCH_CHECKS
+        | NativePackageQa.BATCH_FEEDBACK_CHECKS
+    ) == 26
+    assert len(BATCH_RECOGNITION_CRITERIA) == 9
 
 
 def _dialog(kind: str, title: str, message: str) -> dict:

@@ -12,7 +12,10 @@ from openpyxl import load_workbook
 
 from core.contracts import (
     ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID,
+    ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS,
+    ERBA_CLASSIFICATION_METADATA_COLUMNS,
     ERBA_CLASSIFICATION_PREDICTION_COLUMNS,
+    ERBA_CLASSIFICATION_PUBCHEM_COLUMNS,
     ERBAArtifactSpec,
     ERBARoutePreflight,
     ERBAResult,
@@ -36,6 +39,7 @@ from gui.erba_tab import (
     batch_destination_display as erba_batch_destination_display,
     build_primary_predictions,
     canonicalize_batch_input,
+    classification_prediction_row,
     export_erba_batch,
     load_erba_catalog,
     load_shared_example_input,
@@ -1004,6 +1008,46 @@ class ErbaExcelContractTests(unittest.TestCase):
         frame.to_excel(path, index=False)
         return path
 
+    def test_classification_columns_use_numeric_binding_class_and_parse_validity(self):
+        non_binding = classification_prediction_row(
+            ERBAResult(
+                row_index=0,
+                task=ERBATask.CLASSIFICATION,
+                subtype=ERBASubtype.ER_ALPHA,
+                raw_smiles="CCO",
+                model_smiles="CCO",
+                status_code=ERBAStatusCode.OK,
+                status_message="",
+                non_binding_probability=0.7,
+                binding_probability=0.3,
+                binding_label="non_binding",
+            ),
+            "64-17-5",
+        )
+        self.assertEqual(non_binding["Prediction"], 0)
+        self.assertEqual(non_binding["Prediction_label"], "Non-binding")
+        self.assertIs(non_binding["Mol_valid"], True)
+
+        unsupported_but_parseable = classification_prediction_row(
+            ERBAResult(
+                row_index=1,
+                task=ERBATask.CLASSIFICATION,
+                subtype=ERBASubtype.ER_ALPHA,
+                raw_smiles="[Na+]",
+                model_smiles=None,
+                status_code=ERBAStatusCode.NO_CARBON,
+                status_message="no carbon",
+                non_binding_probability=0.8,
+                binding_probability=0.2,
+                binding_label="non_binding",
+            ),
+            "",
+        )
+        self.assertIs(unsupported_but_parseable["Mol_valid"], True)
+        self.assertEqual(unsupported_but_parseable["Probability_Negative_0"], "")
+        self.assertEqual(unsupported_but_parseable["Prediction"], "")
+        self.assertEqual(unsupported_but_parseable["Prediction_label"], "")
+
     def test_canonical_aliases_reject_duplicates_and_preserve_source_fields(self):
         frame = pd.DataFrame([["one", "50-00-0", "CCO", "keep"]], columns=["id", "cas", "smiles", "Note"])
         canonical, passthrough = canonicalize_batch_input(frame)
@@ -1036,7 +1080,12 @@ class ErbaExcelContractTests(unittest.TestCase):
         predictor = _Predictor()
         erba_ad = _BatchAD()
         with tempfile.TemporaryDirectory() as directory, patch(
-            "gui.erba_tab.cas_to_smiles", return_value={"CanonicalSMILES": "CCC"}
+            "gui.erba_tab.cas_to_smiles",
+            return_value={
+                "CanonicalSMILES": "CCC",
+                "PubChem_CID": 123,
+                "PubChem_status": "Found",
+            },
         ) as lookup, patch(
             "gui.erba_tab.save_erba_batch_graphs",
             return_value=((), None),
@@ -1053,7 +1102,15 @@ class ErbaExcelContractTests(unittest.TestCase):
             headers = [cell.value for cell in prediction_sheet[1]]
             probability_cell = prediction_sheet.cell(
                 2,
-                headers.index("binding_probability") + 1,
+                headers.index("Probability_Positive_1") + 1,
+            ).value
+            prediction_cell = prediction_sheet.cell(
+                2,
+                headers.index("Prediction") + 1,
+            ).value
+            mol_valid_cell = prediction_sheet.cell(
+                2,
+                headers.index("Mol_valid") + 1,
             ).value
             distance_cell = prediction_sheet.cell(
                 2,
@@ -1072,6 +1129,12 @@ class ErbaExcelContractTests(unittest.TestCase):
                 dtype=str,
                 keep_default_na=False,
             )
+            diagnostics = pd.read_excel(
+                export_result.destination,
+                sheet_name="Diagnostics",
+                dtype=str,
+                keep_default_na=False,
+            )
             metadata = pd.read_excel(
                 export_result.destination,
                 sheet_name="Metadata",
@@ -1079,9 +1142,15 @@ class ErbaExcelContractTests(unittest.TestCase):
                 keep_default_na=False,
             )
         self.assertEqual(export_result.count, 3)
-        self.assertEqual(sheet_names, ["Predictions", "Guide", "Input", "Metadata"])
+        self.assertEqual(
+            sheet_names,
+            ["Predictions", "Guide", "Diagnostics", "Input", "Metadata"],
+        )
         self.assertEqual(active_sheet, "Predictions")
         self.assertIsInstance(probability_cell, (int, float))
+        self.assertEqual(prediction_cell, 1)
+        self.assertIs(type(prediction_cell), int)
+        self.assertIs(mol_valid_cell, True)
         self.assertIsInstance(distance_cell, (int, float))
         self.assertEqual([call.smiles for call in predictor.calls], ["CCO", "CCC", ""])
         lookup.assert_called_once_with("50-00-0")
@@ -1095,14 +1164,25 @@ class ErbaExcelContractTests(unittest.TestCase):
             predictions.columns.tolist(),
             [
                 "identifier",
-                "cas no.",
-                "SMILES",
                 "Analyst note",
                 *ERBA_CLASSIFICATION_PREDICTION_COLUMNS,
                 *ERBA_BATCH_AD_COLUMNS,
+                *ERBA_CLASSIFICATION_PUBCHEM_COLUMNS,
             ],
         )
-        self.assertEqual(predictions.loc[0, "binding_probability"], "0.8")
+        self.assertEqual(
+            predictions.loc[0, list(ERBA_CLASSIFICATION_PREDICTION_COLUMNS)].to_dict(),
+            {
+                "CAS": "12-34-5",
+                "SMILES": "CCO",
+                "Canonical_SMILES": "CCO",
+                "Mol_valid": "True",
+                "Probability_Negative_0": "0.2",
+                "Probability_Positive_1": "0.8",
+                "Prediction": "1",
+                "Prediction_label": "Binding",
+            },
+        )
         self.assertEqual(
             predictions.loc[0, list(ERBA_BATCH_AD_COLUMNS)].to_dict(),
             {
@@ -1117,13 +1197,32 @@ class ErbaExcelContractTests(unittest.TestCase):
                 "AD_PC2": "-0.25",
             },
         )
-        self.assertEqual(predictions.loc[2, "binding_probability"], "")
-        self.assertEqual(predictions.loc[2, "binding_label"], "")
+        self.assertEqual(predictions.loc[1, "PubChem_CID"], "123")
+        self.assertEqual(predictions.loc[1, "PubChem_status"], "Found")
+        self.assertEqual(predictions.loc[0, "PubChem_CID"], "")
+        self.assertEqual(predictions.loc[0, "PubChem_status"], "")
+        self.assertEqual(predictions.loc[2, "Mol_valid"], "False")
+        self.assertEqual(predictions.loc[2, "Probability_Positive_1"], "")
+        self.assertEqual(predictions.loc[2, "Prediction"], "")
+        self.assertEqual(predictions.loc[2, "Prediction_label"], "")
         self.assertTrue(all(predictions.loc[2, column] == "" for column in ERBA_BATCH_AD_COLUMNS))
-        self.assertEqual(predictions.loc[2, "Result_Status"], "Not predicted")
-        self.assertEqual(predictions.loc[2, "Reason_Category"], "Invalid CAS")
-        self.assertTrue(predictions.loc[2, "Reason_Description"])
-        self.assertTrue(predictions.loc[2, "Recommended_Action"])
+        self.assertEqual(
+            diagnostics.columns.tolist(),
+            list(ERBA_CLASSIFICATION_DIAGNOSTIC_COLUMNS),
+        )
+        self.assertEqual(diagnostics.loc[0, "SMILES_Provenance"], "direct_input")
+        self.assertEqual(diagnostics.loc[1, "SMILES_Provenance"], "pubchem_lookup")
+        self.assertEqual(diagnostics.loc[2, "SMILES_Provenance"], "unavailable")
+        self.assertEqual(diagnostics["row_index"].tolist(), ["0", "1", "2"])
+        self.assertEqual(
+            diagnostics["Row_ID"].tolist(),
+            predictions["identifier"].tolist(),
+        )
+        self.assertEqual(diagnostics.loc[2, "Status_Code"], "prediction_failed")
+        self.assertEqual(diagnostics.loc[2, "Result_Status"], "Not predicted")
+        self.assertEqual(diagnostics.loc[2, "Reason_Category"], "Invalid CAS")
+        self.assertTrue(diagnostics.loc[2, "Reason_Description"])
+        self.assertTrue(diagnostics.loc[2, "Recommended_Action"])
         self.assertEqual(
             erba_ad.calls,
             [
@@ -1150,12 +1249,27 @@ class ErbaExcelContractTests(unittest.TestCase):
         self.assertEqual(metadata.loc[0, "Caveat_SHA256"], "1" * 64)
         self.assertIn("historical", metadata.loc[0, "Evidence_Caveat"].lower())
         self.assertEqual(
+            metadata.columns.tolist(),
+            list(ERBA_CLASSIFICATION_METADATA_COLUMNS),
+        )
+        self.assertEqual(metadata.loc[0, "Workflow"], "erba")
+        self.assertEqual(metadata.loc[0, "Task"], "classification")
+        self.assertEqual(metadata.loc[0, "Subtype"], "er_alpha")
+        self.assertEqual(
+            metadata.loc[0, "Decision_rule"],
+            "binding_probability>=0.5",
+        )
+        self.assertEqual(
+            metadata.loc[0, "Preprocessing_Policy_ID"],
+            "erba_binding_classification_parent_v2",
+        )
+        self.assertEqual(
             metadata.loc[0, "Excel_Contract_ID"],
             ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID,
         )
         self.assertEqual(
             ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID,
-            "erba.binding.classification.excel.v2",
+            "erba.binding.classification.excel.v3",
         )
 
     def test_every_export_sheet_uses_the_same_plain_style_as_erta_pandas_output(self):
@@ -1291,6 +1405,12 @@ class ErbaExcelContractTests(unittest.TestCase):
                 dtype=str,
                 keep_default_na=False,
             )
+            diagnostics = pd.read_excel(
+                export_result.destination,
+                sheet_name="Diagnostics",
+                dtype=str,
+                keep_default_na=False,
+            )
             guide = pd.read_excel(
                 export_result.destination,
                 sheet_name="Guide",
@@ -1298,10 +1418,11 @@ class ErbaExcelContractTests(unittest.TestCase):
                 keep_default_na=False,
             )
         self.assertEqual(export_result.count, 504)
-        self.assertEqual((predictions["Result_Status"] == "Predicted").sum(), 448)
-        self.assertEqual((predictions["Result_Status"] == "Not predicted").sum(), 56)
+        self.assertNotIn("Result_Status", predictions)
+        self.assertEqual((diagnostics["Result_Status"] == "Predicted").sum(), 448)
+        self.assertEqual((diagnostics["Result_Status"] == "Not predicted").sum(), 56)
         self.assertEqual(
-            predictions.loc[predictions["Result_Status"] == "Not predicted", "Reason_Category"]
+            diagnostics.loc[diagnostics["Result_Status"] == "Not predicted", "Reason_Category"]
             .value_counts()
             .to_dict(),
             {
@@ -1311,6 +1432,27 @@ class ErbaExcelContractTests(unittest.TestCase):
                 "Unsupported metal-containing structure": 1,
             },
         )
+        self.assertEqual(predictions.loc[448, "Mol_valid"], "True")
+        self.assertEqual(predictions.loc[466, "Mol_valid"], "True")
+        self.assertEqual(predictions.loc[467, "Mol_valid"], "False")
+        self.assertEqual(predictions.loc[469, "Mol_valid"], "False")
+        self.assertEqual(diagnostics.loc[467, "SMILES_Provenance"], "unavailable")
+        self.assertEqual(
+            diagnostics.loc[469, "SMILES_Provenance"],
+            "pubchem_lookup_failed",
+        )
+        guide_details = guide.set_index("Topic")["Details"].to_dict()
+        self.assertIn("not ERTA transactivation", guide_details["Endpoint semantics"])
+        self.assertIn("0 = Non-binding", guide_details["Prediction"])
+        self.assertIn(
+            "binding_probability>=0.5",
+            guide_details["Decision_rule"],
+        )
+        self.assertIn(
+            "pubchem_lookup_failed",
+            guide_details["SMILES_Provenance"],
+        )
+        self.assertIn("one-to-one", guide_details["Diagnostics"])
         self.assertEqual(progress[0], ("Reading input workbook", 0, 0, 0))
         self.assertEqual(progress[-1], ("Completed", 504, 504, 100))
         self.assertEqual({entry[0] for entry in progress}, {
@@ -1717,7 +1859,12 @@ class ErbaExcelContractTests(unittest.TestCase):
                 "report_sha256": "c" * 64,
             }
         }
-        row = metadata_row(ERBATask.IC50_REGRESSION, self.spec, payload)
+        row = metadata_row(
+            ERBATask.IC50_REGRESSION,
+            ERBASubtype.ER_ALPHA,
+            self.spec,
+            payload,
+        )
         self.assertEqual(row["Performance_Evidence_Scope"], "internal_regression_model")
         self.assertEqual(row["Preprocessing_Parity_SHA256"], "b" * 64)
         self.assertEqual(row["Evidence_Caveat"], "")
@@ -1885,9 +2032,11 @@ class ErbaExcelContractTests(unittest.TestCase):
     def test_primary_predictions_suffix_duplicate_passthrough_headers_and_trust_results(self):
         input_rows = pd.DataFrame(
             [["first", "second", "spoof"]],
-            columns=["Note", "Note", " status_code "],
+            columns=["Note", "Note", " Probability_Positive_1 "],
         )
-        trusted = pd.DataFrame([{"status_code": "ok", "binding_probability": 0.8}])
+        trusted = pd.DataFrame([
+            {"Probability_Positive_1": 0.8, "Prediction_label": "Binding"}
+        ])
         ad_rows = pd.DataFrame(
             [{
                 "AD": "In-domain",
@@ -1902,15 +2051,31 @@ class ErbaExcelContractTests(unittest.TestCase):
             }],
             columns=ERBA_BATCH_AD_COLUMNS,
         )
+        pubchem_rows = pd.DataFrame([
+            {"PubChem_CID": 702, "PubChem_status": "Found"}
+        ])
 
-        primary = build_primary_predictions(input_rows, trusted, ad_rows)
+        primary = build_primary_predictions(
+            input_rows,
+            trusted,
+            ad_rows,
+            pubchem_rows,
+        )
 
         self.assertEqual(
             primary.columns.tolist(),
-            ["Note", "Note_input_2", "status_code", "binding_probability", *ERBA_BATCH_AD_COLUMNS],
+            [
+                "Note",
+                "Note_input_2",
+                "Probability_Positive_1",
+                "Prediction_label",
+                *ERBA_BATCH_AD_COLUMNS,
+                "PubChem_CID",
+                "PubChem_status",
+            ],
         )
         self.assertEqual(len(primary.columns), len(set(primary.columns)))
-        self.assertEqual(primary.iloc[0]["status_code"], "ok")
+        self.assertEqual(primary.iloc[0]["Probability_Positive_1"], 0.8)
         self.assertNotIn("spoof", primary.iloc[0].tolist())
 
     def test_ad_failure_keeps_binding_prediction_and_marks_only_ad_unavailable(self):
@@ -1931,15 +2096,21 @@ class ErbaExcelContractTests(unittest.TestCase):
                 dtype=str,
                 keep_default_na=False,
             )
+            diagnostics = pd.read_excel(
+                export_result.destination,
+                sheet_name="Diagnostics",
+                dtype=str,
+                keep_default_na=False,
+            )
             guide = pd.read_excel(
                 export_result.destination,
                 sheet_name="Guide",
                 dtype=str,
                 keep_default_na=False,
             )
-        self.assertEqual(predictions.loc[0, "Result_Status"], "Predicted")
-        self.assertEqual(predictions.loc[0, "binding_probability"], "0.8")
-        self.assertEqual(predictions.loc[0, "binding_label"], "binding")
+        self.assertEqual(diagnostics.loc[0, "Result_Status"], "Predicted")
+        self.assertEqual(predictions.loc[0, "Probability_Positive_1"], "0.8")
+        self.assertEqual(predictions.loc[0, "Prediction_label"], "Binding")
         self.assertEqual(predictions.loc[0, "AD"], "Unavailable")
         self.assertTrue(all(
             predictions.loc[0, column] == ""
