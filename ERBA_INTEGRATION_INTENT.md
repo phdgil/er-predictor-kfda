@@ -23,7 +23,7 @@ The current code is a Tkinter desktop application for **estrogen receptor transc
 
 ## ERTA invariants
 
-- ERTA remains startup-selected and keeps its Keras model, legacy fingerprint, probability mapping, labels, decision rule, AD, graphs, examples, batch schema, and base filename pattern. The authoritative input-adjacent publication amendment below controls batch destinations and collision suffixes.
+- ERTA remains startup-selected and keeps its Keras model, legacy fingerprint, probability mapping, labels, decision rule, AD, graphs, and batch schema. The authoritative shared-example and publication amendment below controls the distributed example and the `ERTA_` result filename prefix as well as destinations and collision suffixes.
 - Existing model/AD browsing remains ERTA-only.
 - ERTA must not load ERBA joblibs or display direct-binding claims.
 - New ERBA invalid-structure handling must not change historical ERTA behavior.
@@ -86,8 +86,9 @@ A versioned contract shared by adapters, GUI, export, docs, and tests defines ex
 - FDA-facing ERalpha exports classification only.
 - ERalpha uses the same AD algorithm and UI structure as ERTA, but only with its own route-specific training reference and cache.
 - ERalpha workbooks open on the primary `Predictions` worksheet, followed by `Guide`, `Input`, and `Metadata`. `Predictions` starts with collision-safe original input columns in their original order, then trusted binding classification/result/provenance columns, then the nine route-specific AD columns. The untouched source columns remain on `Input`.
+- ERalpha workbook sheets use plain pandas/openpyxl cell formatting without colored headers, result highlighting, wrapped-text decoration, or fitted display widths. For the same cell kind, the primary `Predictions` formatting signature is exactly the one generated for the plain ERTA worksheet. This presentation rule does not alter binding semantics, machine-readable fields, `Guide`, untouched `Input`, or release/provenance `Metadata`.
 - The ERalpha AD columns are, in order, `AD`, `AD_MeanDistance`, `AD_DistanceThreshold`, `AD_Distance_InDomain`, `AD_SimilarityMax`, `AD_SimilarityThreshold`, `AD_Similarity_InDomain`, `AD_PC1`, and `AD_PC2`. Their values and graph artifacts use only the ERalpha route's training reference, cache, and batch results.
-- ERTA and ERalpha batch workbooks are atomically published beside the selected input workbook. They never overwrite the input or an existing result; an available collision-safe filename is allocated instead.
+- ERTA and ERalpha batch workbooks are atomically published beside the selected input workbook. They never overwrite the input or an existing result; an available collision-safe filename is allocated instead. ERTA uses `ERTA_<input-stem>_<model-name>_prediction.xlsx`, then `_2`, `_3`, and so on before the extension.
 - A protected or unwritable input parent is rejected before prediction with clear guidance to copy the input workbook to a writable folder outside the application files and select that copy. Batch publication never silently redirects to another directory.
 
 ## Runtime, GUI, and release boundaries
@@ -124,7 +125,7 @@ This amendment supersedes earlier UI/release scope where it conflicts. The FDA t
 1. **Scope lock:** retain ERTA and ERalpha only. Remove ERbeta from tabs, shortcuts, native QA, released catalog, packaged model/manifest/AD assets, installer, and user documentation. Keep research artifacts outside the FDA distribution.
 2. **Progress:** add a determinate batch progress bar and text for read, CAS/SMILES resolution, preprocessing/prediction, workbook writing, and terminal success/failure. Worker threads communicate progress through Tk `after`; no widget is updated directly from a worker.
 3. **Explain non-predictions:** keep probability/label columns blank and numeric-safe when no prediction exists, and add bilingual-friendly result status, category, description, and recommended action columns.
-4. **Workbook guidance:** make `Predictions` the first and active worksheet, followed by `Guide`, `Input`, and `Metadata`. `Guide` explains all sheets and includes totals and reason counts. Preserve exact machine-readable headers on data sheets. Add filters, frozen headers, widths, wrapped text, and yellow/red outcome highlighting.
+4. **Workbook guidance:** make `Predictions` the first and active worksheet, followed by `Guide`, `Input`, and `Metadata`. `Guide` explains all sheets and includes totals and reason counts. Preserve exact machine-readable headers on data sheets. Use plain pandas/openpyxl cell formatting without colored/fancy outcome highlighting; the later shared-example and presentation amendment is authoritative.
 5. **Compatibility:** preserve ERTA behavior, ERalpha model/preprocessing/AD calculations, input precedence, row order, passthrough identifiers, atomic publication, read-only install boundaries, and the immutable archived legacy ERTA package.
 6. **Validation:** run unit/integration tests, exercise the FDA-provided 504-row workbook, verify progress reaches 100% or a terminal failure, build twice, publish, install to a clean directory, run packaged ERTA/ERalpha QA, uninstall, and re-audit all 10,280 archived legacy ERTA files.
 
@@ -170,6 +171,60 @@ This amendment supersedes the earlier `Guide`-first rule and any earlier stateme
 5. `Binding` and `Non-binding` continue to mean direct ERalpha receptor binding classification only. They do not assert transcriptional activation, agonism, antagonism, signaling, coactivator recruitment, or general endocrine disruption.
 6. The accepted V7 evidence remains an internal resplit/sensitivity evaluation using historically exposed development data. It is not fresh independent, external, temporal, population, regulatory, or regulatory-use validation.
 
+## Authoritative shared example, plain workbook, filename, and dialog amendment
+
+This amendment supersedes every earlier reference to
+`templates\ERTA_KRICT_example.xlsx` as the UI default, every requirement for
+colored/fancy ERalpha workbook styling, and every ERTA result filename pattern
+without the `ERTA_` prefix. It changes distribution, presentation, naming, and
+batch feedback only. Released models, decision rules, AD calculations, direct
+binding meaning, evidence limitations, and provenance sheets remain unchanged.
+
+1. The exact user-supplied
+   `D:\research\FDA_endocrine_disruption\ER_Predictor\test.xlsx` (25 rows) is
+   bundled as `templates/test.xlsx` without changing its bytes. Its only header
+   is the historical `CARSRN` spelling, which both ERTA and ERalpha batch
+   adapters recognize as a CAS alias. Neither packaging nor QA may mutate the
+   supplied source workbook. Its SHA-256 is
+   `5a1f569f8f6a5cd47bff67a189645c3f9461fcf07bd24f4e5b4f83197f3350aa`.
+2. Both endpoints receive the same `Path` from
+   `core.paths.resolve_shared_example_input(example_path=None)`. A frozen one-folder
+   layout `<container>/ER_Predictor/ER_Predictor.exe` uses
+   `<container>/test.xlsx`. Other runs atomically initialize
+   `%USERPROFILE%/Documents/ER_Predictor/Examples/test.xlsx` from the bundled
+   bytes. Existing user or published copies are preserved; deleting that copy
+   is the explicit reset operation. Missing/unreadable bundled bytes or a
+   non-writable destination fails clearly instead of falling back.
+3. Single-input defaults and **Example input** use the first shared CAS and an
+   empty SMILES when the source provides no SMILES. CAS lookup is therefore
+   required before a CAS-only single prediction. Batch QA copies the workbook
+   into QA-owned writable directories and never publishes beside or writes to
+   the distributed/source copy. Unattended native QA replaces PubChem responses
+   for the listed 25 CAS values with the same valid `C=O` SMILES solely for
+   deterministic callback/model/export coverage, records that substitution in
+   its automation transcript, and does not present it as chemical-identity or
+   online-service evidence. The unmodified 25-CAS online run remains a separate
+   packaged-app verification.
+4. `gui.main_window.allocate_erta_output_path(input_path, model_name)` reserves
+   ERTA batch results as
+   `ERTA_<input-stem>_<model-name>_prediction.xlsx` with collision suffixes
+   before `.xlsx`. ERalpha keeps its collision-safe ERBA filename and its
+   `Predictions`, `Guide`, untouched `Input`, and provenance `Metadata` sheets.
+5. ERalpha removes colored/fancy workbook decoration.
+   `core.native_qa.compare_plain_primary_workbook_formatting(erta_workbook,
+   eralpha_workbook)` verifies that its primary `Predictions` cells have the
+   exact same openpyxl formatting signature as ERTA cells of the same kind;
+   values and endpoint-specific column semantics are not compared to establish
+   formatting parity.
+6. A fully successful batch on either endpoint shows
+   `messagebox.showinfo("Batch prediction done", ...)`. A start, read,
+   prediction, or publication failure shows
+   `messagebox.showerror("Batch prediction failed", ...)`, restores all batch
+   controls, leaves terminal failure text/progress, and emits no success
+   dialog. An ERalpha workbook published with row-level not-predicted results
+   shows `messagebox.showwarning("Batch prediction completed with warnings",
+   ...)` rather than false success.
+
 ## FDA usability amendment: exact ERTA/ERalpha interaction parity
 
 This amendment replaces approximate visual similarity with a shared widget and
@@ -181,9 +236,11 @@ browsing remains ERTA-only; ERalpha browsing is restricted as specified below.
    fixed-size probability/result areas, batch progress row, result box, and
    status-row placement. A stable `parity_widgets` map names the corresponding
    controls for native bounding-box comparison.
-2. Both single pages initialize and reset from the exact first `CAS` and
-   `SMILES` row in `templates\ERTA_KRICT_example.xlsx`. Both batch pages
-   initialize to that same workbook; endpoint state remains independent after
+2. Both single pages initialize and reset from the first CAS value in the shared
+   `test.xlsx`. The distributed source has the exact original `CARSRN` header
+   and 25 CAS rows but no SMILES column, so the initial/reset SMILES may be
+   blank until PubChem lookup. Both batch pages initialize to the exact same
+   writable shared workbook; endpoint state remains independent after
    initialization.
 3. Both `Options` boxes expose, in order, `Model`, `Browse`, `Reload model`,
    `AD reference`, `Browse`, and `Reload AD`. ERalpha model browsing accepts

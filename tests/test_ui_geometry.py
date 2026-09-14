@@ -9,7 +9,7 @@ from core.native_qa import (
     inspect_endpoint_geometry_parity,
     inspect_shared_example_parity,
 )
-from gui.erba_tab import ErbaTab
+from gui.erba_tab import ErbaTab, SharedExampleInput
 from gui.main_window import MainWindow
 
 
@@ -21,13 +21,36 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def real_tk_window(tmp_path):
+def real_tk_window(tmp_path, monkeypatch):
     output_root = tmp_path / "output"
     state_root = tmp_path / "state"
+    user_profile = tmp_path / "user-profile"
     output_root.mkdir()
     state_root.mkdir()
+    user_profile.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(user_profile))
+    example_directory = tmp_path / "shared-example"
+    example_directory.mkdir()
+    example_workbook = example_directory / "test.xlsx"
+    example_workbook.write_bytes(
+        (PROJECT_ROOT / "templates" / "test.xlsx").read_bytes()
+    )
+    shared_example = SharedExampleInput(
+        workbook=example_workbook,
+        cas="6422-86-2",
+        smiles="",
+    )
     try:
-        with patch.object(MainWindow, "load_defaults_on_startup"), patch.object(
+        with patch(
+            "gui.main_window.load_shared_example_input",
+            return_value=shared_example,
+        ), patch(
+            "gui.erba_tab.load_shared_example_input",
+            return_value=shared_example,
+        ), patch.object(
+            MainWindow,
+            "load_defaults_on_startup",
+        ), patch.object(
             ErbaTab,
             "load_defaults_on_startup",
         ):
@@ -138,13 +161,38 @@ def test_real_endpoint_controls_have_exact_geometry_in_every_surface_state(
 
 def test_real_example_buttons_restore_identical_preset_and_batch_workbook(
     real_tk_window,
+    tmp_path,
 ):
     window = real_tk_window
 
-    receipt = inspect_shared_example_parity(window)
+    receipt = inspect_shared_example_parity(
+        window,
+        tmp_path / "fresh-shared-example-profile",
+    )
 
     assert receipt["path_equal"] is True
     assert receipt["content_equal"] is True
+    assert receipt["default_writable"] is True
+    assert receipt["default_matches_bundled"] is True
+    assert receipt["fresh_copy_writable"] is True
+    assert receipt["fresh_copy_matches_bundled"] is True
+    assert Path(receipt["fresh_copy"]) == (
+        tmp_path
+        / "fresh-shared-example-profile"
+        / "Documents"
+        / "ER_Predictor"
+        / "Examples"
+        / "test.xlsx"
+    ).resolve()
+    assert Path(receipt["fresh_copy"]).is_file()
+    assert Path(receipt["workbook"]).name == "test.xlsx"
+    assert Path(receipt["bundled_workbook"]).name == "test.xlsx"
+    assert receipt["bundled_headers"] == ["CARSRN"]
+    assert receipt["cas_header"] == "CARSRN"
+    assert receipt["smiles_header"] is None
+    assert receipt["bundled_row_count"] == 25
+    assert receipt["workbook_row_count"] == 25
+    assert receipt["smiles"] == ""
     assert receipt["cas"] == window.example_cas == window.eralpha_tab.example_cas
     assert (
         receipt["smiles"]
@@ -160,13 +208,33 @@ def test_real_example_buttons_restore_identical_preset_and_batch_workbook(
         == window.batch_input_display_var.get()
         == window.eralpha_tab.batch_input_display_var.get()
     )
+    assert (
+        receipt["batch_destination"]
+        == str(Path(receipt["workbook"]).parent)
+        == window.batch_destination_var.get()
+        == window.eralpha_tab.batch_destination_var.get()
+    )
     assert receipt["workbook_size_bytes"] > 0
     assert len(receipt["workbook_sha256"]) == 64
+    assert receipt["bundled_sha256"] == (
+        "5a1f569f8f6a5cd47bff67a189645c3f9461fcf07bd24f4e5b4f83197f3350aa"
+    )
+    assert receipt["fresh_copy_sha256"] == receipt["bundled_sha256"]
+    assert receipt["fresh_copy_size_bytes"] == receipt["bundled_size_bytes"]
     assert [row["endpoint"] for row in receipt["callbacks"]] == [
         "erta",
         "eralpha",
     ]
     assert all(row["other_endpoint_unchanged"] for row in receipt["callbacks"])
+    assert all(
+        row["restored_batch"]
+        == [
+            receipt["workbook"],
+            "test.xlsx",
+            str(Path(receipt["workbook"]).parent),
+        ]
+        for row in receipt["callbacks"]
+    )
     assert (window.cas_var.get(), window.smiles_var.get()) == (
         receipt["cas"],
         receipt["smiles"],

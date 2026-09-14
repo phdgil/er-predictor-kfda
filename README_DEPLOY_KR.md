@@ -49,6 +49,7 @@ installer\ER_Predictor_Setup_x64.exe
 - `Binding`과 `Non-binding`은 직접 ERα 수용체 결합 분류만 뜻합니다. 전사 활성, 작용제/길항제 활성, 신호 전달, 공동활성인자 모집 또는 일반 내분비계 장애를 뜻하지 않습니다.
 - ERalpha AD는 ERTA와 같은 계산 코드를 사용하지만 ERα 전용 학습 참조와 캐시만 사용합니다.
 - ERalpha batch 결과 workbook은 `Predictions`, `Guide`, `Input`, `Metadata` 순서이며, 열 때 `Predictions`가 첫 시트이자 활성 시트입니다. `Guide`, 변경하지 않은 원본 `Input`, 추적용 `Metadata`도 그대로 유지됩니다.
+- ERalpha workbook의 모든 시트는 색 채우기, 결과별 강조, 임의 열 너비 같은 장식 서식을 추가하지 않습니다. 특히 기본 `Predictions` 데이터 셀 서식은 ERTA가 pandas/openpyxl로 생성하는 평문 worksheet와 동일합니다. 이 서식 단순화는 결과 열, 결합 의미, `Guide`, 원본 `Input`, 모델·근거 provenance가 있는 `Metadata`를 제거하거나 변경하지 않습니다.
 - `Predictions`에는 원본 입력 열이 원래 순서대로 먼저 나오고, `non_binding_probability`, `binding_probability`, `binding_label`을 포함한 신뢰된 결합 분류 결과/상태/모델 추적 열과 ERalpha 전용 AD 열 9개가 이어집니다. 이름을 정규화했을 때 입력 열과 결과 열이 충돌하면 신뢰된 결과 열을 사용하며, 원본 값과 머리글은 `Input` 시트에서 확인할 수 있습니다.
 - ERalpha AD 열은 `AD`, `AD_MeanDistance`, `AD_DistanceThreshold`, `AD_Distance_InDomain`, `AD_SimilarityMax`, `AD_SimilarityThreshold`, `AD_Similarity_InDomain`, `AD_PC1`, `AD_PC2`입니다. 모두 ERalpha 경로의 학습 참조와 캐시로 계산하며 ERTA AD 데이터를 섞지 않습니다.
 - `Guide`는 각 시트, 빈 예측값, 제외 사유와 권장 조치를 설명합니다. `Predictions`의 확률/라벨이 빈 행은 `Result_Status`, `Reason_Category`, `Reason_Description`, `Recommended_Action`을 확인하십시오.
@@ -60,20 +61,46 @@ installer\ER_Predictor_Setup_x64.exe
 
 - 모든 지원 경로에서 직접 SMILES 입력은 오프라인으로 동작합니다.
 - CAS 조회만 인터넷이 필요합니다. 조회 실패가 이미 유효한 SMILES를 덮어쓰지 않습니다.
-- ERTA와 ERalpha의 단일 입력은 모두
-  `templates\ERTA_KRICT_example.xlsx` 첫 행의 정확한 `CAS`와 `SMILES`로
-  초기화됩니다. 각 탭의 **Example input**은 변경된 두 필드를 그 값으로
-  독립적으로 되돌립니다.
-- 두 batch 페이지도 같은 `templates\ERTA_KRICT_example.xlsx`를 초기 예제로
-  표시합니다. 이 bundled workbook 자체의 폴더에는 결과를 쓸 수 없습니다.
-  **Download template** 저장 대화상자에서 응용 프로그램 폴더 밖의 쓰기
-  가능한 사용자 폴더를 명시적으로 선택하고, 저장된 workbook을 편집한 뒤
-  실행하십시오. 보호된 경로를 다른 위치로 자동 전환하지 않습니다.
+- 배포 원본 예제는 bundled `templates\test.xlsx`입니다. 배포된 one-folder
+  실행 파일이 `<container>\ER_Predictor\ER_Predictor.exe`이면 두 탭은
+  `<container>\test.xlsx`를 함께 사용합니다. 그 외 환경에서는 최초 실행 때
+  bundled 원본을
+  `%USERPROFILE%\Documents\ER_Predictor\Examples\test.xlsx`로 원자적으로
+  복사하여 두 탭이 같은 쓰기 가능한 파일을 사용합니다. 기존 사용자/게시
+  `test.xlsx`는 덮어쓰거나 초기화하지 않습니다. 사용자가 해당 복사본을
+  삭제한 뒤 다시 실행하는 것이 bundled 원본으로 되돌리는 명시적 방법입니다.
+- 배포 `test.xlsx`는 원본 25개 CAS 행과 `CARSRN` 머리글의 바이트를 그대로
+  보존합니다(SHA-256
+  `5a1f569f8f6a5cd47bff67a189645c3f9461fcf07bd24f4e5b4f83197f3350aa`).
+  `CARSRN`은 두 batch 경로에서 `CAS` 별칭으로 인식됩니다.
+  단일 입력은 첫 행의 CAS로 초기화되며 workbook에 SMILES 열이 없으므로
+  SMILES는 비어 있을 수 있습니다. 각 탭의 **Example input**은 이 CAS/빈
+  SMILES 상태를 서로 독립적으로 복원하며, 예측 전 CAS 조회에는 인터넷이
+  필요합니다.
+- 기본 `test.xlsx`는 결과를 바로 옆에 쓸 수 있는 사용자 파일입니다. 반복
+  실행이나 원본 보존이 필요하면 별도의 쓰기 가능한 폴더에 복사해 선택하십시오.
+  **Download template**도 응용 프로그램 폴더 밖의 쓰기 가능한 사용자
+  폴더만 허용하며 보호된 경로를 다른 위치로 자동 전환하지 않습니다.
 - 결합 예시는 `templates\ERTA_ERBA_example.xlsx`입니다. 첫 시트 **ERBA_Input**은 ERBA 입력용이며 정확히 `Row_ID`, `CAS`, `SMILES` 열을 사용합니다. 두 번째 **ERTA_Input**은 `CID`, `CAS`, `SMILES`, `label` 열을 보여 줍니다. ERTA batch에 넣을 때는 이 시트를 별도 workbook으로 내보내십시오.
 
 - ERTA와 ERalpha batch 페이지에는 별도의 출력 폴더 선택기가 없습니다. 입력 workbook을 선택하면 읽기 전용 **Result folder (same as input)** 항목에 입력 파일의 폴더가 표시되고, 결과 workbook은 항상 그 폴더에 원자적으로 게시됩니다. ERTA batch 그래프는 같은 위치의 `graphs` 하위 폴더에 저장됩니다.
+- ERTA 결과 이름은 `ERTA_<입력파일 stem>_<모델명>_prediction.xlsx`로
+  시작합니다. 같은 이름이 있으면 확장자 앞에 `_2`, `_3`을 붙입니다.
 - ERalpha batch AD 그래프는 ERalpha 경로의 AD 데이터와 Binding/Non-binding 의미만 사용하고, 결과 workbook 옆의 충돌 방지 폴더 `<workbook-stem>_graphs`에 저장됩니다. 같은 이름이 이미 있으면 `_2`, `_3` 접미사를 사용하여 이전 그래프 폴더를 덮어쓰지 않습니다.
 - ERalpha batch 완료 요약은 ERTA와 같은 `Prediction result` 영역에 표시되며 전체 행, Binding, Non-binding, 예측하지 못한 행, AD In-domain/Out-of-domain 수, 정확한 workbook 경로, 그래프 수/폴더 및 내부 평가 근거의 한계를 포함합니다.
+- 모든 행을 정상 예측하고 게시하면 두 endpoint 모두
+  `Batch prediction done` 정보 팝업을 표시합니다. 시작 전 거부나
+  읽기/예측/게시 실패는 `Batch prediction failed` 오류 팝업을 표시하고
+  입력·template·실행 컨트롤을 다시 활성화하며 성공 팝업을 표시하지
+  않습니다. ERalpha가 workbook을 게시했지만 일부 행을 예측하지 못했으면
+  성공으로 가장하지 않고 `Batch prediction completed with warnings` 경고
+  팝업을 표시합니다.
+- 무인 native QA는 원본/기본 파일 옆에 결과를 쓰지 않고 QA 전용 폴더의
+  바이트 동일 복사본 두 개를 사용합니다. 네트워크 변동을 제거하기 위해
+  25개 CAS의 PubChem 응답을 동일한 유효 SMILES `C=O`로 대체하며 이
+  substitution과 전체 CAS 목록을 automation transcript에 기록합니다. 이는
+  실제 물질 조회 결과 검증이 아닙니다. 실제 25개 CAS의 온라인 동작은 이
+  native QA 자동화 모드 없이 배포 앱에서 별도로 실행하여 확인합니다.
 - 입력 파일의 상위 폴더가 보호되어 있거나 쓰기 불가능하면 예측을 시작하지 않고, 입력 workbook을 응용 프로그램 설치 폴더 밖의 쓰기 가능한 폴더로 복사한 뒤 다시 선택하라는 안내와 함께 실패합니다. 다른 위치로 자동 전환하지 않습니다.
 - 입력 workbook과 이전 batch 결과 workbook은 절대 덮어쓰지 않습니다. 같은 결과 이름이 이미 있으면 `_2`, `_3`처럼 충돌하지 않는 이름을 사용합니다.
 

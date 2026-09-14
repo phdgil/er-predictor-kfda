@@ -1,6 +1,7 @@
 """Static contracts for the isolated, reproducible ER_Predictor package."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -184,6 +185,49 @@ def test_combined_template_preserves_separate_erta_and_erba_input_sheets():
     assert first_sheet < second_sheet
     for header in ("Row_ID", "CAS", "SMILES", "CID", "label"):
         assert header in worksheet_text
+
+
+def test_shared_example_template_is_the_exact_supplied_batch_workbook():
+    from openpyxl import load_workbook
+
+    template = PROJECT_ROOT / "templates" / "test.xlsx"
+    contents = template.read_bytes()
+    assert len(contents) == 9867
+    assert (
+        hashlib.sha256(contents).hexdigest()
+        == "5a1f569f8f6a5cd47bff67a189645c3f9461fcf07bd24f4e5b4f83197f3350aa"
+    )
+
+    workbook = load_workbook(template, read_only=True, data_only=False)
+    try:
+        assert workbook.sheetnames == ["Sheet1"]
+        worksheet = workbook["Sheet1"]
+        assert worksheet.max_row == 26
+        assert worksheet.max_column == 1
+        assert worksheet["A1"].value == "CARSRN"
+        assert worksheet["A2"].value == "6422-86-2"
+    finally:
+        workbook.close()
+
+
+def test_spec_integrity_checks_and_bundles_the_shared_example_template():
+    spec = (PROJECT_ROOT / "app.spec").read_text(encoding="utf-8")
+    assert 'SHARED_EXAMPLE_TEMPLATE = TEMPLATES_ROOT / "test.xlsx"' in spec
+    assert (
+        'SHARED_EXAMPLE_TEMPLATE_SHA256 = '
+        '"5a1f569f8f6a5cd47bff67a189645c3f9461fcf07bd24f4e5b4f83197f3350aa"'
+    ) in spec
+    assert "sha256(SHARED_EXAMPLE_TEMPLATE) != SHARED_EXAMPLE_TEMPLATE_SHA256" in spec
+    assert '(str(TEMPLATES_ROOT), "templates")' in spec
+
+
+def test_shared_example_resolution_has_no_developer_absolute_input_path():
+    source = (PROJECT_ROOT / "core" / "paths.py").read_text(encoding="utf-8")
+    assert "D:/research/" not in source.replace("\\", "/")
+    assert "executable.parent == paths.install_root" in source
+    assert "app_container = paths.install_root.parent" in source
+    assert 'documents / PRODUCT / "Examples" / SHARED_EXAMPLE_FILENAME' in source
+
 
 def test_external_runner_rejects_stale_receipt_and_binds_nonce_and_pid(tmp_path):
     from qa.external_qa_runner import wait_for_receipt

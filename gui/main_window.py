@@ -25,6 +25,7 @@ from gui.erba_tab import (
     ErbaTab,
     batch_destination_display,
     load_shared_example_input,
+    validate_cas,
 )
 
 try:
@@ -37,7 +38,7 @@ except Exception:
 def allocate_erta_output_path(input_path: str | Path, model_name: str) -> Path:
     """Reserve a collision-safe ERTA result path beside the input workbook."""
     source = Path(input_path).expanduser().resolve(strict=False)
-    stem = f"{source.stem}_{model_name}_prediction"
+    stem = f"ERTA_{source.stem}_{model_name}_prediction"
     for index in range(1, 10000):
         suffix = "" if index == 1 else f"_{index}"
         candidate = source.parent / f"{stem}{suffix}.xlsx"
@@ -89,20 +90,26 @@ class MainWindow(tk.Tk):
         self.example_cas = example.cas
         self.example_smiles = example.smiles
         self.example_workbook = example.workbook
+        self.example_error = example.error
         self.model_path_var = tk.StringVar(value=self.default_model_path())
         self.ad_ref_path_var = tk.StringVar(value=self.default_ad_reference_path())
         self.loaded_model_path_var = tk.StringVar()
         self.loaded_ad_ref_path_var = tk.StringVar()
         self.cas_var = tk.StringVar(value=self.example_cas)
         self.smiles_var = tk.StringVar(value=self.example_smiles)
-        self.status_var = tk.StringVar(value="Starting...")
+        self.status_var = tk.StringVar(value=self.example_error or "Starting...")
         self.prediction_summary_var = tk.StringVar(value="Prediction: -")
         self.active_probability_var = tk.StringVar(value="Probability Positive: -")
         self.inactive_probability_var = tk.StringVar(value="Probability Negative: -")
         self.ad_domain_var = tk.StringVar(value="Applicability domain: Not evaluated")
         self.nearest_reference_var = tk.StringVar(value="Nearest training reference: -")
-        self.batch_input_var = tk.StringVar(value=str(self.example_workbook))
-        default_batch_name = os.path.basename(self.batch_input_var.get()) if os.path.exists(self.batch_input_var.get()) else "No input template selected"
+        example_path = str(self.example_workbook) if self.example_workbook else ""
+        self.batch_input_var = tk.StringVar(value=example_path)
+        default_batch_name = (
+            self.example_workbook.name
+            if self.example_workbook is not None
+            else "Example input unavailable — choose Input xlsx"
+        )
         self.batch_input_display_var = tk.StringVar(value=default_batch_name)
         self.batch_destination_var = tk.StringVar(
             value=batch_destination_display(self.batch_input_var.get())
@@ -113,6 +120,8 @@ class MainWindow(tk.Tk):
         self._active_batch_total = 0
 
         self._build_ui()
+        if self.example_error:
+            self.example_button.configure(text="Example unavailable")
         self.bind_all("<Alt-e>", lambda _event: self.notebook.select(self.erta_tab))
         self.bind_all("<Alt-a>", lambda _event: self.notebook.select(self.eralpha_tab))
         self.bind_all("<Control-Key-1>", lambda _event: self.notebook.select(self.erta_tab))
@@ -427,7 +436,13 @@ class MainWindow(tk.Tk):
             state="disabled",
         )
         self.batch_result.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        self._set_erta_batch_result("Run a batch to show the completion summary.")
+        initial_result = (
+            f"Example input unavailable.\n\n{self.example_error}\n\n"
+            "Choose Input xlsx to select a workbook manually."
+            if self.example_error
+            else "Run a batch to show the completion summary."
+        )
+        self._set_erta_batch_result(initial_result)
 
     # ---------- UI helpers ----------
     def _register_parity_widgets(self):
@@ -463,8 +478,18 @@ class MainWindow(tk.Tk):
         }
 
     def load_example_input(self):
+        if self.example_workbook is None:
+            self.set_status(
+                f"{self.example_error} Choose Input xlsx to select a workbook manually."
+            )
+            return
         self.cas_var.set(self.example_cas)
         self.smiles_var.set(self.example_smiles)
+        self.batch_input_var.set(str(self.example_workbook))
+        self.batch_input_display_var.set(self.example_workbook.name)
+        self.batch_destination_var.set(
+            batch_destination_display(self.example_workbook)
+        )
         self.set_status(
             f"Example input restored from {self.example_workbook.name}."
         )
@@ -761,9 +786,14 @@ class MainWindow(tk.Tk):
         df = df.copy()
         df.columns = [str(col).strip() for col in df.columns]
 
-        cas_col = self._find_column(df, ["CAS", "CAS No", "CAS No.", "CAS RN", "CASRN", "CAS Number", "CAS_Number"])
+        cas_col = self._find_column(df, ["CAS", "CARSRN", "CAS No", "CAS No.", "CAS RN", "CASRN", "CAS Number", "CAS_Number"])
         smiles_col = self._find_column(df, ["SMILES", "Canonical_SMILES", "Canonical SMILES", "Isomeric_SMILES", "Isomeric SMILES"])
 
+        if cas_col is None and smiles_col is None:
+            raise ValueError(
+                "Input workbook must contain a recognized CAS column "
+                "(CAS, CARSRN, CASRN, or CAS Number) or a recognized SMILES column."
+            )
         if smiles_col is None:
             df["SMILES"] = ""
             smiles_col = "SMILES"
@@ -790,6 +820,12 @@ class MainWindow(tk.Tk):
                 continue
 
             cas_text = str(cas).strip()
+            if not validate_cas(cas_text):
+                df.at[idx, "PubChem_status"] = (
+                    "Not found: CAS is invalid; expected a valid CAS Registry "
+                    "Number check digit."
+                )
+                continue
             try:
                 self.set_status(f"Fetching SMILES from PubChem: {idx + 1} / {total} ({cas_text})")
                 res = cas_to_smiles(cas_text)

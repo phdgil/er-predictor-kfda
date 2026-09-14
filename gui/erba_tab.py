@@ -22,7 +22,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from openpyxl.styles import Alignment, Font, PatternFill
 
 from core.contracts import (
     ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID,
@@ -60,7 +59,7 @@ from core.erba_release_allowlist import TRUSTED_ERBA_ARTIFACTS
 from core.graph import save_ad_decision_plot, save_ad_plot, save_single_ad_plot
 from core.molecule_image import save_molecule_image
 from core.pubchem import cas_to_smiles
-from core.paths import validate_mutable_directory
+from core.paths import resolve_shared_example_input, validate_mutable_directory
 
 try:
     from PIL import Image, ImageTk
@@ -82,13 +81,18 @@ ERBA_BATCH_AD_COLUMNS = (
     "AD_PC1",
     "AD_PC2",
 )
+_BATCH_INPUT_HEADER_ALIASES = {
+    **ERBA_INPUT_HEADER_ALIASES,
+    "CAS": (*ERBA_INPUT_HEADER_ALIASES["CAS"], "carsrn"),
+}
 
 
 @dataclass(frozen=True)
 class SharedExampleInput:
-    workbook: Path
+    workbook: Path | None
     cas: str
     smiles: str
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -151,11 +155,13 @@ class ERBAReleasedCatalog(dict):
 
 
 def load_shared_example_input(project_root: str | Path) -> SharedExampleInput:
-    """Read the existing ERTA example used to initialize both endpoint tabs."""
-    workbook = Path(project_root) / "templates" / "ERTA_KRICT_example.xlsx"
-    if not workbook.is_file():
-        return SharedExampleInput(workbook, "", "")
+    """Resolve the shared test workbook and retain a valid first-row single input."""
     try:
+        source_root = Path(project_root).expanduser().resolve(strict=False)
+        local_example = source_root.parent / "ER_Predictor" / "test.xlsx"
+        workbook = resolve_shared_example_input(
+            local_example if local_example.is_file() else None
+        )
         frame = pd.read_excel(
             workbook,
             sheet_name=0,
@@ -163,22 +169,56 @@ def load_shared_example_input(project_root: str | Path) -> SharedExampleInput:
             dtype=str,
             keep_default_na=False,
         )
-    except Exception:
-        return SharedExampleInput(workbook, "", "")
+    except Exception as error:
+        return SharedExampleInput(
+            None,
+            "",
+            "",
+            f"Shared example input is unavailable: {error}",
+        )
     if frame.empty:
-        return SharedExampleInput(workbook, "", "")
+        return SharedExampleInput(
+            None,
+            "",
+            "",
+            f"Shared example input is unavailable: {workbook} has no data rows.",
+        )
     columns = {
         re.sub(r"\s+", " ", str(column).strip()).casefold(): column
         for column in frame.columns
     }
-    cas_column = columns.get("cas")
-    smiles_column = columns.get("smiles")
+    cas_column = next(
+        (
+            columns[alias]
+            for alias in _BATCH_INPUT_HEADER_ALIASES["CAS"]
+            if alias in columns
+        ),
+        None,
+    )
+    smiles_column = next(
+        (
+            columns[alias]
+            for alias in _BATCH_INPUT_HEADER_ALIASES["SMILES"]
+            if alias in columns
+        ),
+        None,
+    )
     cas = str(frame.iloc[0][cas_column]).strip() if cas_column is not None else ""
+    if cas and not validate_cas(cas):
+        cas = ""
     smiles = (
         str(frame.iloc[0][smiles_column]).strip()
         if smiles_column is not None
         else ""
     )
+    if not cas and not smiles:
+        return SharedExampleInput(
+            None,
+            "",
+            "",
+            "Shared example input is unavailable: "
+            f"the first row of {workbook} has no valid CAS or SMILES value.",
+        )
     return SharedExampleInput(workbook, cas, smiles)
 
 
@@ -265,12 +305,12 @@ def read_batch_input(path: str | Path) -> pd.DataFrame:
 
 
 def canonicalize_batch_input(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return canonical request fields and untouched source rows, rejecting ambiguity."""
+    """Canonicalize documented input aliases, including the supplied CARSRN header."""
     normalized = {}
     for header in frame.columns:
         normalized.setdefault(str(header).strip().lower(), []).append(header)
     canonical = {}
-    for target, aliases in ERBA_INPUT_HEADER_ALIASES.items():
+    for target, aliases in _BATCH_INPUT_HEADER_ALIASES.items():
         matches = [header for alias in aliases for header in normalized.get(alias, [])]
         if len(matches) > 1:
             raise ValueError(f"Duplicate canonical {target} headers are not allowed.")
@@ -592,15 +632,13 @@ def _progress(callback, stage: str, current: int, total: int, percent: int) -> N
 def _format_workbook(
     writer,
     predictions: pd.DataFrame,
-    input_rows: pd.DataFrame,
-    metadata: pd.DataFrame,
     task: ERBATask,
     graph_paths: tuple[Path, ...],
     graph_directory: Path | None,
     graph_error: str,
     ad_error: str,
 ) -> None:
-    """Apply readable presentation without changing data-sheet headers or values."""
+    """Write supporting content while retaining ERTA's plain pandas workbook style."""
     classification = task is ERBATask.CLASSIFICATION
     guide_rows = [
         (
@@ -690,46 +728,6 @@ def _format_workbook(
         writer, sheet_name=ERBA_GUIDE_SHEET_NAME, index=False
     )
 
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    warning_fill = PatternFill("solid", fgColor="FFF2CC")
-    fatal_fill = PatternFill("solid", fgColor="F4CCCC")
-    for sheet_name, frame in (
-        (ERBA_PREDICTIONS_SHEET_NAME, predictions),
-        (ERBA_GUIDE_SHEET_NAME, pd.DataFrame(guide_rows)),
-        (ERBA_INPUT_SHEET_NAME, input_rows),
-        (ERBA_METADATA_SHEET_NAME, metadata),
-    ):
-        sheet = writer.book[sheet_name]
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-        for cell in sheet[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-        for column_cells in sheet.columns:
-            letter = column_cells[0].column_letter
-            width = max(len(str(cell.value or "")) for cell in column_cells)
-            sheet.column_dimensions[letter].width = min(max(width + 2, 12), 48)
-            for cell in column_cells[1:]:
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
-        if sheet_name == ERBA_PREDICTIONS_SHEET_NAME:
-            status_column = predictions.columns.get_loc("Result_Status") + 1
-            technical_column = predictions.columns.get_loc("status_code") + 1
-            reason_column = predictions.columns.get_loc("Reason_Category") + 1
-            for row in range(2, sheet.max_row + 1):
-                status = sheet.cell(row, status_column).value
-                technical = sheet.cell(row, technical_column).value
-                reason = sheet.cell(row, reason_column).value
-                fill = (
-                    fatal_fill
-                    if technical in {code.value for code in ERBA_FATAL_ARTIFACT_STATUS_CODES}
-                    or reason == "System or model failure"
-                    else warning_fill
-                )
-                if status != "Predicted":
-                    for cell in sheet[row]:
-                        cell.fill = fill
     writer.book._sheets = [
         writer.book[ERBA_PREDICTIONS_SHEET_NAME],
         writer.book[ERBA_GUIDE_SHEET_NAME],
@@ -911,8 +909,6 @@ def export_erba_batch(
             _format_workbook(
                 writer,
                 predictions,
-                input_rows,
-                metadata,
                 task,
                 graph_paths,
                 graph_directory,
@@ -994,6 +990,7 @@ class ErbaTab(ttk.Frame):
         self.example_cas = example.cas
         self.example_smiles = example.smiles
         self.example_workbook = example.workbook
+        self.example_error = example.error
         self.smiles_var = tk.StringVar(value=self.example_smiles)
         self.cas_var = tk.StringVar(value=self.example_cas)
         model_path = (
@@ -1014,7 +1011,9 @@ class ErbaTab(ttk.Frame):
         )
         self.loaded_model_path_var = tk.StringVar()
         self.loaded_ad_ref_path_var = tk.StringVar()
-        self.single_status_var = tk.StringVar(value=self.catalog_error or "Ready")
+        self.single_status_var = tk.StringVar(
+            value=self.catalog_error or self.example_error or "Ready"
+        )
         self.single_prediction_summary_var = tk.StringVar(value="Prediction: -")
         self.single_negative_probability_var = tk.StringVar(value="Non-binding probability: -")
         self.single_positive_probability_var = tk.StringVar(value="Binding probability: -")
@@ -1024,17 +1023,20 @@ class ErbaTab(ttk.Frame):
             value="Applicability domain: Not evaluated"
         )
         self.single_detail_var = tk.StringVar(value="Awaiting prediction.")
-        self.batch_input_var = tk.StringVar(value=str(self.example_workbook))
+        example_path = str(self.example_workbook) if self.example_workbook else ""
+        self.batch_input_var = tk.StringVar(value=example_path)
         default_batch_name = (
             self.example_workbook.name
-            if self.example_workbook.is_file()
-            else "No input template selected"
+            if self.example_workbook is not None
+            else "Example input unavailable — choose Input xlsx"
         )
         self.batch_input_display_var = tk.StringVar(value=default_batch_name)
         self.batch_destination_var = tk.StringVar(
             value=batch_destination_display(self.batch_input_var.get())
         )
-        self.batch_status_var = tk.StringVar(value=self.catalog_error or "Ready")
+        self.batch_status_var = tk.StringVar(
+            value=self.catalog_error or self.example_error or "Ready"
+        )
         self.batch_progress_var = tk.StringVar(value="0% - 0/0 - Ready")
         self.batch_progress_value = tk.DoubleVar(value=0)
         self._active_single_request_id = None
@@ -1054,6 +1056,8 @@ class ErbaTab(ttk.Frame):
         self.erba_ad = ERBAApplicabilityDomain(self.project_root)
         self.options_visible = False
         self._build_ui()
+        if self.example_error:
+            self.example_button.configure(text="Example unavailable")
         self.single_task_var.trace_add("write", lambda *_: self._route_changed("single"))
         self.single_subtype_var.trace_add("write", lambda *_: self._route_changed("single"))
         self.batch_task_var.trace_add("write", lambda *_: self._route_changed("batch"))
@@ -1274,9 +1278,16 @@ class ErbaTab(ttk.Frame):
         if hasattr(self, "single_prediction_summary_var"):
             self._clear_single_result("Prediction: -")
         if hasattr(self, "batch_result"):
+            example_error = getattr(self, "example_error", "")
+            batch_message = (
+                f"Example input unavailable.\n\n{example_error}\n\n"
+                "Choose Input xlsx to select a workbook manually."
+                if example_error and not self.batch_input_var.get().strip()
+                else "Run a batch to show the completion summary."
+            )
             self._set_text(
                 self.batch_result,
-                "Run a batch to show the completion summary.",
+                batch_message,
             )
             self.batch_progress_value.set(0)
             self.batch_progress_var.set("0% - 0/0 - Ready")
@@ -1744,8 +1755,19 @@ class ErbaTab(ttk.Frame):
         self.set_status(f"PubChem found CID {cid}")
 
     def load_example_input(self):
+        if self.example_workbook is None:
+            self.single_status_var.set(
+                f"{self.example_error} Enter a CAS/SMILES value or choose "
+                "Input xlsx manually."
+            )
+            return
         self.cas_var.set(self.example_cas)
         self.smiles_var.set(self.example_smiles)
+        self.batch_input_var.set(str(self.example_workbook))
+        self.batch_input_display_var.set(self.example_workbook.name)
+        self.batch_destination_var.set(
+            batch_destination_display(self.example_workbook)
+        )
         self.single_status_var.set(
             f"Example input restored from {self.example_workbook.name}."
         )
@@ -2033,9 +2055,15 @@ class ErbaTab(ttk.Frame):
             state="disabled",
         )
         self.batch_result.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        initial_result = (
+            f"Example input unavailable.\n\n{self.example_error}\n\n"
+            "Choose Input xlsx to select a workbook manually."
+            if self.example_error
+            else "Run a batch to show the completion summary."
+        )
         self._set_text(
             self.batch_result,
-            "Run a batch to show the completion summary.",
+            initial_result,
         )
 
     def _selected_route(self, workflow: str):
@@ -2623,6 +2651,15 @@ class ErbaTab(ttk.Frame):
         normalized = {str(column).strip().lower(): column for column in frame.columns}
         return next((normalized[name] for name in aliases if name in normalized), None)
 
+    @staticmethod
+    def _show_batch_dialog(level: str, title: str, message: str) -> None:
+        dialogs = {
+            "info": messagebox.showinfo,
+            "warning": messagebox.showwarning,
+            "error": messagebox.showerror,
+        }
+        dialogs[level](title, message)
+
     def _reject_batch_start(self, request_id: int, message: str) -> None:
         self.batch_status_var.set(message)
         self.batch_progress_value.set(100)
@@ -2633,12 +2670,18 @@ class ErbaTab(ttk.Frame):
                 result,
                 f"Batch prediction failed.\n\nTechnical details: {message}",
             )
+        self._show_batch_dialog("error", "Batch prediction failed", message)
         self._started_at.pop(request_id, None)
         self._forget_request(request_id)
 
     def batch_predict_clicked(self):
         snapshot = self._snapshot("batch")
         if not snapshot:
+            message = (
+                self.batch_status_var.get().strip()
+                or "The ERalpha batch route is unavailable."
+            )
+            self._show_batch_dialog("error", "Batch prediction failed", message)
             return
         request_id, task, subtype, model_id = snapshot
         input_path = self.batch_input_var.get().strip()
@@ -2800,6 +2843,11 @@ class ErbaTab(ttk.Frame):
             self._emit("batch.inference_complete", workflow="erba", task=task.value, subtype=subtype.value,
                        model_id=model_id, correlation_id=request_id, duration_ms=duration_ms,
                        row_count=0, status="failed", exception_type="BatchError")
+            self._show_batch_dialog(
+                "error",
+                "Batch prediction failed",
+                str(error),
+            )
             return
         if export_result is None:
             raise RuntimeError("ERBA batch completed without an export result.")
@@ -2846,6 +2894,46 @@ class ErbaTab(ttk.Frame):
             lines.append(f"AD warning: {export_result.ad_error}")
         lines.extend(("", caveat))
         self._set_text(self.batch_result, "\n".join(lines))
+
+        dialog_lines = [
+            f"Saved:\n{destination}",
+            "",
+            f"Total rows: {export_result.count}",
+            f"Binding: {export_result.binding_count}",
+            f"Non-binding: {export_result.non_binding_count}",
+            f"Not predicted: {export_result.not_predicted_count}",
+        ]
+        warnings = []
+        if export_result.not_predicted_count:
+            warnings.append(
+                f"{export_result.not_predicted_count} row(s) were not predicted."
+            )
+        if export_result.ad_unavailable_count:
+            warnings.append(
+                f"Applicability domain was unavailable for "
+                f"{export_result.ad_unavailable_count} row(s)."
+            )
+        if not export_result.graph_paths:
+            warnings.append(
+                f"Graphs: {export_result.graph_error or 'no graphs were generated.'}"
+            )
+        elif export_result.graph_error:
+            warnings.append(f"Graphs: {export_result.graph_error}")
+        if export_result.ad_error:
+            warnings.append(f"Applicability domain: {export_result.ad_error}")
+        if warnings:
+            dialog_lines.extend(("", "Warnings:", *warnings))
+            self._show_batch_dialog(
+                "warning",
+                "Batch prediction completed with warnings",
+                "\n".join(dialog_lines),
+            )
+        else:
+            self._show_batch_dialog(
+                "info",
+                "Batch prediction done",
+                "\n".join(dialog_lines),
+            )
 
     def _snapshot_is_current(self, workflow, request_id, task, subtype, model_id):
         active_id = (

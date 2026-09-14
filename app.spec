@@ -17,6 +17,9 @@ MODELS_ROOT = PROJECT_ROOT / "models"
 ERBA_ROOT = MODELS_ROOT / "erba"
 ERBA_CATALOG = ERBA_ROOT / "catalog.v2.json"
 ERBA_AD_ROOT = ERBA_ROOT / "ad"
+TEMPLATES_ROOT = PROJECT_ROOT / "templates"
+SHARED_EXAMPLE_TEMPLATE = TEMPLATES_ROOT / "test.xlsx"
+SHARED_EXAMPLE_TEMPLATE_SHA256 = "5a1f569f8f6a5cd47bff67a189645c3f9461fcf07bd24f4e5b4f83197f3350aa"
 ERBA_AD_STEMS = (
     "classification_er_alpha_reference",
 )
@@ -142,9 +145,17 @@ def erba_ad_datas() -> list[tuple[str, str]]:
     return [(str(path), "models/erba/ad") for path in sorted(expected)]
 
 
-for required_directory in (PROJECT_ROOT / "data", PROJECT_ROOT / "templates"):
+for required_directory in (PROJECT_ROOT / "data", TEMPLATES_ROOT):
     if not required_directory.is_dir():
         raise SystemExit(f"Required legacy resource directory is missing: {required_directory}")
+if (
+    not SHARED_EXAMPLE_TEMPLATE.is_file()
+    or sha256(SHARED_EXAMPLE_TEMPLATE) != SHARED_EXAMPLE_TEMPLATE_SHA256
+):
+    raise SystemExit(
+        f"Required shared example template is missing or altered: {SHARED_EXAMPLE_TEMPLATE}"
+    )
+
 
 def is_runtime_module(name: str) -> bool:
     return not ({"test", "tests", "testing"} & set(name.split(".")))
@@ -169,7 +180,7 @@ hiddenimports += [
 
 # Explicit package resources and native extension libraries are required at runtime.
 datas = legacy_model_datas() + catalogued_erba_datas() + erba_ad_datas()
-datas += [(str(PROJECT_ROOT / "data"), "data"), (str(PROJECT_ROOT / "templates"), "templates")]
+datas += [(str(PROJECT_ROOT / "data"), "data"), (str(TEMPLATES_ROOT), "templates")]
 for package in ("rdkit", "h5py", "openpyxl", "PIL", "xgboost"):
     datas += collect_data_files(package)
 binaries = []

@@ -1,10 +1,13 @@
 """Opt-in native-package acceptance driver used only by release verification."""
 from __future__ import annotations
 
+from copy import copy
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import time
 import traceback
 
@@ -17,6 +20,10 @@ from core.contracts import (
     HISTORICAL_EXPOSURE_CAVEAT_COMPACT,
 )
 
+DISTRIBUTED_TEST_XLSX_SHA256 = (
+    "5a1f569f8f6a5cd47bff67a189645c3f9461fcf07bd24f4e5b4f83197f3350aa"
+)
+
 
 def _sha256_path(path: Path) -> str:
     digest = hashlib.sha256()
@@ -24,6 +31,212 @@ def _sha256_path(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _normalized_example_header(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().casefold())
+
+
+def _read_shared_example_workbook(path: Path) -> dict:
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = workbook.active
+        headers = [cell.value for cell in sheet[1]]
+        normalized = {
+            _normalized_example_header(value): index
+            for index, value in enumerate(headers)
+        }
+        cas_index = next(
+            (
+                normalized[alias]
+                for alias in (
+                    "cas",
+                    "casno",
+                    "casrn",
+                    "carsrn",
+                    "casnumber",
+                )
+                if alias in normalized
+            ),
+            None,
+        )
+        if cas_index is None:
+            raise AssertionError(
+                f"shared example workbook lacks a recognized CAS column: {headers}"
+            )
+        smiles_index = next(
+            (
+                normalized[alias]
+                for alias in (
+                    "smiles",
+                    "canonicalsmiles",
+                    "isomericsmiles",
+                )
+                if alias in normalized
+            ),
+            None,
+        )
+        values = list(sheet.iter_rows(min_row=2, values_only=True))
+        cas_values = [
+            str(row[cas_index] or "").strip()
+            for row in values
+        ]
+        smiles_values = [
+            (
+                str(row[smiles_index] or "").strip()
+                if smiles_index is not None
+                else ""
+            )
+            for row in values
+        ]
+        return {
+            "sheet": sheet.title,
+            "headers": headers,
+            "row_count": len(values),
+            "cas_header": headers[cas_index],
+            "cas_values": cas_values,
+            "smiles_header": (
+                headers[smiles_index] if smiles_index is not None else None
+            ),
+            "smiles_values": smiles_values,
+        }
+    finally:
+        workbook.close()
+
+
+def _openpyxl_cell_kind(cell) -> str:
+    if cell.row == 1 and cell.value is not None:
+        return "header"
+    if cell.value is None:
+        return "blank"
+    if isinstance(cell.value, bool):
+        return "boolean"
+    if cell.is_date:
+        return "date"
+    if isinstance(cell.value, (int, float)):
+        return "number"
+    return "text"
+
+
+def _openpyxl_format_signature(cell) -> dict:
+    """Return the complete value-independent openpyxl cell-format signature."""
+    return {
+        "font": repr(copy(cell.font)),
+        "fill": repr(copy(cell.fill)),
+        "border": repr(copy(cell.border)),
+        "alignment": repr(copy(cell.alignment)),
+        "number_format": str(cell.number_format),
+        "protection": repr(copy(cell.protection)),
+        "quote_prefix": bool(cell.quotePrefix),
+        "pivot_button": bool(cell.pivotButton),
+    }
+
+
+def _worksheet_format_inventory(sheet) -> dict:
+    inventories: dict[str, dict[str, dict]] = {}
+    counts: dict[str, int] = {}
+    for row in sheet.iter_rows():
+        for cell in row:
+            kind = _openpyxl_cell_kind(cell)
+            signature = _openpyxl_format_signature(cell)
+            canonical = json.dumps(signature, sort_keys=True)
+            inventories.setdefault(kind, {}).setdefault(
+                canonical,
+                {
+                    "signature": signature,
+                    "example_coordinate": cell.coordinate,
+                },
+            )
+            counts[kind] = counts.get(kind, 0) + 1
+    return {
+        kind: {
+            "cell_count": counts[kind],
+            "signatures": [
+                receipt
+                for _, receipt in sorted(inventories[kind].items())
+            ],
+        }
+        for kind in sorted(inventories)
+    }
+
+
+def compare_plain_primary_workbook_formatting(
+    erta_workbook: str | Path,
+    eralpha_workbook: str | Path,
+) -> dict:
+    """Compare exact cell formatting by kind, never endpoint data semantics."""
+    erta = load_workbook(erta_workbook, read_only=False, data_only=False)
+    eralpha = load_workbook(eralpha_workbook, read_only=False, data_only=False)
+    try:
+        erta_sheet = erta.active
+        if "Predictions" not in eralpha.sheetnames:
+            raise AssertionError("ERalpha workbook lacks the Predictions sheet")
+        eralpha_sheet = eralpha["Predictions"]
+        inventories = {
+            "erta": _worksheet_format_inventory(erta_sheet),
+            "eralpha": _worksheet_format_inventory(eralpha_sheet),
+        }
+        compared_kinds = sorted(
+            set(inventories["erta"]) & set(inventories["eralpha"])
+        )
+        required_kinds = {"header", "text", "number", "boolean"}
+        missing = required_kinds - set(compared_kinds)
+        if missing:
+            raise AssertionError(
+                "primary worksheet formatting comparison lacks common cell "
+                f"kinds: {sorted(missing)}"
+            )
+        non_uniform = {
+            f"{endpoint}/{kind}": len(
+                inventories[endpoint][kind]["signatures"]
+            )
+            for endpoint in ("erta", "eralpha")
+            for kind in required_kinds
+            if len(inventories[endpoint][kind]["signatures"]) != 1
+        }
+        if non_uniform:
+            raise AssertionError(
+                "plain primary worksheets have non-uniform formatting within "
+                f"a cell kind: {non_uniform}"
+            )
+        mismatches = {}
+        for kind in compared_kinds:
+            signatures = {
+                endpoint: [
+                    item["signature"]
+                    for item in inventories[endpoint][kind]["signatures"]
+                ]
+                for endpoint in ("erta", "eralpha")
+            }
+            if signatures["erta"] != signatures["eralpha"]:
+                mismatches[kind] = signatures
+        if mismatches:
+            raise AssertionError(
+                "ERalpha Predictions formatting differs from plain ERTA cells "
+                "of the same kind: "
+                + json.dumps(mismatches, sort_keys=True)
+            )
+        return {
+            "comparison": (
+                "exact openpyxl font/fill/border/alignment/number-format/"
+                "protection/quote-prefix/pivot-button signature by cell kind"
+            ),
+            "data_semantics_compared": False,
+            "cell_kind_policy": (
+                "header row, then blank/boolean/date/number/text by openpyxl "
+                "cell value type; values and column meanings are ignored"
+            ),
+            "erta_sheet": erta_sheet.title,
+            "eralpha_sheet": eralpha_sheet.title,
+            "compared_kinds": compared_kinds,
+            "required_kinds": sorted(required_kinds),
+            "inventories": inventories,
+            "uniform_within_required_kinds": True,
+            "exact_match": True,
+        }
+    finally:
+        erta.close()
+        eralpha.close()
 
 
 def _widget_geometry_receipt(widget, endpoint_tab) -> dict:
@@ -579,8 +792,16 @@ def inspect_endpoint_geometry_parity(
     }
 
 
-def inspect_shared_example_parity(app) -> dict:
-    """Verify both real endpoint widgets restore the same bundled ERTA example."""
+def inspect_shared_example_parity(
+    app,
+    isolated_profile_root: str | Path | None = None,
+) -> dict:
+    """Verify both endpoints share the writable, byte-faithful test.xlsx."""
+    from core.paths import (
+        resolve_shared_example_input,
+        validate_mutable_directory,
+    )
+
     endpoints = {
         "erta": app,
         "eralpha": app.eralpha_tab,
@@ -596,12 +817,13 @@ def inspect_shared_example_parity(app) -> dict:
                 strict=True
             ),
             "batch_display": owner.batch_input_display_var.get(),
+            "batch_destination": owner.batch_destination_var.get(),
         }
         for name, owner in endpoints.items()
     }
     for name, owner in endpoints.items():
-        if not expected[name]["cas"] or not expected[name]["smiles"]:
-            raise AssertionError(f"{name} preset CAS/SMILES is blank")
+        if not expected[name]["cas"]:
+            raise AssertionError(f"{name} preset CAS is blank")
         if (
             owner.cas_var.get() != expected[name]["cas"]
             or owner.smiles_var.get() != expected[name]["smiles"]
@@ -614,6 +836,12 @@ def inspect_shared_example_parity(app) -> dict:
         if expected[name]["batch_display"] != expected[name]["workbook"].name:
             raise AssertionError(
                 f"{name} batch example display does not name the preset workbook"
+            )
+        if expected[name]["batch_destination"] != str(
+            expected[name]["workbook"].parent
+        ):
+            raise AssertionError(
+                f"{name} batch destination does not name the writable preset parent"
             )
 
     if (
@@ -628,32 +856,26 @@ def inspect_shared_example_parity(app) -> dict:
         raise AssertionError("ERTA and ERalpha batch example paths differ")
     if expected["erta"]["batch_display"] != expected["eralpha"]["batch_display"]:
         raise AssertionError("ERTA and ERalpha batch example displays differ")
+    if (
+        expected["erta"]["batch_destination"]
+        != expected["eralpha"]["batch_destination"]
+    ):
+        raise AssertionError("ERTA and ERalpha batch destinations differ")
+    if expected["erta"]["workbook"].name.casefold() != "test.xlsx":
+        raise AssertionError("shared batch default is not named test.xlsx")
 
     erta_bytes = expected["erta"]["workbook"].read_bytes()
     eralpha_bytes = expected["eralpha"]["workbook"].read_bytes()
     if erta_bytes != eralpha_bytes:
         raise AssertionError("ERTA and ERalpha batch example workbook bytes differ")
 
-    workbook = load_workbook(
-        expected["erta"]["workbook"],
-        read_only=True,
-        data_only=True,
+    default_metadata = _read_shared_example_workbook(
+        expected["erta"]["workbook"]
     )
-    try:
-        sheet = workbook.active
-        sheet_title = sheet.title
-        headers = [cell.value for cell in sheet[1]]
-        normalized = {
-            str(value).strip().casefold(): index
-            for index, value in enumerate(headers)
-        }
-        if "cas" not in normalized or "smiles" not in normalized:
-            raise AssertionError("shared example workbook lacks CAS/SMILES columns")
-        first_row = next(sheet.iter_rows(min_row=2, max_row=2, values_only=True))
-        source_cas = str(first_row[normalized["cas"]] or "").strip()
-        source_smiles = str(first_row[normalized["smiles"]] or "").strip()
-    finally:
-        workbook.close()
+    if not default_metadata["cas_values"]:
+        raise AssertionError("shared example workbook has no data rows")
+    source_cas = default_metadata["cas_values"][0]
+    source_smiles = default_metadata["smiles_values"][0]
     if (source_cas, source_smiles) != (
         expected["erta"]["cas"],
         expected["erta"]["smiles"],
@@ -661,6 +883,104 @@ def inspect_shared_example_parity(app) -> dict:
         raise AssertionError(
             "preset CAS/SMILES does not equal the first shared workbook example"
         )
+
+    default_hash_before = hashlib.sha256(erta_bytes).hexdigest()
+    validate_mutable_directory(
+        expected["erta"]["workbook"].parent,
+        forbidden_roots=(app.project_root, app.install_root),
+    )
+    if not os.access(expected["erta"]["workbook"], os.W_OK):
+        raise AssertionError("resolved shared test.xlsx is not writable")
+    if hashlib.sha256(
+        expected["erta"]["workbook"].read_bytes()
+    ).hexdigest() != default_hash_before:
+        raise AssertionError(
+            "writability inspection changed the shared default workbook"
+        )
+
+    bundled_workbook = (
+        Path(app.project_root).expanduser().resolve(strict=True)
+        / "templates"
+        / "test.xlsx"
+    )
+    if not bundled_workbook.is_file():
+        raise AssertionError(
+            f"bundled shared example is missing: {bundled_workbook}"
+        )
+    bundled_bytes = bundled_workbook.read_bytes()
+    bundled_sha256 = hashlib.sha256(bundled_bytes).hexdigest()
+    if bundled_sha256 != DISTRIBUTED_TEST_XLSX_SHA256:
+        raise AssertionError(
+            "bundled test.xlsx bytes differ from the supplied distribution source"
+        )
+    bundled_metadata = _read_shared_example_workbook(bundled_workbook)
+    if (
+        bundled_metadata["headers"] != ["CARSRN"]
+        or bundled_metadata["cas_header"] != "CARSRN"
+        or bundled_metadata["smiles_header"] is not None
+        or bundled_metadata["row_count"] != 25
+        or not all(bundled_metadata["cas_values"])
+    ):
+        raise AssertionError(
+            "bundled test.xlsx does not preserve the supplied CARSRN/25-row contract"
+        )
+
+    fresh_copy = None
+    if isolated_profile_root is not None:
+        qa_profile = Path(isolated_profile_root).expanduser().resolve(
+            strict=False
+        )
+        requested_fresh_copy = (
+            qa_profile
+            / "Documents"
+            / "ER_Predictor"
+            / "Examples"
+            / "test.xlsx"
+        )
+        if qa_profile.exists():
+            raise AssertionError(
+                f"fresh shared-example QA profile already exists: {qa_profile}"
+            )
+        original_environment = {
+            name: os.environ.get(name)
+            for name in (
+                "USERPROFILE",
+                "LOCALAPPDATA",
+                "ER_PREDICTOR_PORTABLE",
+            )
+        }
+        had_frozen = hasattr(os.sys, "frozen")
+        original_frozen = getattr(os.sys, "frozen", None)
+        try:
+            os.environ["USERPROFILE"] = str(qa_profile)
+            os.environ["LOCALAPPDATA"] = str(qa_profile / "LocalAppData")
+            os.environ["ER_PREDICTOR_PORTABLE"] = "0"
+            setattr(os.sys, "frozen", False)
+            fresh_copy = resolve_shared_example_input()
+        finally:
+            if had_frozen:
+                setattr(os.sys, "frozen", original_frozen)
+            else:
+                delattr(os.sys, "frozen")
+            for name, value in original_environment.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        if fresh_copy != requested_fresh_copy or not fresh_copy.is_file():
+            raise AssertionError(
+                "shared-example resolver did not create the isolated first-run copy"
+            )
+        if fresh_copy.read_bytes() != bundled_bytes:
+            raise AssertionError(
+                "newly created shared default does not byte-match bundled test.xlsx"
+            )
+        validate_mutable_directory(
+            fresh_copy.parent,
+            forbidden_roots=(app.project_root, app.install_root),
+        )
+        if not os.access(fresh_copy, os.W_OK):
+            raise AssertionError("newly created shared-example QA copy is not writable")
 
     original_endpoint = app.notebook.select()
     original_modes = {
@@ -672,9 +992,20 @@ def inspect_shared_example_parity(app) -> dict:
         for name, owner in endpoints.items():
             other_name = "eralpha" if name == "erta" else "erta"
             other = endpoints[other_name]
-            other_values = (other.cas_var.get(), other.smiles_var.get())
+            other_values = (
+                other.cas_var.get(),
+                other.smiles_var.get(),
+                other.batch_input_var.get(),
+                other.batch_input_display_var.get(),
+                other.batch_destination_var.get(),
+            )
             owner.cas_var.set(f"{name}-changed-cas")
             owner.smiles_var.set(f"{name}-changed-smiles")
+            owner.batch_input_var.set(
+                str(expected[name]["workbook"].parent / f"{name}-changed.xlsx")
+            )
+            owner.batch_input_display_var.set(f"{name}-changed.xlsx")
+            owner.batch_destination_var.set(f"{name}-changed-destination")
             app.notebook.select(owner.parity_widgets["endpoint_tab"])
             owner.parity_widgets["mode_notebook"].select(
                 owner.parity_widgets["single_tab"]
@@ -684,11 +1015,33 @@ def inspect_shared_example_parity(app) -> dict:
             app.update_idletasks()
             restored = (owner.cas_var.get(), owner.smiles_var.get())
             expected_values = (expected[name]["cas"], expected[name]["smiles"])
+            restored_batch = (
+                Path(owner.batch_input_var.get()).expanduser().resolve(
+                    strict=True
+                ),
+                owner.batch_input_display_var.get(),
+                owner.batch_destination_var.get(),
+            )
+            expected_batch = (
+                expected[name]["workbook"],
+                expected[name]["workbook"].name,
+                str(expected[name]["workbook"].parent),
+            )
             if restored != expected_values:
                 raise AssertionError(
                     f"{name} Example input button did not restore the preset"
                 )
-            if (other.cas_var.get(), other.smiles_var.get()) != other_values:
+            if restored_batch != expected_batch:
+                raise AssertionError(
+                    f"{name} Example input button did not restore the batch default"
+                )
+            if (
+                other.cas_var.get(),
+                other.smiles_var.get(),
+                other.batch_input_var.get(),
+                other.batch_input_display_var.get(),
+                other.batch_destination_var.get(),
+            ) != other_values:
                 raise AssertionError(
                     f"{name} Example input callback leaked into {other_name}"
                 )
@@ -698,6 +1051,11 @@ def inspect_shared_example_parity(app) -> dict:
                     "widget": "example_button",
                     "invoked": True,
                     "restored": list(restored),
+                    "restored_batch": [
+                        str(restored_batch[0]),
+                        restored_batch[1],
+                        restored_batch[2],
+                    ],
                     "other_endpoint_unchanged": True,
                 }
             )
@@ -712,12 +1070,39 @@ def inspect_shared_example_parity(app) -> dict:
         "smiles": expected["erta"]["smiles"],
         "workbook": str(expected["erta"]["workbook"]),
         "workbook_size_bytes": len(erta_bytes),
-        "workbook_sha256": hashlib.sha256(erta_bytes).hexdigest(),
-        "workbook_sheet": sheet_title,
-        "workbook_headers": headers,
+        "workbook_sha256": default_hash_before,
+        "workbook_sheet": default_metadata["sheet"],
+        "workbook_headers": default_metadata["headers"],
+        "workbook_row_count": default_metadata["row_count"],
+        "cas_header": default_metadata["cas_header"],
+        "smiles_header": default_metadata["smiles_header"],
         "batch_display": expected["erta"]["batch_display"],
+        "batch_destination": expected["erta"]["batch_destination"],
         "path_equal": True,
         "content_equal": True,
+        "default_writable": True,
+        "default_matches_bundled": erta_bytes == bundled_bytes,
+        "bundled_workbook": str(bundled_workbook),
+        "bundled_size_bytes": len(bundled_bytes),
+        "bundled_sha256": bundled_sha256,
+        "bundled_headers": bundled_metadata["headers"],
+        "bundled_row_count": bundled_metadata["row_count"],
+        "bundled_cas_values": bundled_metadata["cas_values"],
+        "fresh_copy": str(fresh_copy) if fresh_copy is not None else None,
+        "fresh_copy_writable": fresh_copy is not None,
+        "fresh_copy_matches_bundled": fresh_copy is not None,
+        "fresh_copy_sha256": (
+            _sha256_path(fresh_copy) if fresh_copy is not None else None
+        ),
+        "fresh_copy_size_bytes": (
+            fresh_copy.stat().st_size if fresh_copy is not None else None
+        ),
+        "fresh_copy_resolution": (
+            "resolve_shared_example_input() under a QA-only USERPROFILE and "
+            "LOCALAPPDATA with frozen layout temporarily disabled"
+            if fresh_copy is not None
+            else None
+        ),
         "callbacks": callback_receipts,
     }
 
@@ -725,6 +1110,38 @@ def inspect_shared_example_parity(app) -> dict:
 class NativePackageQa:
     """Drive real Tk callbacks and record fail-closed packaged-app evidence."""
 
+    BASELINE_CHECKS = {
+        "erta_eralpha_exact_ui_geometry_and_examples",
+        "eralpha_real_resource_buttons_release_enforcement_and_isolation",
+        "erta_startup_resources_and_controls",
+        "erta_options_and_resource_controls",
+        "erta_exact_valid_single",
+        "erta_legacy_invalid_direct_smiles",
+        "erta_mocked_pubchem_callback",
+        "erta_mocked_pubchem_prediction",
+        "erta_model_ad_browse_callbacks",
+        "erta_template_callback_and_dialog",
+        "erta_batch_workbook_graphs_and_order",
+        "erba_evidence_caveat_and_dialog",
+        "erba_route",
+        "erba_invalid_wildcard",
+        "erba_invalid_pipe",
+        "erba_invalid_metal",
+        "erba_invalid_blank",
+        "erba_invalid_invalid_cas",
+        "erba_eralpha_batch_workbook_ad_graphs_and_summary",
+        "fixed_eralpha_classification_tab",
+        "erta_erba_erta_state_isolation",
+        "read_only_install_and_writable_state",
+    }
+    BATCH_FEEDBACK_CHECKS = {
+        "erta_batch_failure_dialog_and_control_recovery",
+        "eralpha_batch_failure_dialog_and_control_recovery",
+    }
+    SHARED_EXAMPLE_BATCH_CHECKS = {
+        "erta_shared_test_batch_success_dialog_and_predictions",
+        "eralpha_shared_test_batch_success_dialog_and_predictions",
+    }
     VALID_SMILES = "C[C@]12CC[C@H]3[C@@H]([C@@H]1CC[C@@H]2O)CCC4=CC(=CC=C34)O"
     LEGACY_INVALID_SMILES = "not a SMILES"
     MOCK_CAS = "50-00-0"
@@ -764,6 +1181,8 @@ class NativePackageQa:
         self.destination.parent.mkdir(parents=True, exist_ok=True)
         self.root = Path(app.output_root) / "native-package-qa"
         self.root.mkdir(parents=True, exist_ok=True)
+        self.run_root = self.root / f"run-{os.getpid()}-{time.time_ns()}"
+        self.run_root.mkdir(parents=True, exist_ok=False)
         self.stage = -4
         self._tick_active = False
         self.route_index = 0
@@ -780,6 +1199,13 @@ class NativePackageQa:
         self.dialogs: list[dict] = []
         self.patches: list[tuple[object, str, object]] = []
         self.mock_cas_enabled = False
+        self.mock_cas_values: set[str] = {self.MOCK_CAS}
+        self.shared_default_path: Path | None = None
+        self.shared_default_sha256 = ""
+        self.shared_bundle_path: Path | None = None
+        self.shared_bundle_sha256 = ""
+        self.qa_shared_example_path: Path | None = None
+        self.erta_batch_output_path: Path | None = None
         gate_value = os.environ.get("ER_PREDICTOR_EXTERNAL_DRIVER_GATE", "").strip()
         self.external_driver_gate = Path(gate_value) if gate_value else None
         self.run_nonce = os.environ.get("ER_PREDICTOR_AUTOMATION_NONCE", "").strip()
@@ -867,39 +1293,77 @@ class NativePackageQa:
     def _install_dialog_observer(self) -> None:
         # Native message boxes block unattended Tk automation; record their exact
         # visible title/body while preserving the callback path that invokes them.
-        from gui import main_window
+        from gui import erba_tab, main_window
 
         def observe(kind):
             def handler(title, message, **_kwargs):
-                self.dialogs.append({"kind": kind, "title": str(title), "message": str(message)})
+                controls_at_dialog = {}
+                for endpoint, owner in (
+                    ("erta", self.app),
+                    ("eralpha", self.app.eralpha_tab),
+                ):
+                    try:
+                        controls_at_dialog[endpoint] = (
+                            self._batch_control_states(owner)
+                        )
+                    except Exception as error:
+                        controls_at_dialog[endpoint] = {
+                            "unavailable": f"{type(error).__name__}: {error}"
+                        }
+                self.dialogs.append(
+                    {
+                        "kind": kind,
+                        "title": str(title),
+                        "message": str(message),
+                        "batch_controls_at_dialog": controls_at_dialog,
+                    }
+                )
                 return "ok"
             return handler
 
-        self._patch(main_window.messagebox, "showerror", observe("error"))
-        self._patch(main_window.messagebox, "showinfo", observe("info"))
+        messagebox_modules = {
+            id(main_window.messagebox): main_window.messagebox,
+            id(erba_tab.messagebox): erba_tab.messagebox,
+        }
+        for messagebox_module in messagebox_modules.values():
+            self._patch(messagebox_module, "showerror", observe("error"))
+            self._patch(messagebox_module, "showinfo", observe("info"))
+            self._patch(messagebox_module, "showwarning", observe("warning"))
         self.transcript["automation_scopes"].append({
             "scope": "messagebox_observer",
+            "functions": ["showinfo", "showwarning", "showerror"],
             "reason": "record dialog-visible semantics without blocking opt-in automation",
         })
 
     def _install_mock_cas(self) -> None:
         if self.mock_cas_enabled:
             return
-        from gui import main_window
+        from gui import erba_tab, main_window
 
         def mocked_cas_to_smiles(cas: str) -> dict:
-            if str(cas).strip() != self.MOCK_CAS:
+            normalized = str(cas).strip()
+            if normalized not in self.mock_cas_values:
                 raise RuntimeError(f"unexpected deterministic QA CAS: {cas}")
             return {"CanonicalSMILES": self.MOCK_SMILES, "PubChem_CID": "712"}
 
         self._patch(main_window, "cas_to_smiles", mocked_cas_to_smiles)
+        self._patch(erba_tab, "cas_to_smiles", mocked_cas_to_smiles)
         self.mock_cas_enabled = True
         self.transcript["automation_scopes"].append({
             "scope": "mocked_pubchem",
-            "cas": self.MOCK_CAS,
+            "cas_values": sorted(self.mock_cas_values),
             "canonical_smiles": self.MOCK_SMILES,
             "cid": "712",
-            "reason": "deterministic opt-in UI callback coverage; no network request",
+            "reason": (
+                "deterministic opt-in UI callback and bundled 25-CAS batch "
+                "coverage; every CAS is deliberately substituted with the same "
+                "valid SMILES and no network request is made"
+            ),
+            "production_equivalent": False,
+            "online_verification": (
+                "Run the packaged app without native-QA substitution to resolve "
+                "the actual 25 CAS values through PubChem."
+            ),
         })
 
     def _install_picker(self, save_path: Path) -> None:
@@ -944,6 +1408,69 @@ class NativePackageQa:
 
     def _wait_dialog(self, count: int) -> bool:
         return len(self.dialogs) > count
+
+    @staticmethod
+    def _batch_control_states(owner) -> dict:
+        return {
+            "input": str(owner.batch_input_button.cget("state")),
+            "template": str(owner.download_template_button.cget("state")),
+            "run": str(owner.run_batch_button.cget("state")),
+        }
+
+    def _terminal_dialog(
+        self,
+        initial_count: int,
+        *,
+        kind: str,
+        title: str,
+        context: str,
+    ) -> dict:
+        observed = self.dialogs[initial_count:]
+        self._require(
+            len(observed) == 1,
+            f"{context} emitted {len(observed)} dialogs instead of exactly one: "
+            f"{observed}",
+        )
+        dialog = observed[0]
+        self._require(
+            dialog["kind"] == kind and dialog["title"] == title,
+            f"{context} dialog contract drift: {dialog}",
+        )
+        return dialog
+
+    def _copy_shared_example_for_batch(self, endpoint: str) -> Path:
+        self._require(
+            self.qa_shared_example_path is not None
+            and self.qa_shared_example_path.is_file(),
+            "fresh bundled shared-example QA source is unavailable",
+        )
+        source = self.qa_shared_example_path
+        source_hash = _sha256_path(source)
+        destination = (
+            self.run_root / "shared-example-success" / endpoint / "test.xlsx"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=False)
+        self._require(
+            destination.resolve(strict=False) != source.resolve(strict=True),
+            f"{endpoint} QA batch input unexpectedly targets the shared source",
+        )
+        shutil.copyfile(source, destination)
+        self._require(
+            destination.read_bytes() == source.read_bytes()
+            and _sha256_path(source) == source_hash,
+            f"{endpoint} QA copy changed the shared example bytes",
+        )
+        return destination.resolve(strict=True)
+
+    def _make_corrupt_batch_input(self, endpoint: str) -> Path:
+        destination = (
+            self.run_root / "deterministic-batch-failure" / endpoint / "test.xlsx"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=False)
+        destination.write_bytes(
+            b"ER_Predictor native QA deterministic invalid xlsx fixture\n"
+        )
+        return destination.resolve(strict=True)
 
     @staticmethod
     def _same_path(first: str | Path, second: str | Path) -> bool:
@@ -1068,10 +1595,38 @@ class NativePackageQa:
     def _start_exact_ui_parity_stage(self) -> None:
         app = self.app
         tab = app.eralpha_tab
-        example_receipt = inspect_shared_example_parity(app)
+        example_receipt = inspect_shared_example_parity(
+            app,
+            self.run_root / "fresh-default-profile",
+        )
+        self.shared_default_path = Path(example_receipt["workbook"])
+        self.shared_default_sha256 = example_receipt["workbook_sha256"]
+        self.shared_bundle_path = Path(example_receipt["bundled_workbook"])
+        self.shared_bundle_sha256 = example_receipt["bundled_sha256"]
+        self.qa_shared_example_path = Path(example_receipt["fresh_copy"])
+        self.mock_cas_values.update(example_receipt["bundled_cas_values"])
+        self.transcript["automation_scopes"].append(
+            {
+                "scope": "isolated_first_run_shared_example_resolution",
+                "profile_root": str(
+                    self.run_root / "fresh-default-profile"
+                ),
+                "temporary_environment": {
+                    "USERPROFILE": "QA-only profile_root",
+                    "LOCALAPPDATA": "QA-only profile_root/LocalAppData",
+                    "ER_PREDICTOR_PORTABLE": "0",
+                    "sys.frozen": False,
+                },
+                "reason": (
+                    "exercise resolve_shared_example_input() creation without "
+                    "reading, replacing, or publishing beside the user's "
+                    "distributed test.xlsx"
+                ),
+            }
+        )
         geometry_receipt = inspect_endpoint_geometry_parity(
             app,
-            self.root / "ui-parity-screenshots",
+            self.run_root / "ui-parity-screenshots",
         )
         self._record(
             "erta_eralpha_exact_ui_geometry_and_examples",
@@ -1223,8 +1778,8 @@ class NativePackageQa:
             "ERalpha Reload AD did not activate a fresh endpoint-local AD manager",
         )
         ad_dialog = self.dialogs[-1]
-        model_candidate = self.root / "unapproved-erba-model.joblib"
-        ad_candidate = self.root / "unapproved-erba-ad.xlsx"
+        model_candidate = self.run_root / "unapproved-erba-model.joblib"
+        ad_candidate = self.run_root / "unapproved-erba-ad.xlsx"
         model_candidate.write_bytes(b"native QA unapproved model candidate\n")
         ad_candidate.write_bytes(b"native QA unapproved AD candidate\n")
         try:
@@ -1464,7 +2019,7 @@ class NativePackageQa:
                 self._record("erta_mocked_pubchem_prediction", summary=app.prediction_summary_var.get(), probability=app.active_probability_var.get(), canonical_details=app.result_text.get("1.0", "end").strip())
                 self.stage = 6
             if self.stage == 6:
-                template_path = self.root / "downloaded-template.xlsx"
+                template_path = self.run_root / "downloaded-template.xlsx"
                 self._install_picker(template_path)
                 model_before = app.model_path_var.get()
                 ad_before = app.ad_ref_path_var.get()
@@ -1477,33 +2032,65 @@ class NativePackageQa:
                 self._require(template_path.is_file(), "template callback did not create workbook")
                 self._require(self._wait_dialog(dialogs_before), "template callback did not expose completion dialog")
                 template = load_workbook(template_path, read_only=True, data_only=True)
-                self._require(template.active.max_row == 1 and [cell.value for cell in template.active[1]] == ["CAS"], "template schema drift")
-                self._record("erta_template_callback_and_dialog", output=str(template_path), headers=[cell.value for cell in template.active[1]], dialog=self.dialogs[-1])
-                input_path = self.root / "erta-mixed-input.xlsx"
-                workbook = Workbook()
-                sheet = workbook.active
-                sheet.append(["No.", "CAS", "Chemical Name", "SMILES"])
-                sheet.append([2, "", "valid", self.VALID_SMILES])
-                sheet.append([1, self.MOCK_CAS, "mocked-cas", ""])
-                sheet.append([3, "", "legacy-invalid", self.LEGACY_INVALID_SMILES])
-                workbook.save(input_path)
-                self.erta_batch_input_path = input_path.resolve()
+                try:
+                    template_headers = [
+                        cell.value for cell in template.active[1]
+                    ]
+                    self._require(
+                        template.active.max_row == 1
+                        and template_headers == ["CAS"],
+                        "template schema drift",
+                    )
+                finally:
+                    template.close()
+                self._record(
+                    "erta_template_callback_and_dialog",
+                    output=str(template_path),
+                    headers=template_headers,
+                    dialog=self._terminal_dialog(
+                        dialogs_before,
+                        kind="info",
+                        title="Template downloaded",
+                        context="ERTA template download",
+                    ),
+                )
+                self.erta_batch_input_path = (
+                    self._copy_shared_example_for_batch("erta")
+                )
                 self.erta_batch_outputs_before = {
                     path.resolve()
                     for path in self.erta_batch_input_path.parent.glob(
-                        "erta-mixed-input_*_prediction*.xlsx"
+                        "ERTA_*.xlsx"
                     )
                 }
-                app.batch_input_var.set(str(input_path))
-                app.batch_input_display_var.set(input_path.name)
+                app.batch_input_var.set(str(self.erta_batch_input_path))
+                app.batch_input_display_var.set(
+                    self.erta_batch_input_path.name
+                )
                 app.batch_destination_var.set(str(self.erta_batch_input_path.parent))
                 self.batch_dialog_count = len(self.dialogs)
                 app.batch_predict_clicked()
+                self.erta_success_locked_controls = (
+                    self._batch_control_states(app)
+                )
+                self._require(
+                    app._batch_active
+                    and self.erta_success_locked_controls
+                    == {
+                        "input": "disabled",
+                        "template": "disabled",
+                        "run": "disabled",
+                    },
+                    "ERTA shared-example batch did not lock its controls",
+                )
                 self.stage = 7
                 self._reschedule()
                 return
             if self.stage == 7:
-                if not self._wait_dialog(self.batch_dialog_count):
+                if (
+                    app._batch_active
+                    or not self._wait_dialog(self.batch_dialog_count)
+                ):
                     self._reschedule()
                     return
                 self._require(
@@ -1514,7 +2101,7 @@ class NativePackageQa:
                 outputs = {
                     path.resolve()
                     for path in input_parent.glob(
-                        "erta-mixed-input_*_prediction*.xlsx"
+                        "ERTA_*.xlsx"
                     )
                 } - self.erta_batch_outputs_before
                 self._require(
@@ -1523,20 +2110,70 @@ class NativePackageQa:
                 )
                 output = outputs.pop()
                 self._require(
-                    output.parent == input_parent,
-                    "ERTA workbook was not saved beside the input workbook",
+                    output.parent == input_parent
+                    and output.name.startswith("ERTA_test_")
+                    and output.name.endswith("_prediction.xlsx"),
+                    "ERTA workbook path or ERTA_ filename contract drift",
                 )
+                self.erta_batch_output_path = output
                 workbook = load_workbook(output, read_only=True, data_only=True)
-                sheet = workbook.active
-                headers = [cell.value for cell in sheet[1]]
-                rows = list(sheet.iter_rows(min_row=2, values_only=True))
-                self._require(sheet.title == "Sheet1", "legacy ERTA workbook sheet name drift")
-                self._require(headers == ["No.", "CAS", "Chemical Name", "SMILES", "Canonical_SMILES", "Mol_valid", "Probability_Negative_0", "Probability_Positive_1", "Prediction", "Prediction_label", "Decision_rule", "AD", "AD_MeanDistance", "AD_DistanceThreshold", "AD_Distance_InDomain", "AD_SimilarityMax", "AD_SimilarityThreshold", "AD_Similarity_InDomain", "AD_PC1", "AD_PC2", "PubChem_CID", "PubChem_status"], "legacy ERTA workbook schema/order drift")
-                self._require([row[0] for row in rows] == [2, 1, 3], "ERTA batch input order drift")
-                self._require(rows[1][3] == self.MOCK_SMILES and rows[1][-1] == "Found", "mocked CAS batch row was not resolved")
-                self._require(rows[2][5] is False, "legacy invalid batch row did not preserve invalid marker")
+                try:
+                    sheet = workbook.active
+                    headers = [cell.value for cell in sheet[1]]
+                    rows = [
+                        dict(zip(headers, row))
+                        for row in sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    ]
+                    self._require(
+                        sheet.title == "Sheet1",
+                        "legacy ERTA workbook sheet name drift",
+                    )
+                finally:
+                    workbook.close()
+                required_headers = {
+                    "CAS",
+                    "SMILES",
+                    "Canonical_SMILES",
+                    "Mol_valid",
+                    "Probability_Negative_0",
+                    "Probability_Positive_1",
+                    "Prediction",
+                    "Prediction_label",
+                    "Decision_rule",
+                    *self.ERBA_BATCH_AD_COLUMNS,
+                    "PubChem_CID",
+                    "PubChem_status",
+                }
+                self._require(
+                    required_headers <= set(headers),
+                    "ERTA shared-example workbook schema is incomplete",
+                )
+                expected_cas = _read_shared_example_workbook(
+                    self.erta_batch_input_path
+                )["cas_values"]
+                self._require(
+                    len(rows) == 25
+                    and [str(row["CAS"]) for row in rows] == expected_cas,
+                    "ERTA CARSRN alias or shared-example input order drift",
+                )
+                self._require(
+                    all(
+                        row["SMILES"] == self.MOCK_SMILES
+                        and row["PubChem_status"] == "Found"
+                        and row["Mol_valid"] is True
+                        and row["Probability_Negative_0"] is not None
+                        and row["Probability_Positive_1"] is not None
+                        and row["Prediction_label"] in {"Positive", "Negative"}
+                        for row in rows
+                    ),
+                    "ERTA shared CARSRN example did not yield 25 nonblank predictions",
+                )
                 graph_paths = sorted(
-                    path.name for path in (self.root / "graphs").glob("*.png")
+                    path.name
+                    for path in (input_parent / "graphs").glob("*.png")
                 )
                 self._require(graph_paths, "ERTA batch graph files were not generated")
                 summary = app.batch_result.get("1.0", "end").strip()
@@ -1552,21 +2189,354 @@ class NativePackageQa:
                     and not hasattr(app, "graph_label"),
                     "obsolete ERTA batch table/graph preview remains in the UI",
                 )
+                completion_dialog = self._terminal_dialog(
+                    self.batch_dialog_count,
+                    kind="info",
+                    title="Batch prediction done",
+                    context="ERTA shared-example batch success",
+                )
+                self._require(
+                    str(output) in completion_dialog["message"]
+                    and completion_dialog[
+                        "batch_controls_at_dialog"
+                    ]["erta"]
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    },
+                    "ERTA success dialog does not report the published workbook",
+                )
+                self._require(
+                    self._batch_control_states(app)
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    }
+                    and app.batch_progress_var.get()
+                    == "100% - 25/25 - Complete"
+                    and int(app.batch_progress_value.get()) == 100,
+                    "ERTA batch controls were not restored after success",
+                )
+                self.erta_success_result_identity = id(app.last_batch_result)
                 self._record(
-                    "erta_batch_workbook_graphs_and_order",
+                    "erta_shared_test_batch_success_dialog_and_predictions",
+                    input=str(self.erta_batch_input_path),
                     output=str(output),
                     sheet=sheet.title,
                     headers=headers,
-                    input_order=[row[0] for row in rows],
-                    mocked_cas_status=rows[1][-1],
-                    invalid_row_mol_valid=rows[2][5],
+                    input_order=expected_cas,
+                    input_header="CARSRN",
+                    row_count=len(rows),
+                    predicted_row_count=sum(
+                        row["Probability_Positive_1"] is not None
+                        for row in rows
+                    ),
+                    mocked_pubchem_statuses=sorted(
+                        {row["PubChem_status"] for row in rows}
+                    ),
+                    deterministic_smiles_substitution=self.MOCK_SMILES,
+                    source_bytes_preserved=(
+                        _sha256_path(self.qa_shared_example_path)
+                        == self.shared_bundle_sha256
+                    ),
                     graph_files=graph_paths,
                     batch_summary=summary,
-                    completion_dialog=self.dialogs[-1],
+                    progress=app.batch_progress_var.get(),
+                    controls_during_run=self.erta_success_locked_controls,
+                    controls=self._batch_control_states(app),
+                    completion_dialog=completion_dialog,
                 )
-                self._restore_patches()
-                self.mock_cas_enabled = False
-                self._install_dialog_observer()
+                self.stage = 72
+            if self.stage == 72:
+                mixed_directory = self.run_root / "mixed-batch" / "erta"
+                mixed_directory.mkdir(parents=True, exist_ok=False)
+                mixed_input = mixed_directory / "erta-mixed-input.xlsx"
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.append(["No.", "CAS", "Chemical Name", "SMILES"])
+                sheet.append([2, "", "valid", self.VALID_SMILES])
+                sheet.append([1, self.MOCK_CAS, "mocked-cas", ""])
+                sheet.append(
+                    [3, "", "legacy-invalid", self.LEGACY_INVALID_SMILES]
+                )
+                workbook.save(mixed_input)
+                workbook.close()
+                self.erta_mixed_input_path = mixed_input.resolve(
+                    strict=True
+                )
+                self.erta_mixed_outputs_before = {
+                    path.resolve()
+                    for path in mixed_directory.glob("ERTA_*.xlsx")
+                }
+                app.batch_input_var.set(str(self.erta_mixed_input_path))
+                app.batch_input_display_var.set(
+                    self.erta_mixed_input_path.name
+                )
+                app.batch_destination_var.set(str(mixed_directory))
+                self.erta_mixed_dialog_count = len(self.dialogs)
+                app.batch_predict_clicked()
+                self.erta_mixed_locked_controls = (
+                    self._batch_control_states(app)
+                )
+                self._require(
+                    app._batch_active
+                    and self.erta_mixed_locked_controls
+                    == {
+                        "input": "disabled",
+                        "template": "disabled",
+                        "run": "disabled",
+                    },
+                    "ERTA mixed batch did not start with locked controls",
+                )
+                self.stage = 73
+                self._reschedule()
+                return
+            if self.stage == 73:
+                if (
+                    app._batch_active
+                    or not self._wait_dialog(
+                        self.erta_mixed_dialog_count
+                    )
+                ):
+                    self._reschedule()
+                    return
+                mixed_parent = self.erta_mixed_input_path.parent
+                mixed_outputs = {
+                    path.resolve()
+                    for path in mixed_parent.glob("ERTA_*.xlsx")
+                } - self.erta_mixed_outputs_before
+                self._require(
+                    len(mixed_outputs) == 1,
+                    f"expected one fresh mixed ERTA workbook, found {len(mixed_outputs)}",
+                )
+                mixed_output = mixed_outputs.pop()
+                self._require(
+                    mixed_output.parent == mixed_parent
+                    and mixed_output.name.startswith(
+                        "ERTA_erta-mixed-input_"
+                    ),
+                    "mixed ERTA workbook path or filename prefix drift",
+                )
+                workbook = load_workbook(
+                    mixed_output,
+                    read_only=True,
+                    data_only=True,
+                )
+                try:
+                    sheet = workbook.active
+                    mixed_headers = [
+                        cell.value for cell in sheet[1]
+                    ]
+                    mixed_rows = list(
+                        sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    )
+                    self._require(
+                        sheet.title == "Sheet1",
+                        "legacy ERTA workbook sheet name drift",
+                    )
+                finally:
+                    workbook.close()
+                expected_headers = [
+                    "No.",
+                    "CAS",
+                    "Chemical Name",
+                    "SMILES",
+                    "Canonical_SMILES",
+                    "Mol_valid",
+                    "Probability_Negative_0",
+                    "Probability_Positive_1",
+                    "Prediction",
+                    "Prediction_label",
+                    "Decision_rule",
+                    *self.ERBA_BATCH_AD_COLUMNS,
+                    "PubChem_CID",
+                    "PubChem_status",
+                ]
+                self._require(
+                    mixed_headers == expected_headers,
+                    "legacy ERTA mixed workbook schema/order drift",
+                )
+                self._require(
+                    [row[0] for row in mixed_rows] == [2, 1, 3],
+                    "ERTA mixed batch input order drift",
+                )
+                self._require(
+                    mixed_rows[1][3] == self.MOCK_SMILES
+                    and mixed_rows[1][-1] == "Found",
+                    "mocked CAS mixed-batch row was not resolved",
+                )
+                self._require(
+                    mixed_rows[2][5] is False,
+                    "legacy invalid mixed-batch row lost its invalid marker",
+                )
+                mixed_graphs = sorted(
+                    path.name
+                    for path in (mixed_parent / "graphs").glob("*.png")
+                )
+                mixed_summary = app.batch_result.get(
+                    "1.0", "end"
+                ).strip()
+                self._require(
+                    mixed_graphs
+                    and f"Output workbook: {mixed_output}" in mixed_summary
+                    and "AD In-domain:" in mixed_summary
+                    and "Graph directory:" in mixed_summary,
+                    "ERTA mixed batch artifacts or completion summary are incomplete",
+                )
+                mixed_dialog = self._terminal_dialog(
+                    self.erta_mixed_dialog_count,
+                    kind="info",
+                    title="Batch prediction done",
+                    context="ERTA mixed batch success",
+                )
+                restored_controls = self._batch_control_states(app)
+                self._require(
+                    restored_controls
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    }
+                    and app.batch_progress_var.get()
+                    == "100% - 3/3 - Complete"
+                    and int(app.batch_progress_value.get()) == 100,
+                    "ERTA mixed batch did not restore controls and progress",
+                )
+                self._require(
+                    mixed_dialog["batch_controls_at_dialog"]["erta"]
+                    == restored_controls,
+                    "ERTA mixed-batch controls were not restored before its dialog",
+                )
+                self.erta_success_result_identity = id(
+                    app.last_batch_result
+                )
+                self._record(
+                    "erta_batch_workbook_graphs_and_order",
+                    input=str(self.erta_mixed_input_path),
+                    output=str(mixed_output),
+                    sheet=sheet.title,
+                    headers=mixed_headers,
+                    input_order=[row[0] for row in mixed_rows],
+                    mocked_cas_status=mixed_rows[1][-1],
+                    invalid_row_mol_valid=mixed_rows[2][5],
+                    graph_files=mixed_graphs,
+                    batch_summary=mixed_summary,
+                    progress=app.batch_progress_var.get(),
+                    controls_during_run=self.erta_mixed_locked_controls,
+                    controls=restored_controls,
+                    completion_dialog=mixed_dialog,
+                )
+                self.stage = 70
+            if self.stage == 70:
+                failure_input = self._make_corrupt_batch_input("erta")
+                self.erta_failure_input_path = failure_input
+                self.erta_failure_outputs_before = {
+                    path.resolve()
+                    for path in failure_input.parent.glob("ERTA_*.xlsx")
+                }
+                self.erta_failure_graphs_before = {
+                    path.resolve()
+                    for path in failure_input.parent.glob("graphs")
+                }
+                app.batch_input_var.set(str(failure_input))
+                app.batch_input_display_var.set(failure_input.name)
+                app.batch_destination_var.set(str(failure_input.parent))
+                self.erta_failure_dialog_count = len(self.dialogs)
+                app.batch_predict_clicked()
+                self.erta_failure_locked_controls = (
+                    self._batch_control_states(app)
+                )
+                self._require(
+                    app._batch_active
+                    and self.erta_failure_locked_controls
+                    == {
+                        "input": "disabled",
+                        "template": "disabled",
+                        "run": "disabled",
+                    },
+                    "ERTA deterministic failure did not start with locked controls",
+                )
+                self.stage = 71
+                self._reschedule()
+                return
+            if self.stage == 71:
+                if (
+                    app._batch_active
+                    or not self._wait_dialog(
+                        self.erta_failure_dialog_count
+                    )
+                ):
+                    self._reschedule()
+                    return
+                failure_dialog = self._terminal_dialog(
+                    self.erta_failure_dialog_count,
+                    kind="error",
+                    title="Batch prediction failed",
+                    context="ERTA deterministic batch failure",
+                )
+                failure_summary = app.batch_result.get(
+                    "1.0", "end"
+                ).strip()
+                new_outputs = {
+                    path.resolve()
+                    for path in self.erta_failure_input_path.parent.glob(
+                        "ERTA_*.xlsx"
+                    )
+                } - self.erta_failure_outputs_before
+                restored_controls = self._batch_control_states(app)
+                self._require(
+                    restored_controls
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    }
+                    and app.batch_progress_var.get()
+                    == "100% - 0/0 - Failed"
+                    and int(app.batch_progress_value.get()) == 100
+                    and app.status_var.get()
+                    in {"Error", "Batch prediction failed"}
+                    and failure_summary.startswith(
+                        "Batch prediction failed."
+                    )
+                    and "Batch prediction completed." not in failure_summary
+                    and "Output workbook:" not in failure_summary
+                    and not new_outputs
+                    and {
+                        path.resolve()
+                        for path in self.erta_failure_input_path.parent.glob(
+                            "graphs"
+                        )
+                    }
+                    == self.erta_failure_graphs_before
+                    and id(app.last_batch_result)
+                    == self.erta_success_result_identity
+                    and failure_dialog[
+                        "batch_controls_at_dialog"
+                    ]["erta"]
+                    == restored_controls,
+                    "ERTA failure exposed false success or did not restore controls",
+                )
+                self._record(
+                    "erta_batch_failure_dialog_and_control_recovery",
+                    input=str(self.erta_failure_input_path),
+                    fixture_kind="intentionally corrupt xlsx bytes",
+                    dialog=failure_dialog,
+                    controls_during_run=self.erta_failure_locked_controls,
+                    controls=restored_controls,
+                    progress=app.batch_progress_var.get(),
+                    status=app.status_var.get(),
+                    result=failure_summary,
+                    fresh_outputs=[],
+                    fresh_graph_directories=[],
+                    success_dialog_emitted=False,
+                    prior_success_result_retained=True,
+                )
                 app.notebook.select(tab)
                 self.stage = 8
             if self.stage == 8:
@@ -1667,15 +2637,9 @@ class NativePackageQa:
                 tab.notebook.select(tab.batch_tab)
                 tab.batch_task_var.set(ERBATask.CLASSIFICATION.value)
                 tab.batch_subtype_var.set(ERBASubtype.ER_ALPHA.value)
-                input_path = self.root / "erba-alpha-batch-input.xlsx"
-                workbook = Workbook()
-                sheet = workbook.active
-                sheet.title = "Original_Input"
-                sheet.append(["Row_ID", "SMILES", "Analyst_Note"])
-                sheet.append(["native-valid", "Oc1ccccc1", "preserve-valid"])
-                sheet.append(["native-invalid", "[*]CC", "preserve-invalid"])
-                workbook.save(input_path)
-                self.erba_batch_input_path = input_path.resolve()
+                self.erba_batch_input_path = (
+                    self._copy_shared_example_for_batch("eralpha")
+                )
                 input_parent = self.erba_batch_input_path.parent
                 self.erba_batch_outputs_before = {
                     path.resolve()
@@ -1691,17 +2655,36 @@ class NativePackageQa:
                     if path.is_dir()
                 }
                 tab.batch_input_var.set(str(self.erba_batch_input_path))
+                tab.batch_input_display_var.set(
+                    self.erba_batch_input_path.name
+                )
                 tab.batch_destination_var.set(str(input_parent))
+                self.erba_batch_dialog_count = len(self.dialogs)
                 tab.batch_predict_clicked()
+                self.erba_success_locked_controls = (
+                    self._batch_control_states(tab)
+                )
                 self._require(
-                    tab._active_batch_request_id is not None,
-                    f"ERalpha batch callback did not start: {tab.batch_status_var.get()}",
+                    tab._active_batch_request_id is not None
+                    and self.erba_success_locked_controls
+                    == {
+                        "input": "disabled",
+                        "template": "disabled",
+                        "run": "disabled",
+                    },
+                    "ERalpha shared-example batch did not start with locked "
+                    f"controls: {tab.batch_status_var.get()}",
                 )
                 self.stage = 13
                 self._reschedule()
                 return
             if self.stage == 13:
-                if tab._active_batch_request_id is not None:
+                if (
+                    tab._active_batch_request_id is not None
+                    or not self._wait_dialog(
+                        self.erba_batch_dialog_count
+                    )
+                ):
                     self._reschedule()
                     return
                 self._require(
@@ -1747,59 +2730,110 @@ class NativePackageQa:
                     "ERalpha batch graphs are incomplete or outside the input parent",
                 )
 
-                workbook = load_workbook(output, read_only=True, data_only=True)
-                sheet_names = workbook.sheetnames
-                self._require(
-                    sheet_names == ["Predictions", "Guide", "Input", "Metadata"]
-                    and workbook.active.title == "Predictions",
-                    "ERalpha batch workbook is not Predictions-first and active",
+                workbook = load_workbook(
+                    output,
+                    read_only=True,
+                    data_only=True,
                 )
-                prediction_sheet = workbook["Predictions"]
-                prediction_headers = [cell.value for cell in prediction_sheet[1]]
-                self._require(
-                    all(column in prediction_headers for column in self.ERBA_BATCH_AD_COLUMNS),
-                    "ERalpha batch workbook is missing applicability-domain columns",
-                )
-                prediction_rows = [
-                    dict(zip(prediction_headers, row))
-                    for row in prediction_sheet.iter_rows(min_row=2, values_only=True)
-                ]
-                self._require(
-                    len(prediction_rows) == 2
-                    and prediction_rows[0]["Analyst_Note"] == "preserve-valid"
-                    and prediction_rows[1]["Analyst_Note"] == "preserve-invalid",
-                    "ERalpha primary predictions did not retain safe input fields and row order",
-                )
-                self._require(
-                    prediction_rows[0]["Result_Status"] == "Predicted"
-                    and prediction_rows[0]["AD"] in {"In-domain", "Out-of-domain"}
-                    and prediction_rows[1]["Result_Status"] == "Not predicted"
-                    and all(
-                        prediction_rows[1][column] is None
-                        for column in self.ERBA_BATCH_AD_COLUMNS
-                    ),
-                    "ERalpha prediction/AD row mapping is incorrect",
-                )
+                try:
+                    sheet_names = workbook.sheetnames
+                    self._require(
+                        sheet_names
+                        == ["Predictions", "Guide", "Input", "Metadata"]
+                        and workbook.active.title == "Predictions",
+                        "ERalpha batch workbook is not Predictions-first and active",
+                    )
+                    prediction_sheet = workbook["Predictions"]
+                    prediction_headers = [
+                        cell.value for cell in prediction_sheet[1]
+                    ]
+                    self._require(
+                        all(
+                            column in prediction_headers
+                            for column in self.ERBA_BATCH_AD_COLUMNS
+                        ),
+                        "ERalpha batch workbook is missing applicability-domain columns",
+                    )
+                    prediction_rows = [
+                        dict(zip(prediction_headers, row))
+                        for row in prediction_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    ]
+                    input_sheet = workbook["Input"]
+                    input_headers = [
+                        cell.value for cell in input_sheet[1]
+                    ]
+                    input_rows = list(
+                        input_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    )
+                    guide_sheet = workbook["Guide"]
+                    guide_rows = list(
+                        guide_sheet.iter_rows(values_only=True)
+                    )
+                    metadata_sheet = workbook["Metadata"]
+                    metadata_headers = [
+                        cell.value for cell in metadata_sheet[1]
+                    ]
+                    metadata_values = [
+                        cell.value
+                        for cell in next(
+                            metadata_sheet.iter_rows(
+                                min_row=2,
+                                max_row=2,
+                            )
+                        )
+                    ]
+                    metadata = dict(
+                        zip(metadata_headers, metadata_values)
+                    )
+                finally:
+                    workbook.close()
 
-                input_sheet = workbook["Input"]
-                input_headers = [cell.value for cell in input_sheet[1]]
-                input_rows = list(input_sheet.iter_rows(min_row=2, values_only=True))
+                expected_cas = _read_shared_example_workbook(
+                    self.erba_batch_input_path
+                )["cas_values"]
                 self._require(
-                    input_headers == ["Row_ID", "SMILES", "Analyst_Note"]
+                    input_headers == ["CARSRN"]
                     and input_rows
-                    == [
-                        ("native-valid", "Oc1ccccc1", "preserve-valid"),
-                        ("native-invalid", "[*]CC", "preserve-invalid"),
-                    ],
-                    "ERalpha Input sheet did not preserve the supplied input",
+                    == [(cas,) for cas in expected_cas]
+                    and len(input_rows) == 25,
+                    "ERalpha Input sheet did not preserve the supplied CARSRN workbook",
+                )
+                self._require(
+                    len(prediction_rows) == 25
+                    and [str(row["CARSRN"]) for row in prediction_rows]
+                    == expected_cas
+                    and [str(row["CAS"]) for row in prediction_rows]
+                    == expected_cas,
+                    "ERalpha primary predictions lost CARSRN input order or CAS alias mapping",
+                )
+                self._require(
+                    all(
+                        row["Result_Status"] == "Predicted"
+                        and row["binding_label"]
+                        in {"binding", "non_binding"}
+                        and row["non_binding_probability"] is not None
+                        and row["binding_probability"] is not None
+                        and row["AD"] in {"In-domain", "Out-of-domain"}
+                        for row in prediction_rows
+                    ),
+                    "ERalpha shared CARSRN example did not yield 25 nonblank predictions",
+                )
+                self._require(
+                    guide_rows
+                    and guide_rows[0] == ("Topic", "Details")
+                    and any(
+                        row[0] == "ERalpha batch prediction guide"
+                        for row in guide_rows[1:]
+                    ),
+                    "ERalpha Guide sheet content is missing",
                 )
 
-                metadata_sheet = workbook["Metadata"]
-                metadata_headers = [cell.value for cell in metadata_sheet[1]]
-                metadata_values = [
-                    cell.value for cell in next(metadata_sheet.iter_rows(min_row=2, max_row=2))
-                ]
-                metadata = dict(zip(metadata_headers, metadata_values))
                 expected_spec = tab.catalog[
                     (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA)
                 ]
@@ -1820,7 +2854,6 @@ class NativePackageQa:
                     ),
                     "ERalpha batch metadata did not preserve catalog model provenance",
                 )
-                workbook.close()
 
                 binding_count = sum(
                     row["binding_label"] == "binding" for row in prediction_rows
@@ -1830,6 +2863,11 @@ class NativePackageQa:
                 )
                 not_predicted_count = sum(
                     row["Result_Status"] != "Predicted" for row in prediction_rows
+                )
+                self._require(
+                    binding_count + non_binding_count == 25
+                    and not_predicted_count == 0,
+                    "ERalpha shared example contains blank or not-predicted results",
                 )
                 summary = tab.batch_result.get("1.0", "end").strip()
                 self._require(
@@ -1843,13 +2881,54 @@ class NativePackageQa:
                     and f"Graph directory: {graph_directory}" in summary,
                     "ERalpha batch completion did not expose binding and artifact summaries",
                 )
+                completion_dialog = self._terminal_dialog(
+                    self.erba_batch_dialog_count,
+                    kind="info",
+                    title="Batch prediction done",
+                    context="ERalpha shared-example batch success",
+                )
+                self._require(
+                    str(output) in completion_dialog["message"]
+                    and "Not predicted: 0" in completion_dialog["message"]
+                    and completion_dialog[
+                        "batch_controls_at_dialog"
+                    ]["eralpha"]
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    },
+                    "ERalpha success dialog does not report the complete publication",
+                )
+                restored_controls = self._batch_control_states(tab)
+                self._require(
+                    restored_controls
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    }
+                    and tab.batch_progress_var.get()
+                    == "100% - 25/25 - Completed"
+                    and int(tab.batch_progress_value.get()) == 100,
+                    "ERalpha batch controls were not restored after success",
+                )
+                self._require(
+                    self.erta_batch_output_path is not None,
+                    "ERTA primary workbook is unavailable for style comparison",
+                )
+                formatting_parity = compare_plain_primary_workbook_formatting(
+                    self.erta_batch_output_path,
+                    output,
+                )
                 self._record(
-                    "erba_eralpha_batch_workbook_ad_graphs_and_summary",
+                    "eralpha_shared_test_batch_success_dialog_and_predictions",
                     input=str(self.erba_batch_input_path),
                     output=str(output),
                     sheets=sheet_names,
                     prediction_headers=prediction_headers,
                     preserved_input_rows=[list(row) for row in input_rows],
+                    input_header="CARSRN",
                     metadata=metadata,
                     graph_directory=str(graph_directory),
                     graph_files=sorted(graph_files),
@@ -1857,6 +2936,466 @@ class NativePackageQa:
                     non_binding_count=non_binding_count,
                     not_predicted_count=not_predicted_count,
                     batch_summary=summary,
+                    progress=tab.batch_progress_var.get(),
+                    completion_dialog=completion_dialog,
+                    controls_during_run=self.erba_success_locked_controls,
+                    controls=restored_controls,
+                    plain_primary_formatting=formatting_parity,
+                    deterministic_smiles_substitution=self.MOCK_SMILES,
+                    source_bytes_preserved=(
+                        _sha256_path(self.qa_shared_example_path)
+                        == self.shared_bundle_sha256
+                    ),
+                )
+                self.stage = 132
+            if self.stage == 132:
+                mixed_directory = (
+                    self.run_root / "mixed-batch" / "eralpha"
+                )
+                mixed_directory.mkdir(parents=True, exist_ok=False)
+                mixed_input = (
+                    mixed_directory / "erba-alpha-batch-input.xlsx"
+                )
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.title = "Original_Input"
+                sheet.append(["Row_ID", "SMILES", "Analyst_Note"])
+                sheet.append(
+                    ["native-valid", "Oc1ccccc1", "preserve-valid"]
+                )
+                sheet.append(
+                    ["native-invalid", "[*]CC", "preserve-invalid"]
+                )
+                workbook.save(mixed_input)
+                workbook.close()
+                self.erba_mixed_input_path = mixed_input.resolve(
+                    strict=True
+                )
+                self.erba_mixed_outputs_before = {
+                    path.resolve()
+                    for path in mixed_directory.glob(
+                        "ERBA_classification_er_alpha_results*.xlsx"
+                    )
+                }
+                self.erba_mixed_graph_dirs_before = {
+                    path.resolve()
+                    for path in mixed_directory.glob(
+                        "ERBA_classification_er_alpha_results*_graphs*"
+                    )
+                    if path.is_dir()
+                }
+                tab.batch_input_var.set(str(self.erba_mixed_input_path))
+                tab.batch_input_display_var.set(
+                    self.erba_mixed_input_path.name
+                )
+                tab.batch_destination_var.set(str(mixed_directory))
+                self.erba_mixed_dialog_count = len(self.dialogs)
+                tab.batch_predict_clicked()
+                self.erba_mixed_locked_controls = (
+                    self._batch_control_states(tab)
+                )
+                self._require(
+                    tab._active_batch_request_id is not None
+                    and self.erba_mixed_locked_controls
+                    == {
+                        "input": "disabled",
+                        "template": "disabled",
+                        "run": "disabled",
+                    },
+                    "ERalpha mixed batch did not start with locked controls",
+                )
+                self.stage = 133
+                self._reschedule()
+                return
+            if self.stage == 133:
+                if (
+                    tab._active_batch_request_id is not None
+                    or not self._wait_dialog(
+                        self.erba_mixed_dialog_count
+                    )
+                ):
+                    self._reschedule()
+                    return
+                mixed_parent = self.erba_mixed_input_path.parent
+                mixed_outputs = {
+                    path.resolve()
+                    for path in mixed_parent.glob(
+                        "ERBA_classification_er_alpha_results*.xlsx"
+                    )
+                } - self.erba_mixed_outputs_before
+                self._require(
+                    len(mixed_outputs) == 1,
+                    "expected one new ERalpha mixed-result workbook, found "
+                    f"{len(mixed_outputs)}: {tab.batch_status_var.get()}",
+                )
+                mixed_output = mixed_outputs.pop()
+                self._require(
+                    mixed_output.parent == mixed_parent
+                    and tab.batch_destination_var.get()
+                    == str(mixed_parent),
+                    "ERalpha mixed workbook destination is not its input parent",
+                )
+                mixed_graph_dirs = {
+                    path.resolve()
+                    for path in mixed_parent.glob(
+                        "ERBA_classification_er_alpha_results*_graphs*"
+                    )
+                    if path.is_dir()
+                } - self.erba_mixed_graph_dirs_before
+                self._require(
+                    len(mixed_graph_dirs) == 1,
+                    "expected one new ERalpha mixed graph directory, found "
+                    f"{len(mixed_graph_dirs)}",
+                )
+                mixed_graph_directory = mixed_graph_dirs.pop()
+                mixed_graph_files = {
+                    path.name
+                    for path in mixed_graph_directory.iterdir()
+                    if path.is_file()
+                }
+                self._require(
+                    mixed_graph_directory.parent == mixed_parent
+                    and mixed_graph_files
+                    == self.ERBA_BATCH_GRAPH_FILES,
+                    "ERalpha mixed-batch graphs are incomplete or misplaced",
+                )
+                workbook = load_workbook(
+                    mixed_output,
+                    read_only=True,
+                    data_only=True,
+                )
+                try:
+                    sheet_names = workbook.sheetnames
+                    self._require(
+                        sheet_names
+                        == ["Predictions", "Guide", "Input", "Metadata"]
+                        and workbook.active.title == "Predictions",
+                        "ERalpha mixed workbook is not Predictions-first and active",
+                    )
+                    prediction_sheet = workbook["Predictions"]
+                    prediction_headers = [
+                        cell.value for cell in prediction_sheet[1]
+                    ]
+                    prediction_rows = [
+                        dict(zip(prediction_headers, row))
+                        for row in prediction_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    ]
+                    input_sheet = workbook["Input"]
+                    input_headers = [
+                        cell.value for cell in input_sheet[1]
+                    ]
+                    input_rows = list(
+                        input_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    )
+                    guide_rows = list(
+                        workbook["Guide"].iter_rows(values_only=True)
+                    )
+                    metadata_sheet = workbook["Metadata"]
+                    metadata_headers = [
+                        cell.value for cell in metadata_sheet[1]
+                    ]
+                    metadata_values = [
+                        cell.value
+                        for cell in next(
+                            metadata_sheet.iter_rows(
+                                min_row=2,
+                                max_row=2,
+                            )
+                        )
+                    ]
+                    metadata = dict(
+                        zip(metadata_headers, metadata_values)
+                    )
+                finally:
+                    workbook.close()
+                self._require(
+                    all(
+                        column in prediction_headers
+                        for column in self.ERBA_BATCH_AD_COLUMNS
+                    ),
+                    "ERalpha mixed workbook is missing AD columns",
+                )
+                self._require(
+                    len(prediction_rows) == 2
+                    and prediction_rows[0]["Analyst_Note"]
+                    == "preserve-valid"
+                    and prediction_rows[1]["Analyst_Note"]
+                    == "preserve-invalid",
+                    "ERalpha mixed Predictions lost passthrough fields or order",
+                )
+                self._require(
+                    prediction_rows[0]["Result_Status"] == "Predicted"
+                    and prediction_rows[0]["AD"]
+                    in {"In-domain", "Out-of-domain"}
+                    and prediction_rows[1]["Result_Status"]
+                    == "Not predicted"
+                    and prediction_rows[1]["Reason_Category"]
+                    == "Invalid or ambiguous SMILES"
+                    and prediction_rows[1]["Reason_Description"]
+                    and prediction_rows[1]["Recommended_Action"]
+                    and prediction_rows[1][
+                        "non_binding_probability"
+                    ]
+                    is None
+                    and prediction_rows[1]["binding_probability"]
+                    is None
+                    and prediction_rows[1]["binding_label"] is None
+                    and all(
+                        prediction_rows[1][column] is None
+                        for column in self.ERBA_BATCH_AD_COLUMNS
+                    ),
+                    "ERalpha mixed predicted/not-predicted row mapping is incorrect",
+                )
+                self._require(
+                    input_headers
+                    == ["Row_ID", "SMILES", "Analyst_Note"]
+                    and input_rows
+                    == [
+                        (
+                            "native-valid",
+                            "Oc1ccccc1",
+                            "preserve-valid",
+                        ),
+                        (
+                            "native-invalid",
+                            "[*]CC",
+                            "preserve-invalid",
+                        ),
+                    ],
+                    "ERalpha mixed Input sheet did not preserve exact source rows",
+                )
+                self._require(
+                    any(
+                        row[0] == "Not predicted rows"
+                        and row[1] == "1"
+                        for row in guide_rows
+                    )
+                    and any(
+                        row[0]
+                        == "Reason: Invalid or ambiguous SMILES"
+                        and row[1] == "1"
+                        for row in guide_rows
+                    ),
+                    "ERalpha mixed Guide does not explain the not-predicted row",
+                )
+                expected_spec = tab.catalog[
+                    (ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA)
+                ]
+                hex_digits = set("0123456789abcdef")
+                self._require(
+                    metadata.get("Excel_Contract_ID")
+                    == ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID
+                    and metadata.get("Model_ID")
+                    == expected_spec.model_id
+                    and metadata.get("Model_SHA256")
+                    == expected_spec.sha256
+                    and metadata.get("Performance_Evidence_Scope")
+                    == "internal_historically_exposed"
+                    and bool(metadata.get("Evidence_Caveat"))
+                    and all(
+                        isinstance(metadata.get(column), str)
+                        and len(metadata[column]) == 64
+                        and set(metadata[column]) <= hex_digits
+                        for column in self.ERBA_PROVENANCE_COLUMNS
+                    ),
+                    "ERalpha mixed Metadata lost catalog provenance",
+                )
+                binding_count = sum(
+                    row["binding_label"] == "binding"
+                    for row in prediction_rows
+                )
+                non_binding_count = sum(
+                    row["binding_label"] == "non_binding"
+                    for row in prediction_rows
+                )
+                not_predicted_count = sum(
+                    row["Result_Status"] != "Predicted"
+                    for row in prediction_rows
+                )
+                mixed_summary = tab.batch_result.get(
+                    "1.0", "end"
+                ).strip()
+                self._require(
+                    tab.batch_status_var.get()
+                    == f"ERBA batch complete: {mixed_output}"
+                    and f"Total rows: {len(prediction_rows)}"
+                    in mixed_summary
+                    and f"Binding: {binding_count}" in mixed_summary
+                    and f"Non-binding: {non_binding_count}"
+                    in mixed_summary
+                    and "Not predicted: 1" in mixed_summary
+                    and f"Output workbook: {mixed_output}"
+                    in mixed_summary
+                    and f"Graph files: {len(mixed_graph_files)}"
+                    in mixed_summary
+                    and f"Graph directory: {mixed_graph_directory}"
+                    in mixed_summary,
+                    "ERalpha mixed completion summary is incomplete",
+                )
+                warning_dialog = self._terminal_dialog(
+                    self.erba_mixed_dialog_count,
+                    kind="warning",
+                    title="Batch prediction completed with warnings",
+                    context="ERalpha mixed batch partial success",
+                )
+                restored_controls = self._batch_control_states(tab)
+                self._require(
+                    "Not predicted: 1" in warning_dialog["message"]
+                    and restored_controls
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    }
+                    and tab.batch_progress_var.get()
+                    == "100% - 2/2 - Completed"
+                    and int(tab.batch_progress_value.get()) == 100
+                    and warning_dialog[
+                        "batch_controls_at_dialog"
+                    ]["eralpha"]
+                    == restored_controls,
+                    "ERalpha mixed warning or control-restoration contract drift",
+                )
+                self._record(
+                    "erba_eralpha_batch_workbook_ad_graphs_and_summary",
+                    input=str(self.erba_mixed_input_path),
+                    output=str(mixed_output),
+                    sheets=sheet_names,
+                    prediction_headers=prediction_headers,
+                    preserved_input_rows=[
+                        list(row) for row in input_rows
+                    ],
+                    metadata=metadata,
+                    graph_directory=str(mixed_graph_directory),
+                    graph_files=sorted(mixed_graph_files),
+                    binding_count=binding_count,
+                    non_binding_count=non_binding_count,
+                    not_predicted_count=not_predicted_count,
+                    invalid_reason_category=prediction_rows[1][
+                        "Reason_Category"
+                    ],
+                    batch_summary=mixed_summary,
+                    completion_dialog=warning_dialog,
+                    progress=tab.batch_progress_var.get(),
+                    controls_during_run=self.erba_mixed_locked_controls,
+                    controls=restored_controls,
+                )
+                self.stage = 130
+            if self.stage == 130:
+                failure_input = self._make_corrupt_batch_input("eralpha")
+                self.erba_failure_input_path = failure_input
+                self.erba_failure_outputs_before = {
+                    path.resolve()
+                    for path in failure_input.parent.glob(
+                        "ERBA_classification_er_alpha_results*.xlsx"
+                    )
+                }
+                self.erba_failure_graph_dirs_before = {
+                    path.resolve()
+                    for path in failure_input.parent.glob(
+                        "ERBA_classification_er_alpha_results*_graphs*"
+                    )
+                    if path.is_dir()
+                }
+                tab.batch_input_var.set(str(failure_input))
+                tab.batch_input_display_var.set(failure_input.name)
+                tab.batch_destination_var.set(str(failure_input.parent))
+                self.erba_failure_dialog_count = len(self.dialogs)
+                tab.batch_predict_clicked()
+                self.erba_failure_locked_controls = (
+                    self._batch_control_states(tab)
+                )
+                self._require(
+                    tab._active_batch_request_id is not None
+                    and self.erba_failure_locked_controls
+                    == {
+                        "input": "disabled",
+                        "template": "disabled",
+                        "run": "disabled",
+                    },
+                    "ERalpha deterministic failure did not start with locked controls",
+                )
+                self.stage = 131
+                self._reschedule()
+                return
+            if self.stage == 131:
+                if (
+                    tab._active_batch_request_id is not None
+                    or not self._wait_dialog(
+                        self.erba_failure_dialog_count
+                    )
+                ):
+                    self._reschedule()
+                    return
+                failure_dialog = self._terminal_dialog(
+                    self.erba_failure_dialog_count,
+                    kind="error",
+                    title="Batch prediction failed",
+                    context="ERalpha deterministic batch failure",
+                )
+                failure_summary = tab.batch_result.get(
+                    "1.0", "end"
+                ).strip()
+                new_outputs = {
+                    path.resolve()
+                    for path in self.erba_failure_input_path.parent.glob(
+                        "ERBA_classification_er_alpha_results*.xlsx"
+                    )
+                } - self.erba_failure_outputs_before
+                new_graph_directories = {
+                    path.resolve()
+                    for path in self.erba_failure_input_path.parent.glob(
+                        "ERBA_classification_er_alpha_results*_graphs*"
+                    )
+                    if path.is_dir()
+                } - self.erba_failure_graph_dirs_before
+                restored_controls = self._batch_control_states(tab)
+                self._require(
+                    restored_controls
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    }
+                    and tab.batch_progress_var.get()
+                    == "100% - 0/0 - Failed"
+                    and int(tab.batch_progress_value.get()) == 100
+                    and tab.batch_status_var.get().startswith(
+                        "ERBA batch failed:"
+                    )
+                    and failure_summary.startswith(
+                        "Batch prediction failed."
+                    )
+                    and "ERalpha batch prediction completed."
+                    not in failure_summary
+                    and "Output workbook:" not in failure_summary
+                    and not new_outputs
+                    and not new_graph_directories
+                    and failure_dialog[
+                        "batch_controls_at_dialog"
+                    ]["eralpha"]
+                    == restored_controls,
+                    "ERalpha failure exposed false success or did not restore controls",
+                )
+                self._record(
+                    "eralpha_batch_failure_dialog_and_control_recovery",
+                    input=str(self.erba_failure_input_path),
+                    fixture_kind="intentionally corrupt xlsx bytes",
+                    dialog=failure_dialog,
+                    controls_during_run=self.erba_failure_locked_controls,
+                    controls=restored_controls,
+                    progress=tab.batch_progress_var.get(),
+                    status=tab.batch_status_var.get(),
+                    result=failure_summary,
+                    fresh_outputs=[],
+                    fresh_graph_directories=[],
+                    success_dialog_emitted=False,
                 )
                 self.stage = 14
             if self.stage == 14:
@@ -1887,12 +3426,87 @@ class NativePackageQa:
                 self._require(app.prediction_summary_var.get() != self.erta_summary or app.active_probability_var.get() != self.erta_probability, "ERTA state was not independently updated after CAS journey")
                 self._require(app.last_batch_result is not None and app.notebook.tab(app.notebook.select(), "text") == "ERTA", "ERTA batch state lost after ERBA journey")
                 self._record("erta_erba_erta_state_isolation", erta_summary_after_return=app.prediction_summary_var.get(), erta_probability_after_return=app.active_probability_var.get(), erba_result_retained=bool(self._body(app.eralpha_tab)), erta_batch_rows=len(app.last_batch_result))
+                self._require(
+                    self.shared_default_path is not None
+                    and self.shared_default_path.is_file()
+                    and _sha256_path(self.shared_default_path)
+                    == self.shared_default_sha256,
+                    "native QA changed the resolved shared default workbook",
+                )
+                self._require(
+                    self.shared_bundle_path is not None
+                    and self.shared_bundle_path.is_file()
+                    and _sha256_path(self.shared_bundle_path)
+                    == self.shared_bundle_sha256
+                    and self.qa_shared_example_path is not None
+                    and _sha256_path(self.qa_shared_example_path)
+                    == self.shared_bundle_sha256
+                    and self.erta_batch_input_path is not None
+                    and _sha256_path(self.erta_batch_input_path)
+                    == self.shared_bundle_sha256
+                    and self.erba_batch_input_path is not None
+                    and _sha256_path(self.erba_batch_input_path)
+                    == self.shared_bundle_sha256,
+                    "bundled test.xlsx or a QA input copy changed during prediction",
+                )
                 self._record(
                     "read_only_install_and_writable_state",
                     resource_root=str(app.project_root),
                     output_root=str(app.output_root),
                     state_root=str(app.state_root),
+                    qa_run_root=str(self.run_root),
+                    shared_example={
+                        "resolved_default": str(self.shared_default_path),
+                        "resolved_default_sha256": self.shared_default_sha256,
+                        "resolved_default_bytes_unchanged": True,
+                        "bundled_source": str(self.shared_bundle_path),
+                        "bundled_sha256": self.shared_bundle_sha256,
+                        "bundled_bytes_unchanged": True,
+                        "fresh_first_run_copy": str(
+                            self.qa_shared_example_path
+                        ),
+                        "erta_batch_copy": str(
+                            self.erta_batch_input_path
+                        ),
+                        "eralpha_batch_copy": str(
+                            self.erba_batch_input_path
+                        ),
+                        "all_qa_copies_byte_match_bundle": True,
+                    },
                 )
+                check_names = [
+                    receipt["check"]
+                    for receipt in self.transcript["checks"]
+                ]
+                required_checks = (
+                    self.BASELINE_CHECKS
+                    | self.SHARED_EXAMPLE_BATCH_CHECKS
+                    | self.BATCH_FEEDBACK_CHECKS
+                )
+                self._require(
+                    required_checks <= set(check_names)
+                    and len(self.BASELINE_CHECKS) == 22
+                    and len(check_names)
+                    == 26 + int(bool(self.external_driver_gate)),
+                    "native QA check inventory does not retain the 22 baseline "
+                    "checks plus shared-example and batch-failure contracts",
+                )
+                self.transcript["check_contract"] = {
+                    "baseline_check_count": 22,
+                    "baseline_checks": sorted(self.BASELINE_CHECKS),
+                    "added_shared_example_batch_check_count": 2,
+                    "added_shared_example_batch_checks": sorted(
+                        self.SHARED_EXAMPLE_BATCH_CHECKS
+                    ),
+                    "added_batch_feedback_check_count": 2,
+                    "added_batch_feedback_checks": sorted(
+                        self.BATCH_FEEDBACK_CHECKS
+                    ),
+                    "external_driver_check_present": bool(
+                        self.external_driver_gate
+                    ),
+                    "total_check_count": len(check_names),
+                }
                 app.deiconify()
                 app.state("normal")
                 app.update()

@@ -214,8 +214,13 @@ class GuiContractTests(unittest.TestCase):
             self.assertTrue(second.exists())
             self.assertNotEqual(first, second)
 
-    def test_both_endpoints_use_and_independently_restore_the_erta_example(self):
-        example = load_shared_example_input(Path.cwd())
+    def test_both_endpoints_use_and_independently_restore_the_shared_example(self):
+        workbook = Path("templates/test.xlsx").resolve()
+        with patch(
+            "gui.erba_tab.resolve_shared_example_input",
+            return_value=workbook,
+        ):
+            example = load_shared_example_input(Path.cwd())
         source = pd.read_excel(
             example.workbook,
             sheet_name=0,
@@ -223,10 +228,17 @@ class GuiContractTests(unittest.TestCase):
             dtype=str,
             keep_default_na=False,
         )
-        self.assertEqual(example.cas, source.loc[0, "CAS"])
-        self.assertEqual(example.smiles, source.loc[0, "SMILES"])
+        cas_header = next(
+            header
+            for header in ("CAS", "CARSRN", "CASRN")
+            if header in source.columns
+        )
+        self.assertEqual(example.cas, source.loc[0, cas_header])
+        expected_smiles = (
+            source.loc[0, "SMILES"] if "SMILES" in source.columns else ""
+        )
+        self.assertEqual(example.smiles, expected_smiles)
         self.assertTrue(example.cas)
-        self.assertTrue(example.smiles)
 
         class Variable:
             def __init__(self, value=""):
@@ -246,6 +258,9 @@ class GuiContractTests(unittest.TestCase):
             endpoint.example_workbook = example.workbook
             endpoint.cas_var = Variable("changed-cas")
             endpoint.smiles_var = Variable("changed-smiles")
+            endpoint.batch_input_var = Variable("changed-input")
+            endpoint.batch_input_display_var = Variable("changed.xlsx")
+            endpoint.batch_destination_var = Variable("changed-destination")
         erta.set_status = lambda _text: None
         eralpha.single_status_var = Variable()
 
@@ -260,18 +275,99 @@ class GuiContractTests(unittest.TestCase):
             (eralpha.cas_var.get(), eralpha.smiles_var.get()),
             (example.cas, example.smiles),
         )
+        for endpoint in (erta, eralpha):
+            self.assertEqual(
+                endpoint.batch_input_var.get(),
+                str(example.workbook),
+            )
+            self.assertEqual(
+                endpoint.batch_input_display_var.get(),
+                example.workbook.name,
+            )
+            self.assertEqual(
+                endpoint.batch_destination_var.get(),
+                str(example.workbook.resolve().parent),
+            )
         erta.cas_var.set("ERTA-only")
         self.assertEqual(eralpha.cas_var.get(), example.cas)
         main_source = Path("gui/main_window.py").read_text(encoding="utf-8")
         eralpha_source = Path("gui/erba_tab.py").read_text(encoding="utf-8")
         self.assertIn(
-            "self.batch_input_var = tk.StringVar(value=str(self.example_workbook))",
+            "self.batch_input_var = tk.StringVar(value=example_path)",
             main_source,
         )
         self.assertIn(
-            "self.batch_input_var = tk.StringVar(value=str(self.example_workbook))",
+            "self.batch_input_var = tk.StringVar(value=example_path)",
             eralpha_source,
         )
+
+    def test_source_run_derives_the_user_example_sibling_without_a_fixed_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            project_root = parent / "ER_Predictor_Code"
+            project_root.mkdir()
+            workbook = parent / "ER_Predictor" / "test.xlsx"
+            workbook.parent.mkdir()
+            pd.DataFrame({"CARSRN": ["50-00-0"]}).to_excel(
+                workbook,
+                index=False,
+            )
+
+            with patch(
+                "gui.erba_tab.resolve_shared_example_input",
+                return_value=workbook,
+            ) as resolve:
+                example = load_shared_example_input(project_root)
+
+        resolve.assert_called_once_with(workbook)
+        self.assertEqual(example.workbook, workbook)
+        self.assertEqual(example.cas, "50-00-0")
+        self.assertEqual(example.smiles, "")
+
+    def test_unavailable_shared_example_is_recoverable_without_fallback_chemistry(self):
+        with patch(
+            "gui.erba_tab.resolve_shared_example_input",
+            side_effect=RuntimeError("Examples/test.xlsx is not writable"),
+        ):
+            example = load_shared_example_input(Path.cwd())
+
+        self.assertIsNone(example.workbook)
+        self.assertEqual((example.cas, example.smiles), ("", ""))
+        self.assertIn("Examples/test.xlsx is not writable", example.error)
+
+        class Variable:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        erta = MainWindow.__new__(MainWindow)
+        erta.example_workbook = None
+        erta.example_error = example.error
+        erta.cas_var = Variable("manual-cas")
+        erta.smiles_var = Variable("manual-smiles")
+        erta_status = []
+        erta.set_status = erta_status.append
+
+        eralpha = ErbaTab.__new__(ErbaTab)
+        eralpha.example_workbook = None
+        eralpha.example_error = example.error
+        eralpha.cas_var = Variable("manual-cas")
+        eralpha.smiles_var = Variable("manual-smiles")
+        eralpha.single_status_var = Variable()
+
+        erta.load_example_input()
+        eralpha.load_example_input()
+
+        for endpoint in (erta, eralpha):
+            self.assertEqual(endpoint.cas_var.get(), "manual-cas")
+            self.assertEqual(endpoint.smiles_var.get(), "manual-smiles")
+        self.assertIn(example.error, erta_status[-1])
+        self.assertIn(example.error, eralpha.single_status_var.get())
 
 
 
@@ -978,6 +1074,97 @@ class ErbaExcelContractTests(unittest.TestCase):
             ERBA_BINDING_CLASSIFICATION_EXCEL_CONTRACT_ID,
             "erba.binding.classification.excel.v2",
         )
+
+    def test_every_export_sheet_uses_the_same_plain_style_as_erta_pandas_output(self):
+        def color_signature(color):
+            if color is None:
+                return None
+            return (
+                color.type,
+                color.rgb if color.type == "rgb" else None,
+                color.indexed if color.type == "indexed" else None,
+                color.theme if color.type == "theme" else None,
+                color.tint,
+            )
+
+        def side_signature(side):
+            return side.style, color_signature(side.color)
+
+        def style_signature(cell):
+            return (
+                (
+                    cell.font.name,
+                    cell.font.sz,
+                    cell.font.bold,
+                    cell.font.italic,
+                    cell.font.underline,
+                    color_signature(cell.font.color),
+                ),
+                (
+                    cell.fill.fill_type,
+                    color_signature(cell.fill.fgColor),
+                    color_signature(cell.fill.bgColor),
+                ),
+                (
+                    cell.alignment.horizontal,
+                    cell.alignment.vertical,
+                    cell.alignment.wrap_text,
+                    cell.alignment.shrink_to_fit,
+                    cell.alignment.text_rotation,
+                ),
+                (
+                    side_signature(cell.border.left),
+                    side_signature(cell.border.right),
+                    side_signature(cell.border.top),
+                    side_signature(cell.border.bottom),
+                ),
+                cell.number_format,
+            )
+
+        frame = pd.DataFrame([["row", "CCO"]], columns=["Row_ID", "SMILES"])
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "gui.erba_tab.save_erba_batch_graphs",
+            return_value=((), None),
+        ):
+            export_result = export_erba_batch(
+                self._input(directory, frame),
+                ERBATask.CLASSIFICATION,
+                ERBASubtype.ER_ALPHA,
+                _Predictor(ERBAStatusCode.INVALID_SMILES),
+                _BatchAD(),
+                self.spec,
+                self.provenance,
+            )
+            erta_output = Path(directory, "ERTA_pandas_prediction.xlsx")
+            pd.DataFrame({"Result": ["value"]}).to_excel(
+                erta_output,
+                index=False,
+            )
+            actual = load_workbook(export_result.destination)
+            expected = load_workbook(erta_output)
+            try:
+                expected_header = style_signature(expected.active["A1"])
+                expected_data = style_signature(expected.active["A2"])
+                for sheet in actual.worksheets:
+                    self.assertIsNone(sheet.freeze_panes)
+                    self.assertIsNone(sheet.auto_filter.ref)
+                    self.assertEqual(list(sheet.column_dimensions), [])
+                    self.assertTrue(
+                        all(
+                            style_signature(cell) == expected_header
+                            for cell in sheet[1]
+                        )
+                    )
+                    self.assertTrue(
+                        all(
+                            style_signature(cell) == expected_data
+                            for row in sheet.iter_rows(min_row=2)
+                            for cell in row
+                        )
+                    )
+            finally:
+                actual.close()
+                expected.close()
 
     def test_batch_progress_and_guide_explain_all_unavailable_predictions(self):
         class _FdaPredictor(_Predictor):
@@ -1763,6 +1950,7 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
         tab.download_template_button = self._Widget()
         tab.run_batch_button = self._Widget()
         tab.batch_input_display_var = self._Variable()
+        tab._show_batch_dialog = lambda *_args: None
         return tab
 
     def test_batch_destination_is_read_only_and_tracks_selected_input_parent(self):
@@ -1940,6 +2128,110 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
             self.assertEqual(tab.batch_progress_var.value, "100% - 0/0 - Failed")
             self.assertIsNone(tab._active_batch_request_id)
             self.assertEqual(list(input_path.parent.glob("ERBA_*.xlsx")), [])
+
+    def test_batch_dialogs_route_early_failure_and_terminal_outcomes_directly(self):
+        tab = self._tab_with_batch_controls()
+        tab._show_batch_dialog = ErbaTab._show_batch_dialog
+        tab.batch_input_var = self._Variable("")
+        tab.batch_destination_var = self._Variable()
+        tab.batch_status_var = self._Variable()
+        tab.batch_progress_var = self._Variable()
+        tab.batch_progress_value = self._Variable()
+        tab.batch_result = self._Text()
+        tab._started_at = {1: 0.0}
+        tab._snapshot = lambda _workflow: (
+            1,
+            ERBATask.CLASSIFICATION,
+            ERBASubtype.ER_ALPHA,
+            "model-v1",
+        )
+        callbacks = []
+        tab.after = lambda _delay, callback: callbacks.append(callback)
+
+        with patch("gui.erba_tab.messagebox.showinfo") as show_info, patch(
+            "gui.erba_tab.messagebox.showwarning"
+        ) as show_warning, patch(
+            "gui.erba_tab.messagebox.showerror"
+        ) as show_error:
+            tab.batch_predict_clicked()
+            show_error.assert_called_once()
+            self.assertIn("Choose an input xlsx", str(show_error.call_args))
+            self.assertEqual(callbacks, [])
+            show_error.reset_mock()
+
+            tab._finish_duration_ms = lambda _request_id: 0
+            tab._set_batch_progress = lambda *_args: None
+            tab._snapshot_is_current = lambda *_args: True
+            tab._route_changed = lambda _workflow: None
+            tab._emit = lambda *_args, **_kwargs: None
+
+            destination = Path(
+                "C:/published/ERBA_classification_er_alpha_results.xlsx"
+            )
+            successful = ERBABatchExportResult(
+                destination=destination,
+                count=2,
+                binding_count=1,
+                non_binding_count=1,
+                not_predicted_count=0,
+                ad_in_domain_count=1,
+                ad_out_of_domain_count=1,
+                ad_unavailable_count=0,
+                graph_paths=(destination.parent / "graphs" / "classes.png",),
+                graph_directory=destination.parent / "graphs",
+            )
+            tab._active_batch_request_id = 2
+            tab._batch_complete(
+                2,
+                ERBATask.CLASSIFICATION,
+                ERBASubtype.ER_ALPHA,
+                "model-v1",
+                successful,
+                "",
+            )
+            show_info.assert_called_once()
+            self.assertIn(str(destination), show_info.call_args.args[1])
+            self.assertEqual(callbacks, [])
+
+            warning = ERBABatchExportResult(
+                destination=destination,
+                count=2,
+                binding_count=1,
+                non_binding_count=0,
+                not_predicted_count=1,
+                ad_in_domain_count=1,
+                ad_out_of_domain_count=0,
+                ad_unavailable_count=1,
+                graph_paths=(),
+                graph_directory=None,
+                graph_error="No route-specific AD rows were available.",
+                ad_error="Row 2: AD unavailable",
+            )
+            tab._active_batch_request_id = 3
+            tab._batch_complete(
+                3,
+                ERBATask.CLASSIFICATION,
+                ERBASubtype.ER_ALPHA,
+                "model-v1",
+                warning,
+                "",
+            )
+            show_warning.assert_called_once()
+            self.assertIn("Warnings:", str(show_warning.call_args))
+            self.assertEqual(callbacks, [])
+
+            tab._active_batch_request_id = 4
+            tab._batch_complete(
+                4,
+                ERBATask.CLASSIFICATION,
+                ERBASubtype.ER_ALPHA,
+                "model-v1",
+                None,
+                "write failed",
+            )
+            show_error.assert_called_once()
+            self.assertIn("write failed", str(show_error.call_args))
+            self.assertEqual(callbacks, [])
 
     def test_batch_worker_ignores_single_output_root_and_exports_beside_input(self):
         tab = ErbaTab.__new__(ErbaTab)
@@ -2254,12 +2546,48 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
             try:
                 self.assertEqual(first.parent, input_path.resolve().parent)
                 self.assertEqual(second.parent, input_path.resolve().parent)
-                self.assertEqual(first.name, "input_legacy_prediction.xlsx")
-                self.assertEqual(second.name, "input_legacy_prediction_2.xlsx")
+                self.assertEqual(first.name, "ERTA_input_legacy_prediction.xlsx")
+                self.assertEqual(second.name, "ERTA_input_legacy_prediction_2.xlsx")
                 self.assertEqual(first.read_bytes(), b"prior")
             finally:
                 first.unlink(missing_ok=True)
                 second.unlink(missing_ok=True)
+
+    def test_erta_carsrn_alias_resolves_valid_cas_and_preserves_invalid_rows(self):
+        window = MainWindow.__new__(MainWindow)
+        window.set_status = lambda _message: None
+        frame = pd.DataFrame(
+            {"CARSRN": ["50-00-0", 12345, "", None]},
+        )
+        with patch(
+            "gui.main_window.cas_to_smiles",
+            return_value={"CanonicalSMILES": "C=O", "PubChem_CID": 712},
+        ) as lookup:
+            prepared = window.prepare_batch_input(frame)
+
+        lookup.assert_called_once_with("50-00-0")
+        self.assertEqual(prepared["CAS"].tolist()[:3], ["50-00-0", 12345, ""])
+        self.assertEqual(prepared["SMILES"].tolist(), ["C=O", "", "", ""])
+        self.assertEqual(prepared.loc[0, "PubChem_status"], "Found")
+        self.assertIn("CAS is invalid", prepared.loc[1, "PubChem_status"])
+        self.assertEqual(
+            prepared.loc[2, "PubChem_status"],
+            "Skipped: CAS is empty",
+        )
+        self.assertEqual(
+            prepared.loc[3, "PubChem_status"],
+            "Skipped: CAS is empty",
+        )
+
+    def test_erta_rejects_workbooks_without_a_recognized_input_column(self):
+        window = MainWindow.__new__(MainWindow)
+        with self.assertRaisesRegex(
+            ValueError,
+            "recognized CAS column.*recognized SMILES column",
+        ):
+            window.prepare_batch_input(
+                pd.DataFrame({"Analyst note": ["not an input"]})
+            )
 
     def test_success_then_protected_erta_batch_replaces_stale_result_with_failure(self):
         window = self._window()

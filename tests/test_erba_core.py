@@ -286,6 +286,61 @@ class ERBACoreTests(unittest.TestCase):
                 )
             self.assertEqual(list(Path(directory).glob("ERBA_*.xlsx")), [])
 
+    def test_carsrn_alias_resolves_all_25_rows_from_the_supplied_example(self):
+        cas_values = [
+            "6422-86-2", "64-17-5", "50-00-0", "67-66-3", "107-13-1",
+            "5129-00-0", "24038-68-4", "1571-75-1", "94-18-8", "5397-34-2",
+            "41481-66-7", "97042-18-7", "63134-33-8", "95235-30-6",
+            "191680-83-8", "93589-69-6", "232938-43-1", "151882-81-4",
+            "321860-75-7", "1763-23-1", "29420-49-3", "3871-99-6",
+            "2923-26-4", "2043-47-2", "647-42-7",
+        ]
+        task, subtype = ERBATask.CLASSIFICATION, ERBASubtype.ER_ALPHA
+        spec = ERBAArtifactSpec("model.joblib", 1, "a" * 64, "fixture")
+        provenance = {"metadata": {key: "a" * 64 for key in (
+            "protocol_sha256", "source_manifest_sha256",
+            "historical_exposure_manifest_sha256", "split_manifest_sha256",
+            "nested_cv_sha256", "internal_resplit_sha256", "report_sha256",
+            "caveat_sha256",
+        )}}
+        predictor = _BatchPredictor()
+        erba_ad = _BatchAD()
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory, "test.xlsx")
+            pd.DataFrame({"CARSRN": cas_values}).to_excel(input_path, index=False)
+            with patch(
+                "gui.erba_tab.cas_to_smiles",
+                return_value={"CanonicalSMILES": "CCO", "PubChem_CID": 702},
+            ) as lookup, patch(
+                "gui.erba_tab.save_erba_batch_graphs",
+                return_value=((), None),
+            ):
+                export_result = export_erba_batch(
+                    input_path,
+                    task,
+                    subtype,
+                    predictor,
+                    erba_ad,
+                    spec,
+                    provenance,
+                )
+            predictions = pd.read_excel(
+                export_result.destination,
+                sheet_name="Predictions",
+                dtype=str,
+                keep_default_na=False,
+            )
+
+        self.assertEqual(export_result.count, 25)
+        self.assertEqual(
+            [entry.args[0] for entry in lookup.call_args_list],
+            cas_values,
+        )
+        self.assertEqual([request.smiles for request in predictor.calls], ["CCO"] * 25)
+        self.assertEqual(predictions["CARSRN"].tolist(), cas_values)
+        self.assertEqual(predictions["CAS"].tolist(), cas_values)
+        self.assertEqual(predictions["Result_Status"].tolist(), ["Predicted"] * 25)
+
     def test_regression_remains_separate_and_parity_gated(self):
         with tempfile.TemporaryDirectory() as root:
             task, subtype = ERBATask.IC50_REGRESSION, ERBASubtype.ER_ALPHA
