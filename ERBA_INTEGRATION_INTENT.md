@@ -216,14 +216,20 @@ binding meaning, evidence limitations, and provenance sheets remain unchanged.
    exact same openpyxl formatting signature as ERTA cells of the same kind;
    values and endpoint-specific column semantics are not compared to establish
    formatting parity.
-6. A fully successful batch on either endpoint shows
-   `messagebox.showinfo("Batch prediction done", ...)`. A start, read,
-   prediction, or publication failure shows
+6. An atomically published workbook is a successful batch job on either
+   endpoint even when expected unsupported rows could not be predicted or
+   optional AD/graph artifacts are unavailable. Every such publication shows
+   the blue `messagebox.showinfo("Batch prediction done", ...)` dialog using
+   the same template: exact saved path, total/predicted/not-predicted and
+   endpoint outcome counts, graph count/directory, and neutral textual
+   AD/graph details. It never hides unavailable rows or claims that every row
+   was predicted. If none were predicted, both the result and dialog say
+   `No rows could be predicted.` A start, read, model execution, or workbook
+   save/publication failure that produces no workbook instead shows the red
    `messagebox.showerror("Batch prediction failed", ...)`, restores all batch
    controls, leaves terminal failure text/progress, and emits no success
-   dialog. An ERalpha workbook published with row-level not-predicted results
-   shows `messagebox.showwarning("Batch prediction completed with warnings",
-   ...)` rather than false success.
+   dialog. Expected row-level exclusions and missing optional artifacts do not
+   use a generic yellow warning dialog.
 
 ## FDA usability amendment: exact ERTA/ERalpha interaction parity
 
@@ -269,3 +275,26 @@ browsing remains ERTA-only; ERalpha browsing is restricted as specified below.
    Binding/Non-binding and the required binding-evidence caveat for direct
    ERalpha binding. Predictor state, model paths, AD references, request
    snapshots, results, and batch destinations remain endpoint-isolated.
+7. Starting either batch immediately replaces any prior completion summary
+   with `Batch prediction is running.` The aggregate progress row uses the
+   same format and stage map on both endpoints:
+   `Reading input workbook` (0%), `Resolving CAS/SMILES` (10–35%),
+   `Preprocessing and prediction` (35–88%), `Writing workbook` (90%), and
+   terminal `Completed` or `Failed` (100%). The displayed format is
+   `<percent>% - <current>/<total> - <stage>`.
+8. Aggregate stages remain exclusively in the progress row. During an actual
+   CAS lookup, the shared lower status row exclusively shows
+   `Fetching SMILES from PubChem: <index> / <total> (<CAS>)`; its common
+   lifecycle text is `Batch prediction started.`,
+   `Batch prediction completed: <path>`, or
+   `Batch prediction failed: <details>`. Worker callbacks reach Tk only through
+   `after`, and request/model-generation guards discard queued stale progress,
+   lookup detail, and completion updates.
+9. ERTA preserves its legacy workbook schema and zero-fingerprint inference
+   behavior. Presentation counts a row as Predicted/Positive/Negative only when
+   `Mol_valid=True`; legacy labels retained on `Mol_valid=False` workbook/graph
+   rows are explicitly described as not usable predictions. ERTA model and AD
+   reloads are serialized against batch execution in both directions, and a
+   successful reload clears the prior batch summary. AD In-domain,
+   Out-of-domain, and Unavailable counts on both endpoints cover predicted rows
+   only; not-predicted rows are excluded from that denominator.

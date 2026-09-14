@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,11 +21,18 @@ from core.contracts import (
     ERBATask,
 )
 from gui.erba_tab import (
+    BATCH_RUNNING_RESULT,
+    PREDICTED_AD_COUNT_NOTE,
     ERBA_BATCH_AD_COLUMNS,
     ERBABatchExportResult,
     ERBAReleasedCatalog,
     ErbaTab,
     allocate_output_path,
+    batch_prediction_availability,
+    batch_progress_text,
+    batch_pubchem_status,
+    batch_run_status,
+    batch_success_dialog,
     batch_destination_display as erba_batch_destination_display,
     build_primary_predictions,
     canonicalize_batch_input,
@@ -35,6 +43,7 @@ from gui.erba_tab import (
     save_erba_batch_graphs,
 )
 from gui.main_window import (
+    ERTA_LEGACY_VALID_COUNT_NOTE,
     MainWindow,
     allocate_erta_output_path,
 )
@@ -134,6 +143,63 @@ class GuiContractTests(unittest.TestCase):
             self.assertIn('text="Example input"', source)
             self.assertIn('text="Download template"', source)
             self.assertIn('uniform="single"', source)
+
+    def test_shared_batch_presentation_contract_is_endpoint_neutral(self):
+        self.assertEqual(
+            BATCH_RUNNING_RESULT,
+            "Batch prediction is running.\n\n"
+            "Completion details will appear after the workbook is saved.",
+        )
+        self.assertEqual(
+            batch_progress_text("Ready to read input", 0, 0, 0),
+            "0% - 0/0 - Reading input workbook",
+        )
+        self.assertEqual(
+            batch_progress_text("Predicting", 3, 10, 61),
+            "61% - 3/10 - Preprocessing and prediction",
+        )
+        self.assertEqual(
+            batch_progress_text("Complete", 10, 10, 100),
+            "100% - 10/10 - Completed",
+        )
+        self.assertEqual(
+            batch_pubchem_status(5, 25, "107-13-1"),
+            "Fetching SMILES from PubChem: 5 / 25 (107-13-1)",
+        )
+        self.assertEqual(batch_run_status("started"), "Batch prediction started.")
+        self.assertEqual(
+            batch_run_status("completed", "C:/published/result.xlsx"),
+            "Batch prediction completed: C:/published/result.xlsx",
+        )
+        self.assertEqual(
+            batch_run_status("failed", "write failed"),
+            "Batch prediction failed: write failed",
+        )
+
+    def test_published_all_unavailable_dialog_is_blue_contract_without_false_claim(self):
+        title, message = batch_success_dialog(
+            destination="C:/published/result.xlsx",
+            total_count=2,
+            predicted_count=0,
+            not_predicted_count=2,
+            outcome_counts=(("Binding", 0), ("Non-binding", 0)),
+            graph_paths=(),
+            graph_directory=None,
+            detail_lines=("Graph details: Optional graph files were not generated.",),
+        )
+
+        self.assertEqual(title, "Batch prediction done")
+        self.assertIn("Total rows: 2", message)
+        self.assertIn("Predicted: 0", message)
+        self.assertIn("Not predicted: 2", message)
+        self.assertIn("No rows could be predicted.", message)
+        self.assertIn("Graph files: 0", message)
+        self.assertNotIn("All rows were predicted", message)
+        self.assertEqual(
+            batch_prediction_availability(2, 1, 1),
+            "1 row(s) could not be predicted. "
+            "Row-level reasons are saved in the workbook.",
+        )
 
     def test_catalog_releases_only_approved_routes_and_keeps_beta_regression_disabled(self):
         payload = {
@@ -404,6 +470,14 @@ class _StartupADCalculator:
             raise self.error
 
 
+class _StartupControl:
+    def __init__(self):
+        self.state = "normal"
+
+    def configure(self, **kwargs):
+        self.state = kwargs.get("state", self.state)
+
+
 class StartupLoadingContractTests(unittest.TestCase):
     def _window(self, model_path, ad_path, predictor=None, ad_calculator=None):
         window = MainWindow.__new__(MainWindow)
@@ -417,6 +491,15 @@ class StartupLoadingContractTests(unittest.TestCase):
         window.set_status = window.statuses.append
         window.run_threaded = lambda job: job()
         window.ui = lambda callback, *args: callback(*args)
+        window._batch_active = False
+        window._erta_reload_in_flight = False
+        window.run_batch_button = _StartupControl()
+        window.model_entry = _StartupControl()
+        window.model_browse_button = _StartupControl()
+        window.model_reload_button = _StartupControl()
+        window.ad_entry = _StartupControl()
+        window.ad_browse_button = _StartupControl()
+        window.ad_reload_button = _StartupControl()
         return window
 
     def test_startup_reports_blank_or_missing_model_path_and_does_not_claim_ready(self):
@@ -1189,6 +1272,7 @@ class ErbaExcelContractTests(unittest.TestCase):
         frame.loc[467:468, "CAS"] = "12-34-5"
         frame.loc[469:, "CAS"] = "50-00-0"
         progress = []
+        statuses = []
         with tempfile.TemporaryDirectory() as directory, patch(
             "gui.erba_tab.cas_to_smiles", side_effect=ValueError("404")
         ), patch("gui.erba_tab.save_erba_batch_graphs", return_value=((), None)):
@@ -1199,6 +1283,7 @@ class ErbaExcelContractTests(unittest.TestCase):
                 progress_callback=lambda stage, current, total, percent: progress.append(
                     (stage, current, total, percent)
                 ),
+                status_callback=statuses.append,
             )
             predictions = pd.read_excel(
                 export_result.destination,
@@ -1229,9 +1314,27 @@ class ErbaExcelContractTests(unittest.TestCase):
         self.assertEqual(progress[0], ("Reading input workbook", 0, 0, 0))
         self.assertEqual(progress[-1], ("Completed", 504, 504, 100))
         self.assertEqual({entry[0] for entry in progress}, {
-            "Reading input workbook", "Resolving CAS/SMILES", "Predicting",
-            "Evaluating applicability domain", "Writing workbook", "Completed",
+            "Reading input workbook", "Resolving CAS/SMILES",
+            "Preprocessing and prediction", "Writing workbook", "Completed",
         })
+        preprocessing_currents = [
+            current
+            for stage, current, _total, _percent in progress
+            if stage == "Preprocessing and prediction"
+        ]
+        self.assertEqual(
+            preprocessing_currents,
+            sorted(preprocessing_currents),
+        )
+        self.assertEqual(
+            statuses[0],
+            "Fetching SMILES from PubChem: 470 / 504 (50-00-0)",
+        )
+        self.assertEqual(
+            statuses[-2],
+            "Fetching SMILES from PubChem: 504 / 504 (50-00-0)",
+        )
+        self.assertEqual(statuses[-1], "Batch prediction started.")
         self.assertIn("Not predicted rows", guide["Topic"].tolist())
     def test_single_cas_lookup_uses_isomeric_fallback_and_clears_on_missing_smiles(self):
         class _Variable:
@@ -1660,13 +1763,44 @@ class ErbaExcelContractTests(unittest.TestCase):
         self.assertEqual(tab.batch_progress_var.value, None)
         scheduled[0][1]()
         self.assertEqual(tab.batch_progress_value.value, 61)
-        self.assertEqual(tab.batch_progress_var.value, "61% - 3/10 - Predicting")
+        self.assertEqual(
+            tab.batch_progress_var.value,
+            "61% - 3/10 - Preprocessing and prediction",
+        )
 
         tab._model_generation = 1
         tab._batch_progress_from_worker(7, "Writing workbook", 9, 10, 90)
         scheduled[1][1]()
         self.assertEqual(tab.batch_progress_value.value, 61)
-        self.assertEqual(tab.batch_progress_var.value, "61% - 3/10 - Predicting")
+        self.assertEqual(
+            tab.batch_progress_var.value,
+            "61% - 3/10 - Preprocessing and prediction",
+        )
+
+    def test_worker_lower_status_discards_queued_stale_model_update(self):
+        class _Variable:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+
+        tab = ErbaTab.__new__(ErbaTab)
+        tab._active_batch_request_id = 7
+        tab._model_generation = 0
+        tab._request_generations = {7: 0}
+        tab.batch_status_var = _Variable()
+        scheduled = []
+        tab.after = lambda delay, callback: scheduled.append((delay, callback))
+
+        tab._batch_status_from_worker(
+            7,
+            "Fetching SMILES from PubChem: 1 / 2 (50-00-0)",
+        )
+        tab._model_generation = 1
+        scheduled[0][1]()
+
+        self.assertIsNone(tab.batch_status_var.value)
 
     def test_export_avoids_existing_destination_collision(self):
         frame = pd.DataFrame([["x", "CCO"]], columns=["Row_ID", "SMILES"])
@@ -2017,6 +2151,48 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
             self.assertIn("Copy or download", tab.batch_status_var.value)
             self.assertIn("read-only resources", tab.batch_status_var.value)
 
+    def test_new_eralpha_batch_replaces_prior_completion_before_worker_starts(self):
+        tab = self._tab_with_batch_controls()
+        tab.batch_input_var = self._Variable()
+        tab.batch_destination_var = self._Variable()
+        tab.batch_status_var = self._Variable()
+        tab.batch_progress_var = self._Variable()
+        tab.batch_progress_value = self._Variable()
+        tab.batch_result = self._Text()
+        tab.batch_result.value = "Prior completed result"
+        tab._active_batch_request_id = None
+        tab._model_generation = 0
+        tab._request_generations = {7: 0}
+        tab._request_predictors = {}
+        tab._snapshot = lambda _workflow: (
+            7,
+            ERBATask.CLASSIFICATION,
+            ERBASubtype.ER_ALPHA,
+            "model-v1",
+        )
+        tab.predictor = SimpleNamespace(
+            preflight=lambda _task, _subtype: ERBARoutePreflight(
+                task=ERBATask.CLASSIFICATION,
+                subtype=ERBASubtype.ER_ALPHA,
+                status_code=ERBAStatusCode.OK,
+                status_message="ready",
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.xlsx")
+            source.touch()
+            tab.batch_input_var.set(str(source))
+            with patch("gui.erba_tab.threading.Thread") as worker:
+                tab.batch_predict_clicked()
+
+        worker.assert_called_once()
+        self.assertEqual(tab.batch_result.value, BATCH_RUNNING_RESULT)
+        self.assertEqual(
+            tab.batch_progress_var.value,
+            "0% - 0/0 - Reading input workbook",
+        )
+        self.assertEqual(tab.batch_status_var.value, "Batch prediction started.")
+
     def test_distinct_install_root_rejects_erba_input_template_and_execution(self):
         tab = self._tab_with_batch_controls()
         tab.batch_input_var = self._Variable()
@@ -2192,8 +2368,9 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
             show_info.assert_called_once()
             self.assertIn(str(destination), show_info.call_args.args[1])
             self.assertEqual(callbacks, [])
+            show_info.reset_mock()
 
-            warning = ERBABatchExportResult(
+            mixed = ERBABatchExportResult(
                 destination=destination,
                 count=2,
                 binding_count=1,
@@ -2213,16 +2390,46 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
                 ERBATask.CLASSIFICATION,
                 ERBASubtype.ER_ALPHA,
                 "model-v1",
-                warning,
+                mixed,
                 "",
             )
-            show_warning.assert_called_once()
-            self.assertIn("Warnings:", str(show_warning.call_args))
+            show_info.assert_called_once()
+            self.assertIn("Not predicted: 1", str(show_info.call_args))
+            self.assertIn("Graph details:", str(show_info.call_args))
+            show_warning.assert_not_called()
             self.assertEqual(callbacks, [])
+            show_info.reset_mock()
 
             tab._active_batch_request_id = 4
+            unavailable = ERBABatchExportResult(
+                destination=destination,
+                count=2,
+                binding_count=0,
+                non_binding_count=0,
+                not_predicted_count=2,
+                ad_in_domain_count=0,
+                ad_out_of_domain_count=0,
+                ad_unavailable_count=0,
+                graph_paths=(),
+                graph_directory=None,
+                graph_error="No route-specific AD rows were available.",
+            )
             tab._batch_complete(
                 4,
+                ERBATask.CLASSIFICATION,
+                ERBASubtype.ER_ALPHA,
+                "model-v1",
+                unavailable,
+                "",
+            )
+            show_info.assert_called_once()
+            self.assertIn("No rows could be predicted.", str(show_info.call_args))
+            show_warning.assert_not_called()
+            show_info.reset_mock()
+
+            tab._active_batch_request_id = 5
+            tab._batch_complete(
+                5,
                 ERBATask.CLASSIFICATION,
                 ERBASubtype.ER_ALPHA,
                 "model-v1",
@@ -2231,6 +2438,8 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
             )
             show_error.assert_called_once()
             self.assertIn("write failed", str(show_error.call_args))
+            show_info.assert_not_called()
+            show_warning.assert_not_called()
             self.assertEqual(callbacks, [])
 
     def test_batch_worker_ignores_single_output_root_and_exports_beside_input(self):
@@ -2308,19 +2517,24 @@ class EralphaBatchUsabilityContractTests(unittest.TestCase):
         )
 
         self.assertEqual(tab.batch_destination_var.value, str(destination.parent))
-        self.assertEqual(tab.batch_status_var.value, f"ERBA batch complete: {destination}")
+        self.assertEqual(
+            tab.batch_status_var.value,
+            f"Batch prediction completed: {destination}",
+        )
         self.assertIn(str(destination), tab.batch_result.value)
         for detail in (
             "Total rows: 7",
+            "Predicted: 5",
             "Binding: 3",
             "Non-binding: 2",
             "Not predicted: 2",
             "AD In-domain: 2",
             "AD Out-of-domain: 2",
             "AD Unavailable: 1",
+            PREDICTED_AD_COUNT_NOTE,
             "Graph files: 2",
             f"Graph directory: {destination.parent / 'graphs'}",
-            "AD warning: Row 7: AD unavailable",
+            "Applicability-domain details: Row 7: AD unavailable",
             "historically exposed",
         ):
             self.assertIn(detail, tab.batch_result.value)
@@ -2472,14 +2686,24 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
         window.batch_input_button = _ErtaBatchControl()
         window.download_template_button = _ErtaBatchControl()
         window.run_batch_button = _ErtaBatchControl()
+        window.model_entry = _ErtaBatchControl()
+        window.model_browse_button = _ErtaBatchControl()
+        window.model_reload_button = _ErtaBatchControl()
+        window.ad_entry = _ErtaBatchControl()
+        window.ad_browse_button = _ErtaBatchControl()
+        window.ad_reload_button = _ErtaBatchControl()
         window.batch_result = _ErtaBatchText()
         window.batch_destination_var = _ErtaBatchVariable()
         window.batch_progress_var = _ErtaBatchVariable()
         window.batch_progress_value = _ErtaBatchVariable()
         window._batch_active = False
+        window._batch_request_id = 0
+        window._active_batch_request_id = None
+        window._erta_reload_in_flight = False
         window._active_batch_total = 1
         window.statuses = []
         window.set_status = window.statuses.append
+        window.main_thread = threading.current_thread()
         window.after = lambda _delay, callback: callback()
         window.ui = lambda callback, *args: callback(*args)
         window.run_threaded = lambda job: job()
@@ -2556,6 +2780,8 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
     def test_erta_carsrn_alias_resolves_valid_cas_and_preserves_invalid_rows(self):
         window = MainWindow.__new__(MainWindow)
         window.set_status = lambda _message: None
+        statuses = []
+        progress = []
         frame = pd.DataFrame(
             {"CARSRN": ["50-00-0", 12345, "", None]},
         )
@@ -2563,9 +2789,23 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
             "gui.main_window.cas_to_smiles",
             return_value={"CanonicalSMILES": "C=O", "PubChem_CID": 712},
         ) as lookup:
-            prepared = window.prepare_batch_input(frame)
+            prepared = window.prepare_batch_input(
+                frame,
+                status_callback=statuses.append,
+                progress_callback=lambda stage, current, total, percent: (
+                    progress.append((stage, current, total, percent))
+                ),
+            )
 
         lookup.assert_called_once_with("50-00-0")
+        self.assertEqual(
+            statuses,
+            ["Fetching SMILES from PubChem: 1 / 4 (50-00-0)"],
+        )
+        self.assertEqual(
+            progress[-1],
+            ("Resolving CAS/SMILES", 4, 4, 35),
+        )
         self.assertEqual(prepared["CAS"].tolist()[:3], ["50-00-0", 12345, ""])
         self.assertEqual(prepared["SMILES"].tolist(), ["C=O", "", "", ""])
         self.assertEqual(prepared.loc[0, "PubChem_status"], "Found")
@@ -2593,9 +2833,7 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
         window = self._window()
         window.predictor = _ErtaBatchPredictor()
         window.batch_input_var = _ErtaBatchVariable()
-        reported_errors = []
         started = []
-        window.show_error = lambda title, error: reported_errors.append((title, str(error)))
         window.run_threaded = started.append
         with tempfile.TemporaryDirectory() as directory:
             input_path = Path(directory, "input.xlsx")
@@ -2603,19 +2841,23 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
             window.project_root = directory
             window.install_root = str(Path(directory).parent / "install-root")
             window.batch_input_var.set(str(input_path))
-            window._set_batch_progress("Complete", 1, 1, 100)
+            window._set_batch_progress(None, "Completed", 1, 1, 100)
             window._set_erta_batch_result("Prior successful batch")
 
-            window.batch_predict_clicked()
+            with patch("gui.main_window.messagebox.showerror") as show_error:
+                window.batch_predict_clicked()
 
             self.assertFalse(window._batch_active)
             self.assertEqual(
                 window.batch_destination_var.value,
                 str(input_path.resolve().parent),
             )
-            self.assertEqual(len(reported_errors), 1)
-            self.assertIn("writable folder outside the application files", reported_errors[0][1])
-            self.assertIn("read-only resources", reported_errors[0][1])
+            show_error.assert_called_once()
+            self.assertIn(
+                "writable folder outside the application files",
+                show_error.call_args.args[1],
+            )
+            self.assertIn("read-only resources", show_error.call_args.args[1])
             self.assertEqual(window.batch_progress_var.value, "100% - 0/0 - Failed")
             self.assertIn("Batch prediction failed", window.batch_result.value)
             self.assertNotIn("Prior successful batch", window.batch_result.value)
@@ -2627,9 +2869,7 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
         window.predictor = _ErtaBatchPredictor()
         window.batch_input_var = _ErtaBatchVariable()
         window.batch_input_display_var = _ErtaBatchVariable()
-        reported_errors = []
         started = []
-        window.show_error = lambda title, error: reported_errors.append((title, str(error)))
         window.run_threaded = started.append
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2652,15 +2892,21 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
                 window.browse_batch_input()
             self.assertIn("Unavailable", window.batch_destination_var.value)
 
-            window.batch_predict_clicked()
-            with patch(
-                "gui.main_window.filedialog.asksaveasfilename",
-                return_value=str(template_path),
-            ):
-                window.download_template_clicked()
+            with patch("gui.main_window.messagebox.showerror") as show_error:
+                window.batch_predict_clicked()
+                with patch(
+                    "gui.main_window.filedialog.asksaveasfilename",
+                    return_value=str(template_path),
+                ):
+                    window.download_template_clicked()
 
-            self.assertEqual(len(reported_errors), 2)
-            self.assertTrue(all("read-only resources" in error for _, error in reported_errors))
+            self.assertEqual(show_error.call_count, 2)
+            self.assertTrue(
+                all(
+                    "read-only resources" in call.args[1]
+                    for call in show_error.call_args_list
+                )
+            )
             self.assertEqual(window.batch_progress_var.value, "100% - 0/0 - Failed")
             self.assertIn("Batch prediction failed", window.batch_result.value)
             self.assertEqual(started, [])
@@ -2703,8 +2949,135 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
                 str(path.resolve().parent),
             )
 
+    def test_new_erta_batch_replaces_prior_completion_before_worker_starts(self):
+        window = self._window()
+        window.predictor = _ErtaBatchPredictor()
+        window.batch_input_var = _ErtaBatchVariable()
+        window.batch_result.value = "Prior completed result"
+        jobs = []
+        window.run_threaded = jobs.append
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.xlsx")
+            source.touch()
+            window.batch_input_var.set(str(source))
+            window.batch_predict_clicked()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(window.batch_result.value, BATCH_RUNNING_RESULT)
+        self.assertEqual(
+            window.batch_progress_var.value,
+            "0% - 0/0 - Reading input workbook",
+        )
+        self.assertEqual(window.statuses[-1], "Batch prediction started.")
+
+    def test_erta_batch_and_reload_are_bidirectionally_exclusive(self):
+        window = self._window()
+        window.model_path_var = _ErtaBatchVariable("C:/models/reloaded.keras")
+        window.loaded_model_path_var = _ErtaBatchVariable()
+        window.ad_ref_path_var = _ErtaBatchVariable("C:/models/reference.xlsx")
+
+        class Predictor:
+            model_path = "C:/models/reloaded.keras"
+            model_name = "reloaded"
+            input_shape = 2048
+
+            def __init__(self):
+                self.loaded = []
+
+            def load_model(self, path):
+                self.loaded.append(path)
+
+        window.predictor = Predictor()
+        jobs = []
+        window.run_threaded = jobs.append
+        window.batch_result.value = "Prior completed result"
+        window.batch_progress_var.value = "100% - 2/2 - Completed"
+        window._set_batch_controls_active(True)
+        option_controls = (
+            window.model_entry,
+            window.model_browse_button,
+            window.model_reload_button,
+            window.ad_entry,
+            window.ad_browse_button,
+            window.ad_reload_button,
+        )
+        self.assertTrue(all(control.state == "disabled" for control in option_controls))
+
+        with patch("gui.main_window.filedialog.askopenfilename") as browse:
+            window.browse_model()
+            window.browse_ad_reference()
+            window.load_model_clicked()
+            window.fit_ad_clicked()
+        browse.assert_not_called()
+        self.assertEqual(jobs, [])
+
+        window._set_batch_controls_active(False)
+        window.load_model_clicked()
+        self.assertTrue(window._erta_reload_in_flight)
+        self.assertEqual(window.run_batch_button.state, "disabled")
+        self.assertTrue(all(control.state == "disabled" for control in option_controls))
+        self.assertEqual(len(jobs), 1)
+
+        with patch("gui.main_window.messagebox.showerror") as show_error:
+            window.batch_predict_clicked()
+        show_error.assert_called_once()
+        self.assertIn("reload is running", str(show_error.call_args))
+
+        with patch("gui.main_window.messagebox.showinfo") as show_info:
+            jobs[0]()
+        show_info.assert_called_once()
+        self.assertFalse(window._erta_reload_in_flight)
+        self.assertEqual(window.run_batch_button.state, "normal")
+        self.assertTrue(all(control.state == "normal" for control in option_controls))
+        self.assertEqual(
+            window.loaded_model_path_var.value,
+            "C:/models/reloaded.keras",
+        )
+        self.assertEqual(
+            window.batch_result.value,
+            "Run a batch to show the completion summary.",
+        )
+        self.assertEqual(window.batch_progress_var.value, "0% - 0/0 - Ready")
+
+    def test_erta_failed_ad_reload_unlocks_batch_without_clearing_prior_result(self):
+        window = self._window()
+        window.batch_result.value = "Prior completed result"
+        window._set_erta_reload_active(True)
+
+        with patch("gui.main_window.messagebox.showerror") as show_error:
+            window._finish_erta_ad_reload(
+                "C:/models/reference.xlsx",
+                RuntimeError("reference load failed"),
+            )
+
+        show_error.assert_called_once_with(
+            "AD fitting failed",
+            "reference load failed",
+        )
+        self.assertFalse(window._erta_reload_in_flight)
+        self.assertEqual(window.run_batch_button.state, "normal")
+        self.assertEqual(window.batch_result.value, "Prior completed result")
+
+    def test_erta_empty_message_reload_exception_is_not_treated_as_success(self):
+        window = self._window()
+        window.batch_result.value = "Prior completed result"
+        window._set_erta_reload_active(True)
+
+        with patch("gui.main_window.messagebox.showinfo") as show_info, patch(
+            "gui.main_window.messagebox.showerror"
+        ) as show_error:
+            window._finish_erta_model_reload(
+                "C:/models/reference.keras",
+                RuntimeError(""),
+            )
+
+        show_error.assert_called_once_with("Model load failed", "")
+        show_info.assert_not_called()
+        self.assertEqual(window.batch_result.value, "Prior completed result")
+
     def test_batch_controls_lock_and_restore_with_terminal_progress(self):
         window = self._window()
+        window._active_batch_request_id = 1
         window._set_batch_controls_active(True)
         self.assertTrue(window._batch_active)
         self.assertEqual(
@@ -2714,7 +3087,20 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
             )],
             ["disabled"] * 3,
         )
-        window._finish_batch(False, "Batch prediction failed")
+        self.assertTrue(
+            all(
+                control.state == "disabled"
+                for control in (
+                    window.model_entry,
+                    window.model_browse_button,
+                    window.model_reload_button,
+                    window.ad_entry,
+                    window.ad_browse_button,
+                    window.ad_reload_button,
+                )
+            )
+        )
+        window._finish_batch(1, False, "Batch prediction failed: write failed")
         self.assertFalse(window._batch_active)
         self.assertEqual(window.batch_progress_var.value, "100% - 0/1 - Failed")
         self.assertEqual(
@@ -2724,16 +3110,114 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
             )],
             ["normal"] * 3,
         )
+        self.assertTrue(
+            all(
+                control.state == "normal"
+                for control in (
+                    window.model_entry,
+                    window.model_browse_button,
+                    window.model_reload_button,
+                    window.ad_entry,
+                    window.ad_browse_button,
+                    window.ad_reload_button,
+                )
+            )
+        )
 
     def test_progress_updates_are_scheduled_through_after(self):
         window = self._window()
+        window._active_batch_request_id = 7
         scheduled = []
         window.after = lambda delay, callback: scheduled.append((delay, callback))
-        window._batch_progress_from_worker("Writing workbook", 3, 4, 85)
+        window._batch_progress_from_worker(7, "Writing workbook", 3, 4, 85)
         self.assertEqual(window.batch_progress_var.value, None)
         self.assertEqual(len(scheduled), 1)
         scheduled[0][1]()
         self.assertEqual(window.batch_progress_var.value, "85% - 3/4 - Writing workbook")
+
+    def test_erta_queued_progress_and_status_ignore_stale_request(self):
+        window = self._window()
+        window._active_batch_request_id = 2
+        window.batch_progress_var.set("current progress")
+        window.batch_progress_value.set(44)
+        scheduled = []
+        window.after = lambda delay, callback: scheduled.append((delay, callback))
+
+        window._batch_progress_from_worker(1, "Writing workbook", 1, 1, 90)
+        window._batch_status_from_worker(
+            1,
+            "Fetching SMILES from PubChem: 1 / 1 (50-00-0)",
+        )
+        for _, callback in scheduled:
+            callback()
+
+        self.assertEqual(window.batch_progress_var.value, "current progress")
+        self.assertEqual(window.batch_progress_value.value, 44)
+        self.assertEqual(window.statuses, [])
+
+    def test_erta_published_mixed_and_all_unavailable_batches_use_info_dialog(self):
+        for mol_valid, expected_not_predicted, expected_phrase in (
+            ([True, False], 1, "1 row(s) could not be predicted."),
+            ([False, False], 2, "No rows could be predicted."),
+        ):
+            window = self._window()
+            window._active_batch_request_id = 1
+            window._active_batch_total = 2
+            result = pd.DataFrame(
+                {
+                    "Prediction_label": ["Positive", "Negative"],
+                    "Mol_valid": mol_valid,
+                }
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                destination = Path(directory, "published.xlsx")
+                destination.touch()
+                with patch("gui.main_window.messagebox.showinfo") as show_info, patch(
+                    "gui.main_window.messagebox.showwarning"
+                ) as show_warning, patch(
+                    "gui.main_window.messagebox.showerror"
+                ) as show_error:
+                    window._complete_erta_batch(
+                        1,
+                        result,
+                        str(destination),
+                        [],
+                        "Optional applicability-domain results were not generated.",
+                        "No route-specific AD rows were available.",
+                    )
+
+            show_info.assert_called_once()
+            self.assertIn(
+                f"Not predicted: {expected_not_predicted}",
+                show_info.call_args.args[1],
+            )
+            self.assertIn(expected_phrase, show_info.call_args.args[1])
+            self.assertIn(
+                ERTA_LEGACY_VALID_COUNT_NOTE,
+                show_info.call_args.args[1],
+            )
+            self.assertIn(
+                PREDICTED_AD_COUNT_NOTE,
+                show_info.call_args.args[1],
+            )
+            show_warning.assert_not_called()
+            show_error.assert_not_called()
+
+    def test_erta_no_output_failure_uses_error_dialog_only(self):
+        window = self._window()
+        window._active_batch_request_id = 1
+        with patch("gui.main_window.messagebox.showinfo") as show_info, patch(
+            "gui.main_window.messagebox.showerror"
+        ) as show_error:
+            window._fail_erta_batch(1, RuntimeError("write failed"))
+
+        show_error.assert_called_once_with("Batch prediction failed", "write failed")
+        show_info.assert_not_called()
+        self.assertIn("write failed", window.batch_result.value)
+        self.assertEqual(
+            window.statuses[-1],
+            "Batch prediction failed: write failed",
+        )
 
     def test_batch_ignores_prior_output_root_and_publishes_in_input_parent(self):
         window = self._window()
@@ -2757,7 +3241,14 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
             source = input_directory / "input.xlsx"
             pd.DataFrame({"CAS": ["50-00-0"], "SMILES": ["CCO"]}).to_excel(source, index=False)
             window.batch_input_var = _ErtaBatchVariable(str(source))
-            window.prepare_batch_input = lambda frame: frame
+
+            def prepare(frame, **callbacks):
+                callbacks["status_callback"](
+                    "Fetching SMILES from PubChem: 1 / 1 (50-00-0)"
+                )
+                return frame
+
+            window.prepare_batch_input = prepare
             with patch("gui.main_window.messagebox.showinfo"):
                 window.batch_predict_clicked()
             self.assertEqual(Path(reported[0]).parent, input_directory.resolve())
@@ -2767,6 +3258,13 @@ class ErtaBatchUsabilityContractTests(unittest.TestCase):
                 str(input_directory.resolve()),
             )
             self.assertEqual(list(prior_output_setting.glob("*.xlsx")), [])
+            lookup_index = window.statuses.index(
+                "Fetching SMILES from PubChem: 1 / 1 (50-00-0)"
+            )
+            self.assertEqual(
+                window.statuses[lookup_index + 1],
+                "Batch prediction started.",
+            )
 
 
 if __name__ == "__main__":

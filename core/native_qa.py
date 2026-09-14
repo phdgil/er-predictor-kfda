@@ -24,6 +24,47 @@ DISTRIBUTED_TEST_XLSX_SHA256 = (
     "5a1f569f8f6a5cd47bff67a189645c3f9461fcf07bd24f4e5b4f83197f3350aa"
 )
 
+BATCH_RECOGNITION_GATE_ID = "batch-recognition-contract-v1"
+BATCH_RECOGNITION_CRITERIA = {
+    "BRG-01-FEEDBACK-PLACEMENT": (
+        "Aggregate progress is bound below Run batch, while per-row PubChem "
+        "detail is bound to the endpoint status line below the result pane."
+    ),
+    "BRG-02-NEW-RUN-RESET": (
+        "Starting a new run removes the prior Completed/saved presentation and "
+        "locks all batch controls."
+    ),
+    "BRG-03-RESOLUTION-DETAIL": (
+        "CAS resolution exposes aggregate progress and the same per-row "
+        "PubChem detail format at both endpoints."
+    ),
+    "BRG-04-PUBLISHED-SUCCESS": (
+        "A published workbook finishes as Completed and uses the blue "
+        "showinfo dialog semantic with an explicit Not predicted count."
+    ),
+    "BRG-05-PARTIAL-UNAVAILABLE": (
+        "A partially unavailable batch remains a successful publication and "
+        "retains every unavailable row in both the UI and workbook."
+    ),
+    "BRG-06-ALL-UNAVAILABLE": (
+        "An all-unavailable batch remains a successful publication and "
+        "reports every unavailable row in both the UI and workbook."
+    ),
+    "BRG-07-NO-OUTPUT-FAILURE": (
+        "An actual run/save failure publishes no workbook and uses Failed plus "
+        "the red showerror dialog semantic."
+    ),
+    "BRG-08-OWN-WINDOW-EVIDENCE": (
+        "Running and completion screenshots target only the application Tk "
+        "window when native own-window capture is supported."
+    ),
+    "BRG-09-STUDY-SCOPE": (
+        "The receipt identifies this as an automated recognition-contract "
+        "check, not a real human usability study."
+    ),
+}
+BATCH_UNAVAILABLE_LABEL = "Not predicted"
+
 
 def _sha256_path(path: Path) -> str:
     digest = hashlib.sha256()
@@ -271,6 +312,156 @@ def _widget_geometry_receipt(widget, endpoint_tab) -> dict:
             "height": height,
         }
     return receipt
+
+
+def _batch_recognition_widget_receipt(owner, controls: dict) -> dict:
+    """Inspect the visible batch feedback reading order and its real Tk bindings."""
+    endpoint_tab = controls["endpoint_tab"]
+    progress = controls["batch_progress"]
+    progress_frame = progress.master
+    progress_variable = str(owner.batch_progress_var)
+    progress_labels = []
+    for child in progress_frame.winfo_children():
+        try:
+            if str(child.cget("textvariable")) == progress_variable:
+                progress_labels.append(child)
+        except Exception:
+            continue
+    if len(progress_labels) != 1:
+        raise AssertionError(
+            "batch aggregate progress must have exactly one visible label bound "
+            f"to {progress_variable}; found {len(progress_labels)}"
+        )
+    progress_label = progress_labels[0]
+    detail_variable = getattr(owner, "status_var", None)
+    if detail_variable is None:
+        detail_variable = owner.batch_status_var
+
+    run_receipt = _widget_geometry_receipt(
+        controls["batch_predict_button"],
+        endpoint_tab,
+    )
+    progress_receipt = _widget_geometry_receipt(progress, endpoint_tab)
+    progress_label_receipt = _widget_geometry_receipt(
+        progress_label,
+        endpoint_tab,
+    )
+    result_receipt = _widget_geometry_receipt(
+        controls["batch_result"],
+        endpoint_tab,
+    )
+    detail_receipt = _widget_geometry_receipt(
+        controls["batch_status"],
+        endpoint_tab,
+    )
+    mapped_receipts = (
+        run_receipt,
+        progress_receipt,
+        progress_label_receipt,
+        result_receipt,
+        detail_receipt,
+    )
+    if not all(receipt["mapped"] for receipt in mapped_receipts):
+        raise AssertionError(
+            "batch recognition widgets must all be mapped while the batch "
+            "surface is selected"
+        )
+
+    run_command = str(controls["batch_predict_button"].cget("command"))
+    actual_progress_value_variable = str(progress.cget("variable"))
+    actual_progress_text_variable = str(progress_label.cget("textvariable"))
+    actual_detail_variable = str(
+        controls["batch_status"].cget("textvariable")
+    )
+    if (
+        "batch_predict_clicked" not in run_command
+        or actual_progress_value_variable != str(owner.batch_progress_value)
+        or actual_progress_text_variable != progress_variable
+        or actual_detail_variable != str(detail_variable)
+    ):
+        raise AssertionError(
+            "batch recognition widget binding drift: "
+            + json.dumps(
+                {
+                    "run_command": run_command,
+                    "progress_value_variable": {
+                        "actual": actual_progress_value_variable,
+                        "expected": str(owner.batch_progress_value),
+                    },
+                    "progress_text_variable": {
+                        "actual": actual_progress_text_variable,
+                        "expected": progress_variable,
+                    },
+                    "detail_text_variable": {
+                        "actual": actual_detail_variable,
+                        "expected": str(detail_variable),
+                    },
+                },
+                sort_keys=True,
+            )
+        )
+
+    run_box = run_receipt["box"]
+    progress_box = progress_receipt["box"]
+    progress_label_box = progress_label_receipt["box"]
+    result_box = result_receipt["box"]
+    detail_box = detail_receipt["box"]
+    run_bottom = run_box["y"] + run_box["height"]
+    progress_bottom = progress_box["y"] + progress_box["height"]
+    result_bottom = result_box["y"] + result_box["height"]
+    label_bottom = progress_label_box["y"] + progress_label_box["height"]
+    progress_vertical_overlap = (
+        progress_label_box["y"] < progress_bottom
+        and label_bottom > progress_box["y"]
+    )
+    if not (
+        run_bottom <= progress_box["y"]
+        and progress_vertical_overlap
+        and progress_label_box["x"]
+        >= progress_box["x"] + progress_box["width"]
+        and progress_bottom <= result_box["y"]
+        and result_bottom <= detail_box["y"]
+    ):
+        raise AssertionError(
+            "batch feedback is not in Run, aggregate progress, result, "
+            "per-row detail reading order: "
+            + json.dumps(
+                {
+                    "run": run_box,
+                    "aggregate_progress": progress_box,
+                    "aggregate_progress_label": progress_label_box,
+                    "result": result_box,
+                    "per_row_detail": detail_box,
+                },
+                sort_keys=True,
+            )
+        )
+
+    return {
+        "criterion_id": "BRG-01-FEEDBACK-PLACEMENT",
+        "passed": True,
+        "coordinate_space": "relative to the selected endpoint_tab",
+        "reading_order": [
+            "run_batch",
+            "aggregate_progress",
+            "batch_result",
+            "per_row_detail",
+        ],
+        "bindings": {
+            "run_command": run_command,
+            "run_callback": "batch_predict_clicked",
+            "progress_value_variable": actual_progress_value_variable,
+            "progress_text_variable": actual_progress_text_variable,
+            "per_row_detail_variable": actual_detail_variable,
+        },
+        "boxes": {
+            "run_batch": run_box,
+            "aggregate_progress": progress_box,
+            "aggregate_progress_label": progress_label_box,
+            "batch_result": result_box,
+            "per_row_detail": detail_box,
+        },
+    }
 
 
 def _capture_own_tk_window(window, destination: Path) -> dict:
@@ -531,6 +722,7 @@ def inspect_endpoint_geometry_parity(
     screenshot_available = screenshot_root is not None
     screenshots = []
     states = []
+    recognition_widgets = {}
     toggle_invocations = {"erta": 0, "eralpha": 0}
     window_size_settling = {}
 
@@ -663,6 +855,17 @@ def inspect_endpoint_geometry_parity(
                             key: _widget_geometry_receipt(widget, endpoint_tab)
                             for key, widget in containers[endpoint_name].items()
                         }
+                        if (
+                            size_name == "initial"
+                            and mode == "batch"
+                            and not options_open
+                        ):
+                            recognition_widgets[endpoint_name] = (
+                                _batch_recognition_widget_receipt(
+                                    endpoints[endpoint_name],
+                                    maps[endpoint_name],
+                                )
+                            )
                         if screenshot_available and screenshot_root is not None:
                             option_name = "options-open" if options_open else "options-closed"
                             screenshot = _capture_own_tk_window(
@@ -776,6 +979,33 @@ def inspect_endpoint_geometry_parity(
         raise AssertionError(
             f"expected {expected_state_count} geometry comparisons, found {len(states)}"
         )
+    if set(recognition_widgets) != {"erta", "eralpha"}:
+        raise AssertionError(
+            "batch recognition widget receipts are incomplete: "
+            f"{sorted(recognition_widgets)}"
+        )
+    comparable_recognition_widgets = {
+        endpoint: {
+            "reading_order": receipt["reading_order"],
+            "boxes": receipt["boxes"],
+            "run_callback": receipt["bindings"]["run_callback"],
+        }
+        for endpoint, receipt in recognition_widgets.items()
+    }
+    if (
+        comparable_recognition_widgets["erta"]
+        != comparable_recognition_widgets["eralpha"]
+    ):
+        raise AssertionError(
+            "ERTA/ERalpha batch feedback placement differs: "
+            + json.dumps(comparable_recognition_widgets, sort_keys=True)
+        )
+    batch_recognition_widget_contract = {
+        "criterion_id": "BRG-01-FEEDBACK-PLACEMENT",
+        "passed": True,
+        "exact_layout_match": True,
+        "endpoints": recognition_widgets,
+    }
     return {
         "coordinate_space": "relative to each selected endpoint_tab",
         "compared_widget_keys": sorted(maps["erta"]),
@@ -785,6 +1015,7 @@ def inspect_endpoint_geometry_parity(
         "initial_settling": initial_settling,
         "window_size_settling": window_size_settling,
         "states": states,
+        "batch_recognition_widgets": batch_recognition_widget_contract,
         "screenshots": screenshots,
         "screenshot_policy": (
             "Own Tk HWND only via PrintWindow; no desktop-capture fallback."
@@ -1107,6 +1338,633 @@ def inspect_shared_example_parity(
     }
 
 
+def _require_recognition(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(f"{BATCH_RECOGNITION_GATE_ID}: {message}")
+
+
+def _dialog_recognition_semantic(dialog: dict, context: str) -> str:
+    expected = {
+        "info": ("showinfo", "blue-information"),
+        "warning": ("showwarning", "yellow-warning"),
+        "error": ("showerror", "red-error"),
+    }
+    kind = str(dialog.get("kind", ""))
+    _require_recognition(
+        kind in expected,
+        f"{context} has an unknown dialog kind: {dialog}",
+    )
+    function, icon = expected[kind]
+    _require_recognition(
+        dialog.get("function") == function
+        and dialog.get("icon_semantic") == icon,
+        f"{context} dialog function/icon semantic drift: {dialog}",
+    )
+    return icon
+
+
+def _recognition_records_by_phase(records: list[dict]) -> dict:
+    grouped = {
+        endpoint: {}
+        for endpoint in ("erta", "eralpha")
+    }
+    for record in records:
+        endpoint = record.get("endpoint")
+        phase = record.get("phase")
+        _require_recognition(
+            endpoint in grouped and isinstance(phase, str) and phase,
+            f"malformed batch recognition record: {record}",
+        )
+        grouped[endpoint].setdefault(phase, []).append(record)
+    return grouped
+
+
+def _count_normalized_progress(text: str) -> str:
+    match = re.fullmatch(r"(\d+)% - (\d+)/(\d+) - (.+)", text)
+    _require_recognition(
+        match is not None,
+        f"batch progress has an unrecognized visible format: {text!r}",
+    )
+    return "<percent>% - <current>/<total> - " + match.group(4)
+
+
+def _resolution_transition_receipt(record: dict) -> dict:
+    events = list(record.get("transitions") or ())
+    progress_events = [
+        event
+        for event in events
+        if event.get("channel") == "progress"
+        and str(event.get("text", "")).endswith(
+            " - Resolving CAS/SMILES"
+        )
+    ]
+    progress_values = [
+        str(event.get("text", ""))
+        for event in progress_events
+    ]
+    detail_pattern = re.compile(
+        r"^Fetching SMILES from PubChem: "
+        r"(?P<current>\d+) / (?P<total>\d+) "
+        r"\((?P<cas>[^()\r\n]+)\)$"
+    )
+    detail_events = [
+        event
+        for event in events
+        if event.get("channel") == "detail"
+        and detail_pattern.fullmatch(str(event.get("text", "")))
+    ]
+    detail_values = [
+        str(event.get("text", ""))
+        for event in detail_events
+    ]
+    _require_recognition(
+        progress_values,
+        f"{record['endpoint']} did not display aggregate CAS-resolution progress",
+    )
+    _require_recognition(
+        detail_values,
+        f"{record['endpoint']} did not display per-row PubChem detail at the bottom",
+    )
+    for value in progress_values:
+        _count_normalized_progress(value)
+    parsed_details = [detail_pattern.fullmatch(value) for value in detail_values]
+    _require_recognition(
+        int(progress_events[0]["sequence"])
+        < int(detail_events[0]["sequence"]),
+        f"{record['endpoint']} per-row PubChem detail appeared before "
+        "aggregate resolution progress",
+    )
+    _require_recognition(
+        all(
+            1 <= int(match.group("current"))
+            <= int(match.group("total"))
+            for match in parsed_details
+            if match is not None
+        ),
+        f"{record['endpoint']} displayed an invalid PubChem row counter",
+    )
+    return {
+        "actual_progress_strings": progress_values,
+        "actual_detail_strings": detail_values,
+        "progress_format": (
+            "<percent>% - <current>/<total> - Resolving CAS/SMILES"
+        ),
+        "detail_format": (
+            "Fetching SMILES from PubChem: "
+            "<current> / <total> (<CAS>)"
+        ),
+        "cas_values": [
+            match.group("cas")
+            for match in parsed_details
+            if match is not None
+        ],
+    }
+
+
+def _assert_batch_controls(
+    record: dict,
+    expected_state: str,
+    context: str,
+) -> None:
+    expected = {
+        "input": expected_state,
+        "template": expected_state,
+        "run": expected_state,
+    }
+    _require_recognition(
+        record.get("controls") == expected,
+        f"{context} control-state drift: {record.get('controls')}",
+    )
+
+
+def _assert_unavailable_count_line(
+    text: str,
+    unavailable_count: int,
+    context: str,
+) -> None:
+    expected = f"{BATCH_UNAVAILABLE_LABEL}: {unavailable_count}"
+    _require_recognition(
+        expected in text.splitlines(),
+        f"{context} does not visibly contain the exact line {expected!r}",
+    )
+
+
+def _published_recognition_receipt(
+    record: dict,
+    *,
+    availability: str,
+) -> dict:
+    endpoint = record["endpoint"]
+    context = f"{endpoint}/{availability}"
+    total = int(record.get("total_count", -1))
+    unavailable = int(record.get("unavailable_count", -1))
+    workbook_unavailable = int(
+        record.get("workbook_unavailable_count", -1)
+    )
+    available = int(record.get("available_count", -1))
+    _require_recognition(total > 0, f"{context} has no result rows")
+    _require_recognition(
+        available + unavailable == total,
+        f"{context} available/unavailable counts do not total {total}",
+    )
+    _require_recognition(
+        workbook_unavailable == unavailable,
+        f"{context} UI count {unavailable} differs from workbook count "
+        f"{workbook_unavailable}",
+    )
+    if availability == "success":
+        _require_recognition(
+            unavailable == 0 and available == total,
+            f"{context} is not an all-available success",
+        )
+    elif availability == "partial_unavailable":
+        _require_recognition(
+            0 < unavailable < total and available > 0,
+            f"{context} is not partially unavailable",
+        )
+    elif availability == "all_unavailable":
+        _require_recognition(
+            unavailable == total and available == 0,
+            f"{context} is not all unavailable",
+        )
+    else:
+        raise AssertionError(f"unknown publication availability: {availability}")
+
+    output = str(record.get("output", ""))
+    result = str(record.get("result", ""))
+    status = str(record.get("status", ""))
+    dialog = record.get("dialog")
+    _require_recognition(
+        bool(output) and record.get("output_exists") is True,
+        f"{context} did not publish its recorded workbook",
+    )
+    _require_recognition(
+        str(record.get("progress", ""))
+        == f"100% - {total}/{total} - Completed",
+        f"{context} does not display terminal Completed progress: "
+        f"{record.get('progress')!r}",
+    )
+    _require_recognition(
+        result.startswith("Batch job completed and workbook saved.\n")
+        and output in result
+        and status == f"Batch prediction completed: {output}",
+        f"{context} does not visibly identify the completed workbook",
+    )
+    _require_recognition(
+        isinstance(dialog, dict)
+        and dialog.get("kind") == "info"
+        and dialog.get("title") == "Batch prediction done",
+        f"{context} did not use the successful publication dialog: {dialog}",
+    )
+    _require_recognition(
+        output in str(dialog.get("message", "")),
+        f"{context} success dialog omits the published workbook",
+    )
+    _require_recognition(
+        (dialog.get("batch_controls_at_dialog") or {}).get(endpoint)
+        == {
+            "input": "normal",
+            "template": "normal",
+            "run": "normal",
+        },
+        f"{context} dialog appeared before batch controls were restored",
+    )
+    icon = _dialog_recognition_semantic(dialog, context)
+    _require_recognition(
+        icon == "blue-information",
+        f"{context} successful publication is not blue/info",
+    )
+    _assert_unavailable_count_line(result, unavailable, f"{context} result")
+    _assert_unavailable_count_line(
+        str(dialog["message"]),
+        unavailable,
+        f"{context} dialog",
+    )
+    if availability == "success":
+        availability_sentence = "All rows were predicted."
+    elif availability == "partial_unavailable":
+        availability_sentence = (
+            f"{unavailable} row(s) could not be predicted. "
+            "Row-level reasons are saved in the workbook."
+        )
+    else:
+        availability_sentence = (
+            "No rows could be predicted. "
+            "Row-level reasons are saved in the workbook."
+        )
+    _require_recognition(
+        availability_sentence in result
+        and availability_sentence in str(dialog["message"]),
+        f"{context} omits the exact row-availability explanation",
+    )
+    _assert_batch_controls(record, "normal", context)
+    return {
+        "state_meaning": "published",
+        "terminal_stage": "Completed",
+        "dialog_title": dialog["title"],
+        "dialog_function": dialog["function"],
+        "icon_semantic": icon,
+        "availability": availability,
+        "count_fields_normalized": True,
+        "endpoint_label_normalized": True,
+        "raw_progress": record["progress"],
+        "raw_status": status,
+        "raw_result": result,
+        "raw_dialog_message": dialog["message"],
+        "total_count": total,
+        "available_count": available,
+        "unavailable_count": unavailable,
+        "workbook_unavailable_count": workbook_unavailable,
+        "availability_sentence": availability_sentence,
+    }
+
+
+def evaluate_batch_recognition_contract(
+    records: list[dict],
+    widget_contract: dict,
+) -> dict:
+    """Fail closed on the automated cross-endpoint batch recognition contract."""
+    _require_recognition(
+        widget_contract.get("passed") is True
+        and widget_contract.get("exact_layout_match") is True
+        and set(widget_contract.get("endpoints", {}))
+        == {"erta", "eralpha"},
+        "batch feedback widget placement/binding evidence is incomplete",
+    )
+    for endpoint, receipt in widget_contract["endpoints"].items():
+        bindings = receipt.get("bindings") or {}
+        _require_recognition(
+            receipt.get("passed") is True
+            and receipt.get("criterion_id")
+            == "BRG-01-FEEDBACK-PLACEMENT"
+            and receipt.get("reading_order")
+            == [
+                "run_batch",
+                "aggregate_progress",
+                "batch_result",
+                "per_row_detail",
+            ],
+            f"{endpoint} feedback placement/binding contract failed",
+        )
+        _require_recognition(
+            bindings.get("run_callback") == "batch_predict_clicked"
+            and "batch_predict_clicked"
+            in str(bindings.get("run_command", ""))
+            and bool(bindings.get("progress_value_variable"))
+            and bool(bindings.get("progress_text_variable"))
+            and bool(bindings.get("per_row_detail_variable")),
+            f"{endpoint} feedback widget bindings are incomplete: {bindings}",
+        )
+
+    grouped = _recognition_records_by_phase(records)
+    required_phases = {
+        "new_run",
+        "resolving",
+        "success",
+        "partial_unavailable",
+        "all_unavailable",
+        "no_output_failure",
+    }
+    for endpoint in ("erta", "eralpha"):
+        missing = required_phases - set(grouped[endpoint])
+        _require_recognition(
+            not missing,
+            f"{endpoint} is missing recognition phases: {sorted(missing)}",
+        )
+
+    new_run_receipts = {}
+    resolution_receipts = {}
+    publication_receipts = {
+        phase: {}
+        for phase in (
+            "success",
+            "partial_unavailable",
+            "all_unavailable",
+        )
+    }
+    failure_receipts = {}
+    screenshot_receipts = []
+    for endpoint in ("erta", "eralpha"):
+        prior_terminal_cleared = False
+        for record in grouped[endpoint]["new_run"]:
+            context = f"{endpoint}/new_run/{record.get('scenario', '')}"
+            progress = str(record.get("progress", ""))
+            status = str(record.get("status", ""))
+            result = str(record.get("result", ""))
+            prior_progress = str(record.get("prior_progress", ""))
+            prior_result = str(record.get("prior_result", ""))
+            _assert_batch_controls(record, "disabled", context)
+            _require_recognition(
+                record.get("dialog") is None
+                and progress
+                == "0% - 0/0 - Reading input workbook"
+                and status == "Batch prediction started."
+                and result
+                == (
+                    "Batch prediction is running.\n\n"
+                    "Completion details will appear after the workbook is "
+                    "saved."
+                )
+                and "Completed" not in progress
+                and "Completed" not in status
+                and "completed" not in result.casefold()
+                and "Output workbook:" not in result,
+                f"{context} retained terminal success presentation",
+            )
+            if (
+                "Completed" in prior_progress
+                and "Output workbook:" in prior_result
+            ):
+                prior_terminal_cleared = True
+            screenshot = record.get("screenshot")
+            if isinstance(screenshot, dict):
+                screenshot_receipts.append(
+                    {
+                        "endpoint": endpoint,
+                        "state": "running",
+                        **screenshot,
+                    }
+                )
+        _require_recognition(
+            prior_terminal_cleared,
+            f"{endpoint} did not prove a prior Completed result was cleared "
+            "by a subsequent real callback",
+        )
+        representative_new_run = grouped[endpoint]["new_run"][-1]
+        new_run_receipts[endpoint] = {
+            "state_meaning": "running",
+            "progress_format": _count_normalized_progress(
+                str(representative_new_run["progress"])
+            ),
+            "stale_completed_visible": False,
+            "controls": "disabled",
+        }
+
+        resolving_candidates = [
+            _resolution_transition_receipt(record)
+            for record in grouped[endpoint]["resolving"]
+        ]
+        resolution_receipts[endpoint] = resolving_candidates[0]
+
+        for phase in publication_receipts:
+            record = grouped[endpoint][phase][-1]
+            publication_receipts[phase][endpoint] = (
+                _published_recognition_receipt(
+                    record,
+                    availability=phase,
+                )
+            )
+            screenshot = record.get("screenshot")
+            if phase == "success" and isinstance(screenshot, dict):
+                screenshot_receipts.append(
+                    {
+                        "endpoint": endpoint,
+                        "state": "completion",
+                        **screenshot,
+                    }
+                )
+
+        failure = grouped[endpoint]["no_output_failure"][-1]
+        context = f"{endpoint}/no_output_failure"
+        dialog = failure.get("dialog")
+        result = str(failure.get("result", ""))
+        status = str(failure.get("status", ""))
+        _require_recognition(
+            failure.get("output_exists") is False
+            and not failure.get("output")
+            and failure.get("fresh_output_count") == 0,
+            f"{context} created or claimed an output",
+        )
+        _require_recognition(
+            failure.get("progress") == "100% - 0/0 - Failed"
+            and result.startswith("Batch prediction failed.\n")
+            and "Output workbook:" not in result
+            and "completed" not in result.casefold()
+            and status.startswith("Batch prediction failed:")
+            and "saved" not in status.casefold(),
+            f"{context} does not visibly distinguish failure from publication",
+        )
+        _require_recognition(
+            isinstance(dialog, dict)
+            and dialog.get("kind") == "error"
+            and dialog.get("title") == "Batch prediction failed",
+            f"{context} did not use the failure dialog: {dialog}",
+        )
+        _require_recognition(
+            (dialog.get("batch_controls_at_dialog") or {}).get(endpoint)
+            == {
+                "input": "normal",
+                "template": "normal",
+                "run": "normal",
+            },
+            f"{context} dialog appeared before controls were restored",
+        )
+        icon = _dialog_recognition_semantic(dialog, context)
+        _require_recognition(
+            icon == "red-error",
+            f"{context} failure is not red/error",
+        )
+        _assert_batch_controls(failure, "normal", context)
+        failure_receipts[endpoint] = {
+            "state_meaning": "no-output failure",
+            "terminal_stage": "Failed",
+            "dialog_title": dialog["title"],
+            "dialog_function": dialog["function"],
+            "icon_semantic": icon,
+            "fresh_output_count": 0,
+            "raw_progress": failure["progress"],
+            "raw_status": status,
+            "raw_result": result,
+            "raw_dialog_message": dialog["message"],
+        }
+
+    _require_recognition(
+        {
+            receipt["progress_format"]
+            for receipt in new_run_receipts.values()
+        }
+        == {
+            "<percent>% - <current>/<total> - Reading input workbook"
+        },
+        f"new-run meaning differs by endpoint: {new_run_receipts}",
+    )
+    _require_recognition(
+        {
+            receipt["progress_format"]
+            for receipt in resolution_receipts.values()
+        }
+        == {
+            "<percent>% - <current>/<total> - Resolving CAS/SMILES"
+        }
+        and {
+            receipt["detail_format"]
+            for receipt in resolution_receipts.values()
+        }
+        == {
+            "Fetching SMILES from PubChem: "
+            "<current> / <total> (<CAS>)"
+        }
+        and resolution_receipts["erta"]["cas_values"]
+        == resolution_receipts["eralpha"]["cas_values"],
+        f"CAS-resolution feedback format differs by endpoint: "
+        f"{resolution_receipts}",
+    )
+    for phase, endpoint_receipts in publication_receipts.items():
+        meanings = {
+            (
+                receipt["state_meaning"],
+                receipt["terminal_stage"],
+                receipt["dialog_title"],
+                receipt["dialog_function"],
+                receipt["icon_semantic"],
+                receipt["availability"],
+            )
+            for receipt in endpoint_receipts.values()
+        }
+        _require_recognition(
+            len(meanings) == 1,
+            f"{phase} state meaning differs by endpoint: {endpoint_receipts}",
+        )
+    _require_recognition(
+        len(
+            {
+                (
+                    receipt["state_meaning"],
+                    receipt["terminal_stage"],
+                    receipt["dialog_title"],
+                    receipt["dialog_function"],
+                    receipt["icon_semantic"],
+                )
+                for receipt in failure_receipts.values()
+            }
+        )
+        == 1,
+        f"no-output failure meaning differs by endpoint: {failure_receipts}",
+    )
+
+    expected_screenshots = {
+        (endpoint, state)
+        for endpoint in ("erta", "eralpha")
+        for state in ("running", "completion")
+    }
+    observed_screenshots = {
+        (receipt["endpoint"], receipt["state"])
+        for receipt in screenshot_receipts
+    }
+    _require_recognition(
+        expected_screenshots <= observed_screenshots,
+        "running/completion own-window screenshot receipts are incomplete: "
+        f"{sorted(expected_screenshots - observed_screenshots)}",
+    )
+    for screenshot in screenshot_receipts:
+        _require_recognition(
+            screenshot.get("method")
+            == "PrintWindow(PW_RENDERFULLCONTENT)"
+            and screenshot.get("capture_scope") == "own Tk HWND only"
+            and (
+                (
+                    screenshot.get("supported") is True
+                    and bool(screenshot.get("path"))
+                    and bool(screenshot.get("target_hwnd"))
+                    and Path(str(screenshot["path"])).is_file()
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(screenshot.get("sha256", "")),
+                    )
+                    is not None
+                )
+                or (
+                    screenshot.get("supported") is False
+                    and bool(screenshot.get("reason"))
+                )
+            ),
+            "screenshot evidence used a non-own-window method or is "
+            f"incomplete: {screenshot}",
+        )
+
+    passed_ids = list(BATCH_RECOGNITION_CRITERIA)
+    return {
+        "gate_id": BATCH_RECOGNITION_GATE_ID,
+        "passed": True,
+        "criteria": [
+            {
+                "id": criterion_id,
+                "description": BATCH_RECOGNITION_CRITERIA[criterion_id],
+                "passed": True,
+            }
+            for criterion_id in passed_ids
+        ],
+        "criteria_ids": passed_ids,
+        "widget_contract": widget_contract,
+        "comparison": {
+            "new_run": new_run_receipts,
+            "resolving": resolution_receipts,
+            **publication_receipts,
+            "no_output_failure": failure_receipts,
+        },
+        "records": records,
+        "screenshots": screenshot_receipts,
+        "normalization": {
+            "normalized_fields": [
+                "endpoint display label",
+                "endpoint-specific prediction-label counts",
+            ],
+            "whole_messages_normalized": False,
+            "raw_displayed_strings_retained": True,
+        },
+        "validation_scope": {
+            "automated_recognition_contract_checks": True,
+            "real_human_usability_study_performed": False,
+            "statement": (
+                "This gate checks machine-observable recognition cues, real "
+                "callback transitions, displayed strings, widget placement, "
+                "and messagebox API semantics. It is not evidence from a real "
+                "human usability study; no such study was performed."
+            ),
+        },
+    }
+
+
 class NativePackageQa:
     """Drive real Tk callbacks and record fail-closed packaged-app evidence."""
 
@@ -1146,6 +2004,7 @@ class NativePackageQa:
     LEGACY_INVALID_SMILES = "not a SMILES"
     MOCK_CAS = "50-00-0"
     MOCK_SMILES = "C=O"
+    MOCK_UNAVAILABLE_CAS_VALUES = ("7732-18-5", "58-08-2")
     ERBA_BATCH_AD_COLUMNS = (
         "AD",
         "AD_MeanDistance",
@@ -1197,6 +2056,9 @@ class NativePackageQa:
         self.erba_batch_outputs_before: set[Path] = set()
         self.erba_batch_graph_dirs_before: set[Path] = set()
         self.dialogs: list[dict] = []
+        self.batch_recognition_records: list[dict] = []
+        self.batch_recognition_widget_contract: dict | None = None
+        self._active_batch_transition_observer: dict | None = None
         self.patches: list[tuple[object, str, object]] = []
         self.mock_cas_enabled = False
         self.mock_cas_values: set[str] = {self.MOCK_CAS}
@@ -1295,7 +2157,7 @@ class NativePackageQa:
         # visible title/body while preserving the callback path that invokes them.
         from gui import erba_tab, main_window
 
-        def observe(kind):
+        def observe(kind, function, icon_semantic):
             def handler(title, message, **_kwargs):
                 controls_at_dialog = {}
                 for endpoint, owner in (
@@ -1313,6 +2175,8 @@ class NativePackageQa:
                 self.dialogs.append(
                     {
                         "kind": kind,
+                        "function": function,
+                        "icon_semantic": icon_semantic,
                         "title": str(title),
                         "message": str(message),
                         "batch_controls_at_dialog": controls_at_dialog,
@@ -1326,9 +2190,21 @@ class NativePackageQa:
             id(erba_tab.messagebox): erba_tab.messagebox,
         }
         for messagebox_module in messagebox_modules.values():
-            self._patch(messagebox_module, "showerror", observe("error"))
-            self._patch(messagebox_module, "showinfo", observe("info"))
-            self._patch(messagebox_module, "showwarning", observe("warning"))
+            self._patch(
+                messagebox_module,
+                "showerror",
+                observe("error", "showerror", "red-error"),
+            )
+            self._patch(
+                messagebox_module,
+                "showinfo",
+                observe("info", "showinfo", "blue-information"),
+            )
+            self._patch(
+                messagebox_module,
+                "showwarning",
+                observe("warning", "showwarning", "yellow-warning"),
+            )
         self.transcript["automation_scopes"].append({
             "scope": "messagebox_observer",
             "functions": ["showinfo", "showwarning", "showerror"],
@@ -1342,6 +2218,10 @@ class NativePackageQa:
 
         def mocked_cas_to_smiles(cas: str) -> dict:
             normalized = str(cas).strip()
+            if normalized in self.MOCK_UNAVAILABLE_CAS_VALUES:
+                raise RuntimeError(
+                    "deterministic native-QA PubChem unavailability"
+                )
             if normalized not in self.mock_cas_values:
                 raise RuntimeError(f"unexpected deterministic QA CAS: {cas}")
             return {"CanonicalSMILES": self.MOCK_SMILES, "PubChem_CID": "712"}
@@ -1352,12 +2232,17 @@ class NativePackageQa:
         self.transcript["automation_scopes"].append({
             "scope": "mocked_pubchem",
             "cas_values": sorted(self.mock_cas_values),
+            "unavailable_cas_values": list(
+                self.MOCK_UNAVAILABLE_CAS_VALUES
+            ),
             "canonical_smiles": self.MOCK_SMILES,
             "cid": "712",
             "reason": (
                 "deterministic opt-in UI callback and bundled 25-CAS batch "
-                "coverage; every CAS is deliberately substituted with the same "
-                "valid SMILES and no network request is made"
+                "coverage; recognized success CAS values are deliberately "
+                "substituted with the same valid SMILES, while two explicit "
+                "CAS values raise a deterministic unavailable response; no "
+                "network request is made"
             ),
             "production_equivalent": False,
             "online_verification": (
@@ -1382,6 +2267,7 @@ class NativePackageQa:
         })
 
     def _finish(self, passed: bool, error: str = "") -> None:
+        self._stop_batch_transition_observer(record_resolution=False)
         self._restore_patches()
         self.transcript["passed"] = passed
         self.transcript["duration_seconds"] = time.monotonic() - self.started_at
@@ -1416,6 +2302,227 @@ class NativePackageQa:
             "template": str(owner.download_template_button.cget("state")),
             "run": str(owner.run_batch_button.cget("state")),
         }
+
+    def _batch_owner(self, endpoint: str):
+        if endpoint == "erta":
+            return self.app
+        if endpoint == "eralpha":
+            return self.app.eralpha_tab
+        raise AssertionError(f"unknown batch endpoint: {endpoint}")
+
+    @staticmethod
+    def _batch_status_value(owner) -> str:
+        status_var = getattr(owner, "status_var", None)
+        if status_var is None:
+            status_var = owner.batch_status_var
+        return str(status_var.get())
+
+    @staticmethod
+    def _batch_result_value(owner) -> str:
+        return str(owner.batch_result.get("1.0", "end")).strip()
+
+    def _select_batch_surface(self, endpoint: str) -> None:
+        owner = self._batch_owner(endpoint)
+        controls = owner.parity_widgets
+        self.app.notebook.select(controls["endpoint_tab"])
+        controls["mode_notebook"].select(controls["batch_tab"])
+        self.app.update()
+        self.app.update_idletasks()
+
+    def _begin_batch_transition_observer(
+        self,
+        endpoint: str,
+        scenario: str,
+    ) -> None:
+        self._require(
+            self._active_batch_transition_observer is None,
+            "a batch transition observer is already active",
+        )
+        owner = self._batch_owner(endpoint)
+        self._select_batch_surface(endpoint)
+        detail_var = getattr(owner, "status_var", None)
+        if detail_var is None:
+            detail_var = owner.batch_status_var
+        events: list[dict] = []
+        traces = []
+
+        def add_trace(channel, variable):
+            def observed(*_args):
+                events.append(
+                    {
+                        "sequence": len(events) + 1,
+                        "channel": channel,
+                        "text": str(variable.get()),
+                    }
+                )
+
+            token = variable.trace_add("write", observed)
+            traces.append((variable, token))
+
+        add_trace("progress", owner.batch_progress_var)
+        add_trace("detail", detail_var)
+        self._active_batch_transition_observer = {
+            "endpoint": endpoint,
+            "scenario": scenario,
+            "events": events,
+            "traces": traces,
+            "dialog_count": len(self.dialogs),
+            "prior_progress": str(owner.batch_progress_var.get()),
+            "prior_status": self._batch_status_value(owner),
+            "prior_result": self._batch_result_value(owner),
+        }
+
+    def _stop_batch_transition_observer(
+        self,
+        *,
+        record_resolution: bool = True,
+    ) -> dict | None:
+        observer = self._active_batch_transition_observer
+        if observer is None:
+            return None
+        self._active_batch_transition_observer = None
+        for variable, token in observer["traces"]:
+            try:
+                variable.trace_remove("write", token)
+            except Exception:
+                pass
+        has_resolution_progress = any(
+            event["channel"] == "progress"
+            and event["text"].endswith(
+                " - Resolving CAS/SMILES"
+            )
+            for event in observer["events"]
+        )
+        has_pubchem_detail = any(
+            event["channel"] == "detail"
+            and event["text"].startswith(
+                "Fetching SMILES from PubChem:"
+            )
+            for event in observer["events"]
+        )
+        if (
+            record_resolution
+            and has_resolution_progress
+            and has_pubchem_detail
+        ):
+            self.batch_recognition_records.append(
+                {
+                    "endpoint": observer["endpoint"],
+                    "phase": "resolving",
+                    "scenario": observer["scenario"],
+                    "transitions": list(observer["events"]),
+                }
+            )
+        return observer
+
+    def _capture_batch_screenshot(
+        self,
+        endpoint: str,
+        state: str,
+    ) -> dict:
+        owner = self._batch_owner(endpoint)
+        self._require(
+            self.app.notebook.select()
+            == str(owner.parity_widgets["endpoint_tab"])
+            and owner.parity_widgets["mode_notebook"].select()
+            == str(owner.parity_widgets["batch_tab"]),
+            f"{endpoint} {state} screenshot is not on its visible batch surface",
+        )
+        self.app.update_idletasks()
+        screenshot = _capture_own_tk_window(
+            self.app,
+            self.run_root
+            / "batch-recognition-screenshots"
+            / f"{endpoint}-{state}.png",
+        )
+        screenshot["capture_scope"] = "own Tk HWND only"
+        return screenshot
+
+    def _record_batch_new_run(
+        self,
+        endpoint: str,
+        *,
+        screenshot: bool = False,
+    ) -> dict:
+        observer = self._active_batch_transition_observer
+        self._require(
+            observer is not None and observer["endpoint"] == endpoint,
+            f"{endpoint} new-run snapshot has no matching observer",
+        )
+        owner = self._batch_owner(endpoint)
+        record = {
+            "endpoint": endpoint,
+            "phase": "new_run",
+            "scenario": observer["scenario"],
+            "progress": str(owner.batch_progress_var.get()),
+            "status": self._batch_status_value(owner),
+            "result": self._batch_result_value(owner),
+            "controls": self._batch_control_states(owner),
+            "dialog": (
+                None
+                if len(self.dialogs) == observer["dialog_count"]
+                else self.dialogs[observer["dialog_count"]]
+            ),
+            "prior_progress": observer["prior_progress"],
+            "prior_status": observer["prior_status"],
+            "prior_result": observer["prior_result"],
+        }
+        if screenshot:
+            record["screenshot"] = self._capture_batch_screenshot(
+                endpoint,
+                "running",
+            )
+        self.batch_recognition_records.append(record)
+        return record
+
+    def _record_batch_terminal(
+        self,
+        endpoint: str,
+        phase: str,
+        *,
+        dialog: dict,
+        output: str | Path | None,
+        output_exists: bool,
+        total_count: int = 0,
+        available_count: int = 0,
+        unavailable_count: int = 0,
+        workbook_unavailable_count: int = 0,
+        fresh_output_count: int = 0,
+        screenshot: bool = False,
+    ) -> dict:
+        owner = self._batch_owner(endpoint)
+        observer = self._stop_batch_transition_observer()
+        self._require(
+            observer is not None
+            and observer["endpoint"] == endpoint,
+            f"{endpoint} terminal snapshot has no matching observer",
+        )
+        record = {
+            "endpoint": endpoint,
+            "phase": phase,
+            "scenario": observer["scenario"],
+            "progress": str(owner.batch_progress_var.get()),
+            "status": self._batch_status_value(owner),
+            "result": self._batch_result_value(owner),
+            "controls": self._batch_control_states(owner),
+            "dialog": dialog,
+            "output": str(output) if output is not None else "",
+            "output_exists": bool(output_exists),
+            "fresh_output_count": int(fresh_output_count),
+            "total_count": int(total_count),
+            "available_count": int(available_count),
+            "unavailable_count": int(unavailable_count),
+            "workbook_unavailable_count": int(
+                workbook_unavailable_count
+            ),
+        }
+        if screenshot:
+            record["screenshot"] = self._capture_batch_screenshot(
+                endpoint,
+                "completion",
+            )
+        self.batch_recognition_records.append(record)
+        return record
 
     def _terminal_dialog(
         self,
@@ -1628,6 +2735,9 @@ class NativePackageQa:
             app,
             self.run_root / "ui-parity-screenshots",
         )
+        self.batch_recognition_widget_contract = geometry_receipt[
+            "batch_recognition_widgets"
+        ]
         self._record(
             "erta_eralpha_exact_ui_geometry_and_examples",
             examples=example_receipt,
@@ -2069,6 +3179,10 @@ class NativePackageQa:
                 )
                 app.batch_destination_var.set(str(self.erta_batch_input_path.parent))
                 self.batch_dialog_count = len(self.dialogs)
+                self._begin_batch_transition_observer(
+                    "erta",
+                    "shared_success",
+                )
                 app.batch_predict_clicked()
                 self.erta_success_locked_controls = (
                     self._batch_control_states(app)
@@ -2083,6 +3197,7 @@ class NativePackageQa:
                     },
                     "ERTA shared-example batch did not lock its controls",
                 )
+                self._record_batch_new_run("erta", screenshot=True)
                 self.stage = 7
                 self._reschedule()
                 return
@@ -2215,11 +3330,33 @@ class NativePackageQa:
                         "run": "normal",
                     }
                     and app.batch_progress_var.get()
-                    == "100% - 25/25 - Complete"
+                    == "100% - 25/25 - Completed"
                     and int(app.batch_progress_value.get()) == 100,
                     "ERTA batch controls were not restored after success",
                 )
                 self.erta_success_result_identity = id(app.last_batch_result)
+                recognition = self._record_batch_terminal(
+                    "erta",
+                    "success",
+                    dialog=completion_dialog,
+                    output=output,
+                    output_exists=output.is_file(),
+                    total_count=len(rows),
+                    available_count=sum(
+                        row["Mol_valid"] is True
+                        for row in rows
+                    ),
+                    unavailable_count=sum(
+                        row["Mol_valid"] is not True
+                        for row in rows
+                    ),
+                    workbook_unavailable_count=sum(
+                        row["Mol_valid"] is not True
+                        for row in rows
+                    ),
+                    fresh_output_count=1,
+                    screenshot=True,
+                )
                 self._record(
                     "erta_shared_test_batch_success_dialog_and_predictions",
                     input=str(self.erta_batch_input_path),
@@ -2247,6 +3384,7 @@ class NativePackageQa:
                     controls_during_run=self.erta_success_locked_controls,
                     controls=self._batch_control_states(app),
                     completion_dialog=completion_dialog,
+                    recognition=recognition,
                 )
                 self.stage = 72
             if self.stage == 72:
@@ -2260,6 +3398,14 @@ class NativePackageQa:
                 sheet.append([1, self.MOCK_CAS, "mocked-cas", ""])
                 sheet.append(
                     [3, "", "legacy-invalid", self.LEGACY_INVALID_SMILES]
+                )
+                sheet.append(
+                    [
+                        4,
+                        self.MOCK_UNAVAILABLE_CAS_VALUES[0],
+                        "pubchem-unavailable",
+                        "",
+                    ]
                 )
                 workbook.save(mixed_input)
                 workbook.close()
@@ -2276,6 +3422,10 @@ class NativePackageQa:
                 )
                 app.batch_destination_var.set(str(mixed_directory))
                 self.erta_mixed_dialog_count = len(self.dialogs)
+                self._begin_batch_transition_observer(
+                    "erta",
+                    "partial_unavailable",
+                )
                 app.batch_predict_clicked()
                 self.erta_mixed_locked_controls = (
                     self._batch_control_states(app)
@@ -2290,6 +3440,7 @@ class NativePackageQa:
                     },
                     "ERTA mixed batch did not start with locked controls",
                 )
+                self._record_batch_new_run("erta")
                 self.stage = 73
                 self._reschedule()
                 return
@@ -2335,6 +3486,10 @@ class NativePackageQa:
                             values_only=True,
                         )
                     )
+                    mixed_dict_rows = [
+                        dict(zip(mixed_headers, row))
+                        for row in mixed_rows
+                    ]
                     self._require(
                         sheet.title == "Sheet1",
                         "legacy ERTA workbook sheet name drift",
@@ -2362,7 +3517,7 @@ class NativePackageQa:
                     "legacy ERTA mixed workbook schema/order drift",
                 )
                 self._require(
-                    [row[0] for row in mixed_rows] == [2, 1, 3],
+                    [row[0] for row in mixed_rows] == [2, 1, 3, 4],
                     "ERTA mixed batch input order drift",
                 )
                 self._require(
@@ -2374,6 +3529,25 @@ class NativePackageQa:
                     mixed_rows[2][5] is False,
                     "legacy invalid mixed-batch row lost its invalid marker",
                 )
+                self._require(
+                    mixed_dict_rows[3]["CAS"]
+                    == self.MOCK_UNAVAILABLE_CAS_VALUES[0]
+                    and str(
+                        mixed_dict_rows[3].get("PubChem_status") or ""
+                    ).startswith("Not found:")
+                    and mixed_dict_rows[3]["Mol_valid"] is False
+                    and mixed_dict_rows[3][
+                        "Probability_Negative_0"
+                    ]
+                    is not None
+                    and mixed_dict_rows[3][
+                        "Probability_Positive_1"
+                    ]
+                    is not None
+                    and mixed_dict_rows[3]["Prediction_label"]
+                    in {"Positive", "Negative"},
+                    "ERTA mixed batch did not retain its unavailable row",
+                )
                 mixed_graphs = sorted(
                     path.name
                     for path in (mixed_parent / "graphs").glob("*.png")
@@ -2384,6 +3558,8 @@ class NativePackageQa:
                 self._require(
                     mixed_graphs
                     and f"Output workbook: {mixed_output}" in mixed_summary
+                    and f"{BATCH_UNAVAILABLE_LABEL}: 2"
+                    in mixed_summary
                     and "AD In-domain:" in mixed_summary
                     and "Graph directory:" in mixed_summary,
                     "ERTA mixed batch artifacts or completion summary are incomplete",
@@ -2403,7 +3579,7 @@ class NativePackageQa:
                         "run": "normal",
                     }
                     and app.batch_progress_var.get()
-                    == "100% - 3/3 - Complete"
+                    == "100% - 4/4 - Completed"
                     and int(app.batch_progress_value.get()) == 100,
                     "ERTA mixed batch did not restore controls and progress",
                 )
@@ -2415,6 +3591,21 @@ class NativePackageQa:
                 self.erta_success_result_identity = id(
                     app.last_batch_result
                 )
+                mixed_recognition = self._record_batch_terminal(
+                    "erta",
+                    "partial_unavailable",
+                    dialog=mixed_dialog,
+                    output=mixed_output,
+                    output_exists=mixed_output.is_file(),
+                    total_count=len(mixed_rows),
+                    available_count=2,
+                    unavailable_count=2,
+                    workbook_unavailable_count=sum(
+                        row["Mol_valid"] is not True
+                        for row in mixed_dict_rows
+                    ),
+                    fresh_output_count=1,
+                )
                 self._record(
                     "erta_batch_workbook_graphs_and_order",
                     input=str(self.erta_mixed_input_path),
@@ -2424,12 +3615,205 @@ class NativePackageQa:
                     input_order=[row[0] for row in mixed_rows],
                     mocked_cas_status=mixed_rows[1][-1],
                     invalid_row_mol_valid=mixed_rows[2][5],
+                    unavailable_row={
+                        key: mixed_dict_rows[3].get(key)
+                        for key in (
+                            "CAS",
+                            "PubChem_status",
+                            "Mol_valid",
+                            "Probability_Negative_0",
+                            "Probability_Positive_1",
+                            "Prediction_label",
+                        )
+                    },
                     graph_files=mixed_graphs,
                     batch_summary=mixed_summary,
                     progress=app.batch_progress_var.get(),
                     controls_during_run=self.erta_mixed_locked_controls,
                     controls=restored_controls,
                     completion_dialog=mixed_dialog,
+                    recognition=mixed_recognition,
+                )
+                self.erta_mixed_check = self.transcript["checks"][-1]
+                self.stage = 74
+            if self.stage == 74:
+                unavailable_directory = (
+                    self.run_root / "all-unavailable-batch" / "erta"
+                )
+                unavailable_directory.mkdir(parents=True, exist_ok=False)
+                unavailable_input = (
+                    unavailable_directory / "all-unavailable-input.xlsx"
+                )
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.append(["CAS"])
+                for cas in self.MOCK_UNAVAILABLE_CAS_VALUES:
+                    sheet.append([cas])
+                workbook.save(unavailable_input)
+                workbook.close()
+                self.erta_unavailable_input_path = (
+                    unavailable_input.resolve(strict=True)
+                )
+                self.erta_unavailable_outputs_before = {
+                    path.resolve()
+                    for path in unavailable_directory.glob("ERTA_*.xlsx")
+                }
+                app.batch_input_var.set(
+                    str(self.erta_unavailable_input_path)
+                )
+                app.batch_input_display_var.set(
+                    self.erta_unavailable_input_path.name
+                )
+                app.batch_destination_var.set(
+                    str(unavailable_directory)
+                )
+                self.erta_unavailable_dialog_count = len(self.dialogs)
+                self._begin_batch_transition_observer(
+                    "erta",
+                    "all_unavailable",
+                )
+                app.batch_predict_clicked()
+                self.erta_unavailable_locked_controls = (
+                    self._batch_control_states(app)
+                )
+                self._require(
+                    app._batch_active
+                    and self.erta_unavailable_locked_controls
+                    == {
+                        "input": "disabled",
+                        "template": "disabled",
+                        "run": "disabled",
+                    },
+                    "ERTA all-unavailable batch did not start with locked "
+                    "controls",
+                )
+                self._record_batch_new_run("erta")
+                self.stage = 75
+                self._reschedule()
+                return
+            if self.stage == 75:
+                if (
+                    app._batch_active
+                    or not self._wait_dialog(
+                        self.erta_unavailable_dialog_count
+                    )
+                ):
+                    self._reschedule()
+                    return
+                unavailable_parent = (
+                    self.erta_unavailable_input_path.parent
+                )
+                unavailable_outputs = {
+                    path.resolve()
+                    for path in unavailable_parent.glob("ERTA_*.xlsx")
+                } - self.erta_unavailable_outputs_before
+                self._require(
+                    len(unavailable_outputs) == 1,
+                    "expected one fresh all-unavailable ERTA workbook, "
+                    f"found {len(unavailable_outputs)}",
+                )
+                unavailable_output = unavailable_outputs.pop()
+                workbook = load_workbook(
+                    unavailable_output,
+                    read_only=True,
+                    data_only=True,
+                )
+                try:
+                    unavailable_sheet = workbook.active
+                    unavailable_headers = [
+                        cell.value for cell in unavailable_sheet[1]
+                    ]
+                    unavailable_rows = [
+                        dict(zip(unavailable_headers, row))
+                        for row in unavailable_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    ]
+                finally:
+                    workbook.close()
+                self._require(
+                    len(unavailable_rows)
+                    == len(self.MOCK_UNAVAILABLE_CAS_VALUES)
+                    and [
+                        str(row["CAS"])
+                        for row in unavailable_rows
+                    ]
+                    == list(self.MOCK_UNAVAILABLE_CAS_VALUES)
+                    and all(
+                        str(row.get("PubChem_status") or "").startswith(
+                            "Not found:"
+                        )
+                        and row["Mol_valid"] is False
+                        and row["Probability_Negative_0"] is not None
+                        and row["Probability_Positive_1"] is not None
+                        and row["Prediction_label"]
+                        in {"Positive", "Negative"}
+                        for row in unavailable_rows
+                    ),
+                    "ERTA all-unavailable result did not retain explicit "
+                    "Mol_valid/PubChem unavailable row markers",
+                )
+                unavailable_summary = self._batch_result_value(app)
+                unavailable_dialog = self._terminal_dialog(
+                    self.erta_unavailable_dialog_count,
+                    kind="info",
+                    title="Batch prediction done",
+                    context="ERTA all-unavailable batch publication",
+                )
+                restored_controls = self._batch_control_states(app)
+                unavailable_count = len(unavailable_rows)
+                self._require(
+                    f"{BATCH_UNAVAILABLE_LABEL}: {unavailable_count}"
+                    in unavailable_summary
+                    and f"{BATCH_UNAVAILABLE_LABEL}: "
+                    f"{unavailable_count}"
+                    in unavailable_dialog["message"]
+                    and app.batch_progress_var.get()
+                    == (
+                        f"100% - {unavailable_count}/"
+                        f"{unavailable_count} - Completed"
+                    )
+                    and restored_controls
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    },
+                    "ERTA all-unavailable publication feedback drift",
+                )
+                unavailable_recognition = self._record_batch_terminal(
+                    "erta",
+                    "all_unavailable",
+                    dialog=unavailable_dialog,
+                    output=unavailable_output,
+                    output_exists=unavailable_output.is_file(),
+                    total_count=unavailable_count,
+                    available_count=0,
+                    unavailable_count=unavailable_count,
+                    workbook_unavailable_count=sum(
+                        row["Mol_valid"] is not True
+                        for row in unavailable_rows
+                    ),
+                    fresh_output_count=1,
+                )
+                self.erta_mixed_check["all_unavailable"] = {
+                    "input": str(self.erta_unavailable_input_path),
+                    "output": str(unavailable_output),
+                    "row_count": unavailable_count,
+                    "unavailable_count": unavailable_count,
+                    "rows": unavailable_rows,
+                    "batch_summary": unavailable_summary,
+                    "completion_dialog": unavailable_dialog,
+                    "progress": app.batch_progress_var.get(),
+                    "controls_during_run": (
+                        self.erta_unavailable_locked_controls
+                    ),
+                    "controls": restored_controls,
+                    "recognition": unavailable_recognition,
+                }
+                self.erta_success_result_identity = id(
+                    app.last_batch_result
                 )
                 self.stage = 70
             if self.stage == 70:
@@ -2447,6 +3831,10 @@ class NativePackageQa:
                 app.batch_input_display_var.set(failure_input.name)
                 app.batch_destination_var.set(str(failure_input.parent))
                 self.erta_failure_dialog_count = len(self.dialogs)
+                self._begin_batch_transition_observer(
+                    "erta",
+                    "no_output_failure",
+                )
                 app.batch_predict_clicked()
                 self.erta_failure_locked_controls = (
                     self._batch_control_states(app)
@@ -2461,6 +3849,7 @@ class NativePackageQa:
                     },
                     "ERTA deterministic failure did not start with locked controls",
                 )
+                self._record_batch_new_run("erta")
                 self.stage = 71
                 self._reschedule()
                 return
@@ -2499,12 +3888,14 @@ class NativePackageQa:
                     and app.batch_progress_var.get()
                     == "100% - 0/0 - Failed"
                     and int(app.batch_progress_value.get()) == 100
-                    and app.status_var.get()
-                    in {"Error", "Batch prediction failed"}
+                    and app.status_var.get().startswith(
+                        "Batch prediction failed:"
+                    )
                     and failure_summary.startswith(
                         "Batch prediction failed."
                     )
-                    and "Batch prediction completed." not in failure_summary
+                    and "Batch job completed and workbook saved."
+                    not in failure_summary
                     and "Output workbook:" not in failure_summary
                     and not new_outputs
                     and {
@@ -2522,6 +3913,14 @@ class NativePackageQa:
                     == restored_controls,
                     "ERTA failure exposed false success or did not restore controls",
                 )
+                failure_recognition = self._record_batch_terminal(
+                    "erta",
+                    "no_output_failure",
+                    dialog=failure_dialog,
+                    output=None,
+                    output_exists=False,
+                    fresh_output_count=len(new_outputs),
+                )
                 self._record(
                     "erta_batch_failure_dialog_and_control_recovery",
                     input=str(self.erta_failure_input_path),
@@ -2536,6 +3935,7 @@ class NativePackageQa:
                     fresh_graph_directories=[],
                     success_dialog_emitted=False,
                     prior_success_result_retained=True,
+                    recognition=failure_recognition,
                 )
                 app.notebook.select(tab)
                 self.stage = 8
@@ -2660,6 +4060,10 @@ class NativePackageQa:
                 )
                 tab.batch_destination_var.set(str(input_parent))
                 self.erba_batch_dialog_count = len(self.dialogs)
+                self._begin_batch_transition_observer(
+                    "eralpha",
+                    "shared_success",
+                )
                 tab.batch_predict_clicked()
                 self.erba_success_locked_controls = (
                     self._batch_control_states(tab)
@@ -2674,6 +4078,10 @@ class NativePackageQa:
                     },
                     "ERalpha shared-example batch did not start with locked "
                     f"controls: {tab.batch_status_var.get()}",
+                )
+                self._record_batch_new_run(
+                    "eralpha",
+                    screenshot=True,
                 )
                 self.stage = 13
                 self._reschedule()
@@ -2871,7 +4279,8 @@ class NativePackageQa:
                 )
                 summary = tab.batch_result.get("1.0", "end").strip()
                 self._require(
-                    tab.batch_status_var.get() == f"ERBA batch complete: {output}"
+                    tab.batch_status_var.get()
+                    == f"Batch prediction completed: {output}"
                     and f"Total rows: {len(prediction_rows)}" in summary
                     and f"Binding: {binding_count}" in summary
                     and f"Non-binding: {non_binding_count}" in summary
@@ -2921,6 +4330,25 @@ class NativePackageQa:
                     self.erta_batch_output_path,
                     output,
                 )
+                recognition = self._record_batch_terminal(
+                    "eralpha",
+                    "success",
+                    dialog=completion_dialog,
+                    output=output,
+                    output_exists=output.is_file(),
+                    total_count=len(prediction_rows),
+                    available_count=sum(
+                        row["Result_Status"] == "Predicted"
+                        for row in prediction_rows
+                    ),
+                    unavailable_count=not_predicted_count,
+                    workbook_unavailable_count=sum(
+                        row["Result_Status"] != "Predicted"
+                        for row in prediction_rows
+                    ),
+                    fresh_output_count=1,
+                    screenshot=True,
+                )
                 self._record(
                     "eralpha_shared_test_batch_success_dialog_and_predictions",
                     input=str(self.erba_batch_input_path),
@@ -2946,6 +4374,7 @@ class NativePackageQa:
                         _sha256_path(self.qa_shared_example_path)
                         == self.shared_bundle_sha256
                     ),
+                    recognition=recognition,
                 )
                 self.stage = 132
             if self.stage == 132:
@@ -2990,6 +4419,10 @@ class NativePackageQa:
                 )
                 tab.batch_destination_var.set(str(mixed_directory))
                 self.erba_mixed_dialog_count = len(self.dialogs)
+                self._begin_batch_transition_observer(
+                    "eralpha",
+                    "partial_unavailable",
+                )
                 tab.batch_predict_clicked()
                 self.erba_mixed_locked_controls = (
                     self._batch_control_states(tab)
@@ -3004,6 +4437,7 @@ class NativePackageQa:
                     },
                     "ERalpha mixed batch did not start with locked controls",
                 )
+                self._record_batch_new_run("eralpha")
                 self.stage = 133
                 self._reschedule()
                 return
@@ -3223,13 +4657,14 @@ class NativePackageQa:
                 ).strip()
                 self._require(
                     tab.batch_status_var.get()
-                    == f"ERBA batch complete: {mixed_output}"
+                    == f"Batch prediction completed: {mixed_output}"
                     and f"Total rows: {len(prediction_rows)}"
                     in mixed_summary
                     and f"Binding: {binding_count}" in mixed_summary
                     and f"Non-binding: {non_binding_count}"
                     in mixed_summary
-                    and "Not predicted: 1" in mixed_summary
+                    and f"{BATCH_UNAVAILABLE_LABEL}: 1"
+                    in mixed_summary
                     and f"Output workbook: {mixed_output}"
                     in mixed_summary
                     and f"Graph files: {len(mixed_graph_files)}"
@@ -3238,15 +4673,16 @@ class NativePackageQa:
                     in mixed_summary,
                     "ERalpha mixed completion summary is incomplete",
                 )
-                warning_dialog = self._terminal_dialog(
+                completion_dialog = self._terminal_dialog(
                     self.erba_mixed_dialog_count,
-                    kind="warning",
-                    title="Batch prediction completed with warnings",
+                    kind="info",
+                    title="Batch prediction done",
                     context="ERalpha mixed batch partial success",
                 )
                 restored_controls = self._batch_control_states(tab)
                 self._require(
-                    "Not predicted: 1" in warning_dialog["message"]
+                    f"{BATCH_UNAVAILABLE_LABEL}: 1"
+                    in completion_dialog["message"]
                     and restored_controls
                     == {
                         "input": "normal",
@@ -3256,11 +4692,28 @@ class NativePackageQa:
                     and tab.batch_progress_var.get()
                     == "100% - 2/2 - Completed"
                     and int(tab.batch_progress_value.get()) == 100
-                    and warning_dialog[
+                    and completion_dialog[
                         "batch_controls_at_dialog"
                     ]["eralpha"]
                     == restored_controls,
-                    "ERalpha mixed warning or control-restoration contract drift",
+                    "ERalpha mixed info dialog or control-restoration contract drift",
+                )
+                mixed_recognition = self._record_batch_terminal(
+                    "eralpha",
+                    "partial_unavailable",
+                    dialog=completion_dialog,
+                    output=mixed_output,
+                    output_exists=mixed_output.is_file(),
+                    total_count=len(prediction_rows),
+                    available_count=(
+                        len(prediction_rows) - not_predicted_count
+                    ),
+                    unavailable_count=not_predicted_count,
+                    workbook_unavailable_count=sum(
+                        row["Result_Status"] != "Predicted"
+                        for row in prediction_rows
+                    ),
+                    fresh_output_count=1,
                 )
                 self._record(
                     "erba_eralpha_batch_workbook_ad_graphs_and_summary",
@@ -3281,11 +4734,235 @@ class NativePackageQa:
                         "Reason_Category"
                     ],
                     batch_summary=mixed_summary,
-                    completion_dialog=warning_dialog,
+                    completion_dialog=completion_dialog,
                     progress=tab.batch_progress_var.get(),
                     controls_during_run=self.erba_mixed_locked_controls,
                     controls=restored_controls,
+                    recognition=mixed_recognition,
                 )
+                self.erba_mixed_check = self.transcript["checks"][-1]
+                self.stage = 134
+            if self.stage == 134:
+                unavailable_directory = (
+                    self.run_root
+                    / "all-unavailable-batch"
+                    / "eralpha"
+                )
+                unavailable_directory.mkdir(parents=True, exist_ok=False)
+                unavailable_input = (
+                    unavailable_directory / "all-unavailable-input.xlsx"
+                )
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.append(["Row_ID", "CAS"])
+                for index, cas in enumerate(
+                    self.MOCK_UNAVAILABLE_CAS_VALUES,
+                    1,
+                ):
+                    sheet.append([f"unavailable-{index}", cas])
+                workbook.save(unavailable_input)
+                workbook.close()
+                self.erba_unavailable_input_path = (
+                    unavailable_input.resolve(strict=True)
+                )
+                self.erba_unavailable_outputs_before = {
+                    path.resolve()
+                    for path in unavailable_directory.glob(
+                        "ERBA_classification_er_alpha_results*.xlsx"
+                    )
+                }
+                self.erba_unavailable_graph_dirs_before = {
+                    path.resolve()
+                    for path in unavailable_directory.glob(
+                        "ERBA_classification_er_alpha_results*_graphs*"
+                    )
+                    if path.is_dir()
+                }
+                tab.batch_input_var.set(
+                    str(self.erba_unavailable_input_path)
+                )
+                tab.batch_input_display_var.set(
+                    self.erba_unavailable_input_path.name
+                )
+                tab.batch_destination_var.set(
+                    str(unavailable_directory)
+                )
+                self.erba_unavailable_dialog_count = len(self.dialogs)
+                self._begin_batch_transition_observer(
+                    "eralpha",
+                    "all_unavailable",
+                )
+                tab.batch_predict_clicked()
+                self.erba_unavailable_locked_controls = (
+                    self._batch_control_states(tab)
+                )
+                self._require(
+                    tab._active_batch_request_id is not None
+                    and self.erba_unavailable_locked_controls
+                    == {
+                        "input": "disabled",
+                        "template": "disabled",
+                        "run": "disabled",
+                    },
+                    "ERalpha all-unavailable batch did not start with "
+                    "locked controls",
+                )
+                self._record_batch_new_run("eralpha")
+                self.stage = 135
+                self._reschedule()
+                return
+            if self.stage == 135:
+                if (
+                    tab._active_batch_request_id is not None
+                    or not self._wait_dialog(
+                        self.erba_unavailable_dialog_count
+                    )
+                ):
+                    self._reschedule()
+                    return
+                unavailable_parent = (
+                    self.erba_unavailable_input_path.parent
+                )
+                unavailable_outputs = {
+                    path.resolve()
+                    for path in unavailable_parent.glob(
+                        "ERBA_classification_er_alpha_results*.xlsx"
+                    )
+                } - self.erba_unavailable_outputs_before
+                self._require(
+                    len(unavailable_outputs) == 1,
+                    "expected one fresh all-unavailable ERalpha workbook, "
+                    f"found {len(unavailable_outputs)}",
+                )
+                unavailable_output = unavailable_outputs.pop()
+                new_graph_directories = {
+                    path.resolve()
+                    for path in unavailable_parent.glob(
+                        "ERBA_classification_er_alpha_results*_graphs*"
+                    )
+                    if path.is_dir()
+                } - self.erba_unavailable_graph_dirs_before
+                self._require(
+                    not new_graph_directories,
+                    "ERalpha all-unavailable batch created misleading "
+                    "graph artifacts",
+                )
+                workbook = load_workbook(
+                    unavailable_output,
+                    read_only=True,
+                    data_only=True,
+                )
+                try:
+                    prediction_sheet = workbook["Predictions"]
+                    unavailable_headers = [
+                        cell.value for cell in prediction_sheet[1]
+                    ]
+                    unavailable_rows = [
+                        dict(zip(unavailable_headers, row))
+                        for row in prediction_sheet.iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    ]
+                    unavailable_input_rows = list(
+                        workbook["Input"].iter_rows(
+                            min_row=2,
+                            values_only=True,
+                        )
+                    )
+                finally:
+                    workbook.close()
+                unavailable_count = len(
+                    self.MOCK_UNAVAILABLE_CAS_VALUES
+                )
+                self._require(
+                    len(unavailable_rows) == unavailable_count
+                    and [
+                        str(row["CAS"])
+                        for row in unavailable_rows
+                    ]
+                    == list(self.MOCK_UNAVAILABLE_CAS_VALUES)
+                    and unavailable_input_rows
+                    == [
+                        (f"unavailable-{index}", cas)
+                        for index, cas in enumerate(
+                            self.MOCK_UNAVAILABLE_CAS_VALUES,
+                            1,
+                        )
+                    ]
+                    and all(
+                        row["Result_Status"] == "Not predicted"
+                        and row["Reason_Category"]
+                        == "PubChem lookup unavailable"
+                        and row["binding_probability"] is None
+                        and row["binding_label"] is None
+                        for row in unavailable_rows
+                    ),
+                    "ERalpha all-unavailable result did not retain its "
+                    "reasoned blank-prediction rows",
+                )
+                unavailable_summary = self._batch_result_value(tab)
+                unavailable_dialog = self._terminal_dialog(
+                    self.erba_unavailable_dialog_count,
+                    kind="info",
+                    title="Batch prediction done",
+                    context="ERalpha all-unavailable batch publication",
+                )
+                restored_controls = self._batch_control_states(tab)
+                self._require(
+                    f"{BATCH_UNAVAILABLE_LABEL}: {unavailable_count}"
+                    in unavailable_summary
+                    and f"{BATCH_UNAVAILABLE_LABEL}: "
+                    f"{unavailable_count}"
+                    in unavailable_dialog["message"]
+                    and tab.batch_progress_var.get()
+                    == (
+                        f"100% - {unavailable_count}/"
+                        f"{unavailable_count} - Completed"
+                    )
+                    and restored_controls
+                    == {
+                        "input": "normal",
+                        "template": "normal",
+                        "run": "normal",
+                    },
+                    "ERalpha all-unavailable publication feedback drift",
+                )
+                unavailable_recognition = self._record_batch_terminal(
+                    "eralpha",
+                    "all_unavailable",
+                    dialog=unavailable_dialog,
+                    output=unavailable_output,
+                    output_exists=unavailable_output.is_file(),
+                    total_count=unavailable_count,
+                    available_count=0,
+                    unavailable_count=unavailable_count,
+                    workbook_unavailable_count=sum(
+                        row["Result_Status"] != "Predicted"
+                        for row in unavailable_rows
+                    ),
+                    fresh_output_count=1,
+                )
+                self.erba_mixed_check["all_unavailable"] = {
+                    "input": str(self.erba_unavailable_input_path),
+                    "output": str(unavailable_output),
+                    "row_count": unavailable_count,
+                    "unavailable_count": unavailable_count,
+                    "rows": unavailable_rows,
+                    "preserved_input_rows": [
+                        list(row)
+                        for row in unavailable_input_rows
+                    ],
+                    "fresh_graph_directories": [],
+                    "batch_summary": unavailable_summary,
+                    "completion_dialog": unavailable_dialog,
+                    "progress": tab.batch_progress_var.get(),
+                    "controls_during_run": (
+                        self.erba_unavailable_locked_controls
+                    ),
+                    "controls": restored_controls,
+                    "recognition": unavailable_recognition,
+                }
                 self.stage = 130
             if self.stage == 130:
                 failure_input = self._make_corrupt_batch_input("eralpha")
@@ -3307,6 +4984,10 @@ class NativePackageQa:
                 tab.batch_input_display_var.set(failure_input.name)
                 tab.batch_destination_var.set(str(failure_input.parent))
                 self.erba_failure_dialog_count = len(self.dialogs)
+                self._begin_batch_transition_observer(
+                    "eralpha",
+                    "no_output_failure",
+                )
                 tab.batch_predict_clicked()
                 self.erba_failure_locked_controls = (
                     self._batch_control_states(tab)
@@ -3321,6 +5002,7 @@ class NativePackageQa:
                     },
                     "ERalpha deterministic failure did not start with locked controls",
                 )
+                self._record_batch_new_run("eralpha")
                 self.stage = 131
                 self._reschedule()
                 return
@@ -3367,7 +5049,7 @@ class NativePackageQa:
                     == "100% - 0/0 - Failed"
                     and int(tab.batch_progress_value.get()) == 100
                     and tab.batch_status_var.get().startswith(
-                        "ERBA batch failed:"
+                        "Batch prediction failed:"
                     )
                     and failure_summary.startswith(
                         "Batch prediction failed."
@@ -3383,6 +5065,14 @@ class NativePackageQa:
                     == restored_controls,
                     "ERalpha failure exposed false success or did not restore controls",
                 )
+                failure_recognition = self._record_batch_terminal(
+                    "eralpha",
+                    "no_output_failure",
+                    dialog=failure_dialog,
+                    output=None,
+                    output_exists=False,
+                    fresh_output_count=len(new_outputs),
+                )
                 self._record(
                     "eralpha_batch_failure_dialog_and_control_recovery",
                     input=str(self.erba_failure_input_path),
@@ -3396,6 +5086,7 @@ class NativePackageQa:
                     fresh_outputs=[],
                     fresh_graph_directories=[],
                     success_dialog_emitted=False,
+                    recognition=failure_recognition,
                 )
                 self.stage = 14
             if self.stage == 14:
@@ -3474,6 +5165,16 @@ class NativePackageQa:
                         "all_qa_copies_byte_match_bundle": True,
                     },
                 )
+                self._require(
+                    self.batch_recognition_widget_contract is not None,
+                    "batch recognition widget contract was not captured",
+                )
+                self.transcript["batch_recognition_gate"] = (
+                    evaluate_batch_recognition_contract(
+                        self.batch_recognition_records,
+                        self.batch_recognition_widget_contract,
+                    )
+                )
                 check_names = [
                     receipt["check"]
                     for receipt in self.transcript["checks"]
@@ -3505,6 +5206,13 @@ class NativePackageQa:
                     "external_driver_check_present": bool(
                         self.external_driver_gate
                     ),
+                    "batch_recognition_gate": {
+                        "gate_id": BATCH_RECOGNITION_GATE_ID,
+                        "criteria_ids": list(
+                            BATCH_RECOGNITION_CRITERIA
+                        ),
+                        "counted_as_additional_check": False,
+                    },
                     "total_check_count": len(check_names),
                 }
                 app.deiconify()

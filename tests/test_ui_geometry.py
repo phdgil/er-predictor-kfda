@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from core.native_qa import (
+    BATCH_RECOGNITION_CRITERIA,
     inspect_endpoint_geometry_parity,
     inspect_shared_example_parity,
 )
@@ -100,6 +101,65 @@ def test_real_endpoint_controls_have_exact_geometry_in_every_surface_state(
         "header_box",
         "single_input_box",
     ]
+    recognition = receipt["batch_recognition_widgets"]
+    assert recognition["criterion_id"] == "BRG-01-FEEDBACK-PLACEMENT"
+    assert (
+        recognition["criterion_id"]
+        in BATCH_RECOGNITION_CRITERIA
+    )
+    assert recognition["passed"] is True
+    assert recognition["exact_layout_match"] is True
+    assert set(recognition["endpoints"]) == {"erta", "eralpha"}
+    for endpoint, owner in (
+        ("erta", window),
+        ("eralpha", window.eralpha_tab),
+    ):
+        endpoint_receipt = recognition["endpoints"][endpoint]
+        assert endpoint_receipt["passed"] is True
+        assert endpoint_receipt["reading_order"] == [
+            "run_batch",
+            "aggregate_progress",
+            "batch_result",
+            "per_row_detail",
+        ]
+        bindings = endpoint_receipt["bindings"]
+        assert bindings["run_callback"] == "batch_predict_clicked"
+        assert "batch_predict_clicked" in bindings["run_command"]
+        assert (
+            bindings["progress_value_variable"]
+            == str(owner.batch_progress_value)
+        )
+        assert (
+            bindings["progress_text_variable"]
+            == str(owner.batch_progress_var)
+        )
+        detail_var = getattr(owner, "status_var", None)
+        if detail_var is None:
+            detail_var = owner.batch_status_var
+        assert (
+            bindings["per_row_detail_variable"]
+            == str(detail_var)
+        )
+        boxes = endpoint_receipt["boxes"]
+        run_bottom = (
+            boxes["run_batch"]["y"]
+            + boxes["run_batch"]["height"]
+        )
+        progress_bottom = (
+            boxes["aggregate_progress"]["y"]
+            + boxes["aggregate_progress"]["height"]
+        )
+        result_bottom = (
+            boxes["batch_result"]["y"]
+            + boxes["batch_result"]["height"]
+        )
+        assert run_bottom <= boxes["aggregate_progress"]["y"]
+        assert progress_bottom <= boxes["batch_result"]["y"]
+        assert result_bottom <= boxes["per_row_detail"]["y"]
+    assert (
+        recognition["endpoints"]["erta"]["boxes"]
+        == recognition["endpoints"]["eralpha"]["boxes"]
+    )
     assert receipt["state_count"] == 8
     assert receipt["toggle_invocations"]["erta"] > 0
     assert receipt["toggle_invocations"]["eralpha"] > 0

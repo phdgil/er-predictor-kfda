@@ -85,6 +85,124 @@ _BATCH_INPUT_HEADER_ALIASES = {
     **ERBA_INPUT_HEADER_ALIASES,
     "CAS": (*ERBA_INPUT_HEADER_ALIASES["CAS"], "carsrn"),
 }
+_BATCH_PROGRESS_STAGE_LABELS = {
+    "Starting": "Reading input workbook",
+    "Ready to read input": "Reading input workbook",
+    "Reading input": "Reading input workbook",
+    "Reading input workbook": "Reading input workbook",
+    "Resolving CAS/SMILES": "Resolving CAS/SMILES",
+    "Predicting": "Preprocessing and prediction",
+    "Evaluating applicability domain": "Preprocessing and prediction",
+    "Preprocessing and prediction": "Preprocessing and prediction",
+    "Writing workbook": "Writing workbook",
+    "Complete": "Completed",
+    "Completed": "Completed",
+    "Failed": "Failed",
+}
+BATCH_RUNNING_RESULT = (
+    "Batch prediction is running.\n\n"
+    "Completion details will appear after the workbook is saved."
+)
+PREDICTED_AD_COUNT_NOTE = (
+    "AD counts cover predicted rows only; not-predicted rows are excluded."
+)
+
+
+def batch_progress_text(stage: str, current: int, total: int, percent: int) -> str:
+    """Return the endpoint-independent aggregate batch progress presentation."""
+    display_stage = _BATCH_PROGRESS_STAGE_LABELS.get(stage, stage)
+    safe_percent = max(0, min(100, int(percent)))
+    safe_total = max(0, int(total))
+    safe_current = max(0, int(current))
+    if safe_total:
+        safe_current = min(safe_current, safe_total)
+    else:
+        safe_current = 0
+    return f"{safe_percent}% - {safe_current}/{safe_total} - {display_stage}"
+
+
+def batch_pubchem_status(current: int, total: int, cas: str) -> str:
+    """Return the shared lower-status detail for a row-level PubChem lookup."""
+    return f"Fetching SMILES from PubChem: {int(current)} / {int(total)} ({cas})"
+
+
+def batch_run_status(state: str, detail: str | Path = "") -> str:
+    """Return shared lower-status text for batch lifecycle transitions."""
+    if state == "started":
+        return "Batch prediction started."
+    if state == "completed":
+        return f"Batch prediction completed: {detail}"
+    if state == "failed":
+        return f"Batch prediction failed: {detail}"
+    raise ValueError(f"Unknown batch state: {state}")
+
+
+def batch_prediction_availability(
+    total_count: int,
+    predicted_count: int,
+    not_predicted_count: int,
+) -> str:
+    """Describe row availability without conflating publication and prediction."""
+    total = max(0, int(total_count))
+    predicted = max(0, int(predicted_count))
+    not_predicted = max(0, int(not_predicted_count))
+    if total and predicted == 0:
+        return (
+            "No rows could be predicted. "
+            "Row-level reasons are saved in the workbook."
+        )
+    if not_predicted:
+        return (
+            f"{not_predicted} row(s) could not be predicted. "
+            "Row-level reasons are saved in the workbook."
+        )
+    if total:
+        return "All rows were predicted."
+    return "No input rows were available for prediction."
+
+
+def batch_success_dialog(
+    *,
+    destination: str | Path,
+    total_count: int,
+    predicted_count: int,
+    not_predicted_count: int,
+    outcome_counts: tuple[tuple[str, int], ...],
+    graph_paths,
+    graph_directory: str | Path | None,
+    detail_lines: tuple[str, ...] = (),
+) -> tuple[str, str]:
+    """Build the shared blue-dialog title and message for a published workbook."""
+    paths = tuple(graph_paths or ())
+    directory = graph_directory
+    if directory is None and paths:
+        directory = Path(paths[0]).parent
+    lines = [
+        "Saved:",
+        str(destination),
+        "",
+        f"Total rows: {int(total_count)}",
+        f"Predicted: {int(predicted_count)}",
+        f"Not predicted: {int(not_predicted_count)}",
+    ]
+    lines.extend(f"{label}: {int(count)}" for label, count in outcome_counts)
+    lines.extend(
+        (
+            "",
+            batch_prediction_availability(
+                total_count,
+                predicted_count,
+                not_predicted_count,
+            ),
+            "",
+            f"Graph files: {len(paths)}",
+            f"Graph directory: {directory if directory is not None else 'Not generated'}",
+        )
+    )
+    details = tuple(str(line).strip() for line in detail_lines if str(line).strip())
+    if details:
+        lines.extend(("", "Details:", *details))
+    return "Batch prediction done", "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -747,6 +865,7 @@ def export_erba_batch(
     catalog_payload: dict,
     progress_callback: Callable[[str, int, int, int], None] | None = None,
     *,
+    status_callback: Callable[[str], None] | None = None,
     forbidden_roots: tuple[str | Path, ...] = (),
 ) -> ERBABatchExportResult:
     """Predict an ERBA workbook and publish a new result beside that input workbook."""
@@ -780,6 +899,10 @@ def export_erba_batch(
                 lookup_error = "CAS is invalid: expected a valid CAS Registry Number check digit."
             else:
                 try:
+                    if status_callback is not None:
+                        status_callback(
+                            batch_pubchem_status(position + 1, total, cas)
+                        )
                     smiles = cas_lookup_smiles(cas)
                 except Exception as error:
                     lookup_error = f"CAS lookup failed: {error}"
@@ -791,8 +914,10 @@ def export_erba_batch(
             total,
             10 + int(25 * (position + 1) / total),
         )
+    if status_callback is not None:
+        status_callback(batch_run_status("started"))
     results = []
-    _progress(progress_callback, "Predicting", 0, total, 35)
+    _progress(progress_callback, "Preprocessing and prediction", 0, total, 35)
     for position, row_id, cas, smiles, lookup_error in resolved_rows:
         if lookup_error:
             result = predictor.predict(ERBARequest("", task, subtype, position))
@@ -806,8 +931,8 @@ def export_erba_batch(
         results.append((result, row_id, cas))
         _progress(
             progress_callback,
-            "Predicting",
-            position + 1,
+            "Preprocessing and prediction",
+            0,
             total,
             35 + int(35 * (position + 1) / total),
         )
@@ -830,7 +955,7 @@ def export_erba_batch(
     ad_positions = []
     ad_fingerprints = []
     graph_calculator = None
-    _progress(progress_callback, "Evaluating applicability domain", 0, total, 70)
+    _progress(progress_callback, "Preprocessing and prediction", 0, total, 70)
     for current, (result, row_id, _) in enumerate(results, 1):
         if (
             task is ERBATask.CLASSIFICATION
@@ -854,7 +979,7 @@ def export_erba_batch(
                 ad_errors.append(f"Row {row_id or current}: {error}")
         _progress(
             progress_callback,
-            "Evaluating applicability domain",
+            "Preprocessing and prediction",
             current,
             total,
             70 + int(18 * current / total),
@@ -1042,6 +1167,7 @@ class ErbaTab(ttk.Frame):
         self._active_single_request_id = None
         self._active_ad_request_id = None
         self._active_batch_request_id = None
+        self._active_batch_total = 0
         self._single_structure_image = None
         self._nearest_reference_structure_image = None
         self._single_ad_graph_image = None
@@ -2655,15 +2781,15 @@ class ErbaTab(ttk.Frame):
     def _show_batch_dialog(level: str, title: str, message: str) -> None:
         dialogs = {
             "info": messagebox.showinfo,
-            "warning": messagebox.showwarning,
             "error": messagebox.showerror,
         }
         dialogs[level](title, message)
 
     def _reject_batch_start(self, request_id: int, message: str) -> None:
-        self.batch_status_var.set(message)
+        self._active_batch_total = 0
+        self.batch_status_var.set(batch_run_status("failed", message))
         self.batch_progress_value.set(100)
-        self.batch_progress_var.set("100% - 0/0 - Failed")
+        self.batch_progress_var.set(batch_progress_text("Failed", 0, 0, 100))
         result = getattr(self, "batch_result", None)
         if result is not None:
             self._set_text(
@@ -2677,9 +2803,17 @@ class ErbaTab(ttk.Frame):
     def batch_predict_clicked(self):
         snapshot = self._snapshot("batch")
         if not snapshot:
+            self._active_batch_total = 0
             message = (
                 self.batch_status_var.get().strip()
                 or "The ERalpha batch route is unavailable."
+            )
+            self.batch_status_var.set(batch_run_status("failed", message))
+            self.batch_progress_value.set(100)
+            self.batch_progress_var.set(batch_progress_text("Failed", 0, 0, 100))
+            self._set_text(
+                self.batch_result,
+                f"Batch prediction failed.\n\nTechnical details: {message}",
             )
             self._show_batch_dialog("error", "Batch prediction failed", message)
             return
@@ -2722,8 +2856,10 @@ class ErbaTab(ttk.Frame):
         self.batch_destination_var.set(str(output_dir))
         self._set_batch_controls_active(True)
         self._active_batch_request_id = request_id
-        self._set_batch_progress(request_id, "Ready to read input", 0, 0, 0)
-        self.batch_status_var.set("Running ERBA batch...")
+        self._active_batch_total = 0
+        self._set_text(self.batch_result, BATCH_RUNNING_RESULT)
+        self._set_batch_progress(request_id, "Reading input workbook", 0, 0, 0)
+        self.batch_status_var.set(batch_run_status("started"))
         threading.Thread(
             target=self._batch_work,
             args=(request_id, task, subtype, model_id, input_path),
@@ -2737,24 +2873,35 @@ class ErbaTab(ttk.Frame):
             lambda: self._set_batch_progress(request_id, stage, current, total, percent),
         )
 
-    def _set_batch_progress(self, request_id, stage, current, total, percent):
+    def _batch_status_from_worker(self, request_id: int, message: str) -> None:
+        """Schedule lower-status detail on Tk and retain stale-request guards."""
+        self.after(0, lambda: self._set_batch_status(request_id, message))
+
+    def _batch_update_is_current(self, request_id: int) -> bool:
         if request_id != getattr(self, "_active_batch_request_id", None):
-            return
+            return False
         current_generation = getattr(self, "_model_generation", 0)
         request_generation = getattr(self, "_request_generations", {}).get(
             request_id,
             current_generation,
         )
-        if request_generation != current_generation:
+        return request_generation == current_generation
+
+    def _set_batch_status(self, request_id: int, message: str) -> None:
+        if self._batch_update_is_current(request_id):
+            self.batch_status_var.set(message)
+
+    def _set_batch_progress(self, request_id, stage, current, total, percent):
+        if not self._batch_update_is_current(request_id):
             return
-        percent = max(0, min(100, int(percent)))
-        detail = f"{current}/{total}" if total else "0/0"
         progress_var = getattr(self, "batch_progress_var", None)
         progress_value = getattr(self, "batch_progress_value", None)
         if progress_var is not None:
-            progress_var.set(f"{percent}% - {detail} - {stage}")
+            progress_var.set(batch_progress_text(stage, current, total, percent))
         if progress_value is not None:
-            progress_value.set(percent)
+            progress_value.set(max(0, min(100, int(percent))))
+        if int(total) > 0:
+            self._active_batch_total = int(total)
 
     def _batch_work(self, request_id, task, subtype, model_id, input_path):
         try:
@@ -2781,6 +2928,9 @@ class ErbaTab(ttk.Frame):
                 progress_callback=lambda stage, current, total, percent: self._batch_progress_from_worker(
                     request_id, stage, current, total, percent
                 ),
+                status_callback=lambda message: self._batch_status_from_worker(
+                    request_id, message
+                ),
                 forbidden_roots=(self.project_root, self.install_root),
             )
             self.after(0, lambda: self._batch_complete(
@@ -2805,6 +2955,7 @@ class ErbaTab(ttk.Frame):
         if request_id != self._active_batch_request_id:
             self._forget_request(request_id)
             if self._active_batch_request_id is None:
+                self._active_batch_total = 0
                 self._route_changed("batch")
             self._emit("batch.inference_stale", workflow="erba", task=task.value, subtype=subtype.value,
                        model_id=model_id, correlation_id=request_id, duration_ms=duration_ms)
@@ -2817,25 +2968,34 @@ class ErbaTab(ttk.Frame):
             model_id,
         ):
             self._active_batch_request_id = None
+            self._active_batch_total = 0
             self._set_batch_controls_active(False)
             self._forget_request(request_id)
             self._route_changed("batch")
             self._emit("batch.inference_stale", workflow="erba", task=task.value, subtype=subtype.value,
                        model_id=model_id, correlation_id=request_id, duration_ms=duration_ms)
             return
+        if not error and export_result is None:
+            error = "Batch completed without a published workbook."
+        terminal_total = (
+            export_result.count
+            if export_result is not None
+            else max(0, int(getattr(self, "_active_batch_total", 0)))
+        )
         self._set_batch_progress(
             request_id,
             "Failed" if error else "Completed",
-            export_result.count if export_result is not None else 0,
-            export_result.count if export_result is not None else 0,
+            terminal_total if not error else 0,
+            terminal_total,
             100,
         )
         self._active_batch_request_id = None
+        self._active_batch_total = 0
         self._set_batch_controls_active(False)
         self._forget_request(request_id)
         self._route_changed("batch")
         if error:
-            self.batch_status_var.set(f"ERBA batch failed: {error}")
+            self.batch_status_var.set(batch_run_status("failed", str(error)))
             self._set_text(
                 self.batch_result,
                 f"Batch prediction failed.\n\nTechnical details: {error}",
@@ -2849,11 +3009,10 @@ class ErbaTab(ttk.Frame):
                 str(error),
             )
             return
-        if export_result is None:
-            raise RuntimeError("ERBA batch completed without an export result.")
         destination = export_result.destination
+        predicted_count = export_result.count - export_result.not_predicted_count
         self.batch_destination_var.set(str(destination.parent))
-        self.batch_status_var.set(f"ERBA batch complete: {destination}")
+        self.batch_status_var.set(batch_run_status("completed", destination))
         self._emit("batch.inference_complete", workflow="erba", task=task.value, subtype=subtype.value,
                    model_id=model_id, correlation_id=request_id, duration_ms=duration_ms,
                    row_count=export_result.count, status="ok")
@@ -2862,16 +3021,26 @@ class ErbaTab(ttk.Frame):
             if task is ERBATask.CLASSIFICATION
             else REGRESSION_EVIDENCE_CAVEAT_COMPACT
         )
+        availability = batch_prediction_availability(
+            export_result.count,
+            predicted_count,
+            export_result.not_predicted_count,
+        )
         lines = [
-            "ERalpha batch prediction completed.",
+            "Batch job completed and workbook saved.",
             "",
             f"Total rows: {export_result.count}",
+            f"Predicted: {predicted_count}",
+            f"Not predicted: {export_result.not_predicted_count}",
             f"Binding: {export_result.binding_count}",
             f"Non-binding: {export_result.non_binding_count}",
-            f"Not predicted: {export_result.not_predicted_count}",
+            "",
+            availability,
+            "",
             f"AD In-domain: {export_result.ad_in_domain_count}",
             f"AD Out-of-domain: {export_result.ad_out_of_domain_count}",
             f"AD Unavailable: {export_result.ad_unavailable_count}",
+            PREDICTED_AD_COUNT_NOTE,
             "",
             f"Output workbook: {destination}",
         ]
@@ -2887,53 +3056,61 @@ class ErbaTab(ttk.Frame):
                 (
                     "Graph files: 0",
                     "Graph directory: Not generated",
-                    f"Graph warning: {export_result.graph_error or 'no graphs were generated.'}",
+                    "Graph details: "
+                    + (
+                        export_result.graph_error
+                        or "Optional graph files were not generated."
+                    ),
                 )
             )
+        if export_result.graph_paths and export_result.graph_error:
+            lines.append(f"Graph details: {export_result.graph_error}")
         if export_result.ad_error:
-            lines.append(f"AD warning: {export_result.ad_error}")
+            lines.append(
+                f"Applicability-domain details: {export_result.ad_error}"
+            )
         lines.extend(("", caveat))
         self._set_text(self.batch_result, "\n".join(lines))
 
-        dialog_lines = [
-            f"Saved:\n{destination}",
-            "",
-            f"Total rows: {export_result.count}",
-            f"Binding: {export_result.binding_count}",
-            f"Non-binding: {export_result.non_binding_count}",
-            f"Not predicted: {export_result.not_predicted_count}",
+        detail_lines = [
+            f"AD In-domain: {export_result.ad_in_domain_count}",
+            f"AD Out-of-domain: {export_result.ad_out_of_domain_count}",
+            f"AD Unavailable: {export_result.ad_unavailable_count}",
+            PREDICTED_AD_COUNT_NOTE,
         ]
-        warnings = []
-        if export_result.not_predicted_count:
-            warnings.append(
-                f"{export_result.not_predicted_count} row(s) were not predicted."
-            )
         if export_result.ad_unavailable_count:
-            warnings.append(
-                f"Applicability domain was unavailable for "
-                f"{export_result.ad_unavailable_count} row(s)."
+            detail_lines.append(
+                "Applicability-domain details: "
+                f"Unavailable for {export_result.ad_unavailable_count} row(s)."
             )
         if not export_result.graph_paths:
-            warnings.append(
-                f"Graphs: {export_result.graph_error or 'no graphs were generated.'}"
+            detail_lines.append(
+                "Graph details: "
+                + (
+                    export_result.graph_error
+                    or "Optional graph files were not generated."
+                )
             )
         elif export_result.graph_error:
-            warnings.append(f"Graphs: {export_result.graph_error}")
+            detail_lines.append(f"Graph details: {export_result.graph_error}")
         if export_result.ad_error:
-            warnings.append(f"Applicability domain: {export_result.ad_error}")
-        if warnings:
-            dialog_lines.extend(("", "Warnings:", *warnings))
-            self._show_batch_dialog(
-                "warning",
-                "Batch prediction completed with warnings",
-                "\n".join(dialog_lines),
+            detail_lines.append(
+                f"Applicability-domain details: {export_result.ad_error}"
             )
-        else:
-            self._show_batch_dialog(
-                "info",
-                "Batch prediction done",
-                "\n".join(dialog_lines),
-            )
+        dialog_title, dialog_message = batch_success_dialog(
+            destination=destination,
+            total_count=export_result.count,
+            predicted_count=predicted_count,
+            not_predicted_count=export_result.not_predicted_count,
+            outcome_counts=(
+                ("Binding", export_result.binding_count),
+                ("Non-binding", export_result.non_binding_count),
+            ),
+            graph_paths=export_result.graph_paths,
+            graph_directory=export_result.graph_directory,
+            detail_lines=tuple(detail_lines),
+        )
+        self._show_batch_dialog("info", dialog_title, dialog_message)
 
     def _snapshot_is_current(self, workflow, request_id, task, subtype, model_id):
         active_id = (

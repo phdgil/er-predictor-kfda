@@ -22,7 +22,14 @@ from core.predictor import KerasPredictor
 from core.pubchem import cas_to_smiles
 from core.paths import validate_mutable_directory
 from gui.erba_tab import (
+    BATCH_RUNNING_RESULT,
+    PREDICTED_AD_COUNT_NOTE,
     ErbaTab,
+    batch_prediction_availability,
+    batch_progress_text,
+    batch_pubchem_status,
+    batch_run_status,
+    batch_success_dialog,
     batch_destination_display,
     load_shared_example_input,
     validate_cas,
@@ -49,6 +56,53 @@ def allocate_erta_output_path(input_path: str | Path, model_name: str) -> Path:
         os.close(fd)
         return candidate
     raise RuntimeError("Could not allocate a non-overwriting ERTA output filename.")
+
+
+def _erta_batch_counts(frame: pd.DataFrame) -> dict[str, object]:
+    total = int(len(frame))
+    labels = (
+        frame["Prediction_label"].fillna("").astype(str)
+        if "Prediction_label" in frame.columns
+        else pd.Series("", index=frame.index, dtype=str)
+    )
+    if "Mol_valid" in frame.columns:
+        structurally_valid = frame["Mol_valid"].map(
+            lambda value: (
+                False
+                if pd.isna(value)
+                else str(value).strip().casefold() in {"true", "1"}
+            )
+        )
+    else:
+        structurally_valid = pd.Series(True, index=frame.index, dtype=bool)
+    predicted = structurally_valid & labels.isin(("Positive", "Negative"))
+    return {
+        "total_count": total,
+        "predicted_count": int(predicted.sum()),
+        "not_predicted_count": int(total - predicted.sum()),
+        "positive_count": int((predicted & labels.eq("Positive")).sum()),
+        "negative_count": int((predicted & labels.eq("Negative")).sum()),
+        "predicted_mask": predicted,
+    }
+
+
+def _erta_ad_counts(
+    frame: pd.DataFrame,
+    predicted_mask: pd.Series,
+) -> tuple[int, int, int]:
+    predicted_count = int(predicted_mask.sum())
+    if "AD" not in frame.columns:
+        return 0, 0, predicted_count
+    ad_values = frame.loc[predicted_mask, "AD"].fillna("").astype(str)
+    in_domain = int(ad_values.eq("In-domain").sum())
+    out_of_domain = int(ad_values.eq("Out-of-domain").sum())
+    return in_domain, out_of_domain, predicted_count - in_domain - out_of_domain
+
+
+ERTA_LEGACY_VALID_COUNT_NOTE = (
+    "Predicted/Positive/Negative counts include Mol_valid=True rows only. "
+    "Mol_valid=False legacy workbook/graph labels are not usable predictions."
+)
 
 
 class MainWindow(tk.Tk):
@@ -118,6 +172,11 @@ class MainWindow(tk.Tk):
         self.batch_progress_value = tk.IntVar(value=0)
         self._batch_active = False
         self._active_batch_total = 0
+        self._batch_request_id = 0
+        self._active_batch_request_id = None
+        self._erta_reload_in_flight = False
+        self._last_batch_ad_error = ""
+        self._last_batch_graph_error = ""
 
         self._build_ui()
         if self.example_error:
@@ -691,7 +750,68 @@ class MainWindow(tk.Tk):
             else self.ad_calculator.fit_from_excel_cached(reference_path)
         )
 
+    def _set_erta_reload_active(self, active: bool) -> None:
+        self._erta_reload_in_flight = active
+        configuration_state = (
+            "disabled"
+            if active or self.__dict__.get("_batch_active", False)
+            else "normal"
+        )
+        for name in (
+            "model_entry",
+            "model_browse_button",
+            "model_reload_button",
+            "ad_entry",
+            "ad_browse_button",
+            "ad_reload_button",
+        ):
+            control = self.__dict__.get(name)
+            if control is not None:
+                control.configure(state=configuration_state)
+        run_button = self.__dict__.get("run_batch_button")
+        if run_button is not None:
+            run_button.configure(
+                state=(
+                    "disabled"
+                    if active or self.__dict__.get("_batch_active", False)
+                    else "normal"
+                )
+            )
+
+    def _erta_configuration_change_blocked(self, action: str) -> bool:
+        if self.__dict__.get("_batch_active", False):
+            self.set_status(
+                f"Cannot {action} while batch prediction is running."
+            )
+            return True
+        if self.__dict__.get("_erta_reload_in_flight", False):
+            self.set_status(
+                f"Cannot {action} while model or AD reload is running."
+            )
+            return True
+        return False
+
+    def _reset_erta_batch_presentation(self) -> None:
+        self.last_batch_result = None
+        self.last_batch_fp = None
+        self._active_batch_total = 0
+        self._last_batch_ad_error = ""
+        self._last_batch_graph_error = ""
+        if self.__dict__.get("batch_progress_var") is not None:
+            self._set_batch_progress(None, "Ready", 0, 0, 0)
+        if self.__dict__.get("batch_result") is not None:
+            self._set_erta_batch_result(
+                "Run a batch to show the completion summary."
+            )
+
     def load_defaults_on_startup(self):
+        if (
+            self.__dict__.get("_erta_reload_in_flight", False)
+            or self.__dict__.get("_batch_active", False)
+        ):
+            return
+        self._set_erta_reload_active(True)
+
         def job():
             failures = []
 
@@ -721,11 +841,21 @@ class MainWindow(tk.Tk):
                 except Exception as e:
                     failures.append(f"AD fit failed: {e}")
 
-            self.set_status("Ready" if not failures else "Startup failed: " + " | ".join(failures))
+            self.ui(self._finish_erta_default_loading, failures)
 
         self.run_threaded(job)
 
+    def _finish_erta_default_loading(self, failures: list[str]) -> None:
+        self._set_erta_reload_active(False)
+        self.set_status(
+            "Ready"
+            if not failures
+            else "Startup failed: " + " | ".join(failures)
+        )
+
     def browse_model(self):
+        if self._erta_configuration_change_blocked("browse for a model"):
+            return
         path = filedialog.askopenfilename(
             title="Select model",
             filetypes=[("Model file", "*.keras *.h5"), ("All files", "*.*")],
@@ -734,6 +864,10 @@ class MainWindow(tk.Tk):
             self.model_path_var.set(path)
 
     def browse_ad_reference(self):
+        if self._erta_configuration_change_blocked(
+            "browse for an AD reference"
+        ):
+            return
         path = filedialog.askopenfilename(title="Select AD reference Excel", filetypes=[("Excel", "*.xlsx *.xls"), ("All files", "*.*")])
         if path:
             self.ad_ref_path_var.set(path)
@@ -782,9 +916,16 @@ class MainWindow(tk.Tk):
                 return col
         return None
 
-    def prepare_batch_input(self, df: pd.DataFrame) -> pd.DataFrame:
+    def prepare_batch_input(
+        self,
+        df: pd.DataFrame,
+        *,
+        status_callback=None,
+        progress_callback=None,
+    ) -> pd.DataFrame:
         df = df.copy()
         df.columns = [str(col).strip() for col in df.columns]
+        report_status = status_callback or self.set_status
 
         cas_col = self._find_column(df, ["CAS", "CARSRN", "CAS No", "CAS No.", "CAS RN", "CASRN", "CAS Number", "CAS_Number"])
         smiles_col = self._find_column(df, ["SMILES", "Canonical_SMILES", "Canonical SMILES", "Isomeric_SMILES", "Isomeric SMILES"])
@@ -809,71 +950,161 @@ class MainWindow(tk.Tk):
             return df
 
         total = len(df)
-        for idx, row in df.iterrows():
-            current_smiles = row.get(smiles_col, "")
-            if not self._is_blank(current_smiles):
-                continue
-
-            cas = row.get(cas_col, "")
-            if self._is_blank(cas):
-                df.at[idx, "PubChem_status"] = "Skipped: CAS is empty"
-                continue
-
-            cas_text = str(cas).strip()
-            if not validate_cas(cas_text):
-                df.at[idx, "PubChem_status"] = (
-                    "Not found: CAS is invalid; expected a valid CAS Registry "
-                    "Number check digit."
-                )
-                continue
+        for position, (idx, row) in enumerate(df.iterrows(), 1):
             try:
-                self.set_status(f"Fetching SMILES from PubChem: {idx + 1} / {total} ({cas_text})")
-                res = cas_to_smiles(cas_text)
-                smiles = res.get("CanonicalSMILES") or res.get("IsomericSMILES")
-                if not smiles:
-                    raise RuntimeError("PubChem did not return a SMILES string.")
-                df.at[idx, "SMILES"] = smiles
-                df.at[idx, "PubChem_CID"] = res.get("PubChem_CID", "")
-                df.at[idx, "PubChem_status"] = "Found"
-            except Exception as err:
-                df.at[idx, "PubChem_status"] = f"Not found: {err}"
+                current_smiles = row.get(smiles_col, "")
+                if not self._is_blank(current_smiles):
+                    continue
+
+                cas = row.get(cas_col, "")
+                if self._is_blank(cas):
+                    df.at[idx, "PubChem_status"] = "Skipped: CAS is empty"
+                    continue
+
+                cas_text = str(cas).strip()
+                if not validate_cas(cas_text):
+                    df.at[idx, "PubChem_status"] = (
+                        "Not found: CAS is invalid; expected a valid CAS Registry "
+                        "Number check digit."
+                    )
+                    continue
+                try:
+                    report_status(
+                        batch_pubchem_status(position, total, cas_text)
+                    )
+                    res = cas_to_smiles(cas_text)
+                    smiles = (
+                        res.get("CanonicalSMILES")
+                        or res.get("IsomericSMILES")
+                    )
+                    if not smiles:
+                        raise RuntimeError(
+                            "PubChem did not return a SMILES string."
+                        )
+                    df.at[idx, "SMILES"] = smiles
+                    df.at[idx, "PubChem_CID"] = res.get("PubChem_CID", "")
+                    df.at[idx, "PubChem_status"] = "Found"
+                except Exception as err:
+                    df.at[idx, "PubChem_status"] = f"Not found: {err}"
+            finally:
+                if progress_callback is not None:
+                    progress_callback(
+                        "Resolving CAS/SMILES",
+                        position,
+                        total,
+                        10 + int(25 * position / total),
+                    )
 
         return df
 
     # ---------- Actions ----------
     def load_model_clicked(self):
+        if self._erta_configuration_change_blocked("reload the model"):
+            return
+        self._set_erta_reload_active(True)
+        selected_path = self.model_path_var.get()
+
         def job():
             try:
                 self.set_status("Loading model...")
-                self.predictor.load_model(self.model_path_var.get())
+                self.predictor.load_model(selected_path)
                 self.ui(
-                    self.loaded_model_path_var.set,
-                    self.predictor.model_path,
+                    self._finish_erta_model_reload,
+                    selected_path,
+                    None,
                 )
-                self.set_status(f"Model loaded: {self.predictor.model_name}, input shape={self.predictor.input_shape}")
-                self.ui(messagebox.showinfo, "Model loaded", f"Loaded model:\n{self.predictor.model_path}\n\nInput shape: {self.predictor.input_shape}")
             except Exception as e:
-                self.show_error("Model load failed", e)
+                self.ui(
+                    self._finish_erta_model_reload,
+                    selected_path,
+                    e,
+                )
         self.run_threaded(job)
 
+    def _finish_erta_model_reload(
+        self,
+        selected_path: str,
+        error: Exception | None,
+    ) -> None:
+        self._set_erta_reload_active(False)
+        if error is not None:
+            message = str(error)
+            messagebox.showerror("Model load failed", message)
+            self.set_status(f"Model load failed: {message}")
+            return
+        loaded_path = str(getattr(self.predictor, "model_path", selected_path))
+        self.loaded_model_path_var.set(loaded_path)
+        self._reset_erta_batch_presentation()
+        status = (
+            f"Model loaded: {self.predictor.model_name}, "
+            f"input shape={self.predictor.input_shape}"
+        )
+        self.set_status(status)
+        messagebox.showinfo(
+            "Model loaded",
+            f"Loaded model:\n{loaded_path}\n\n"
+            f"Input shape: {self.predictor.input_shape}",
+        )
+
     def fit_ad_clicked(self):
+        if self._erta_configuration_change_blocked(
+            "reload the AD reference"
+        ):
+            return
+        self._set_erta_reload_active(True)
+        selected_path = self.ad_ref_path_var.get()
+
         def job():
             try:
                 self.set_status("Rebuilding AD reference cache...")
                 self.ensure_ad_fitted(
-                    self.ad_ref_path_var.get(),
+                    selected_path,
                     force_refit=True,
                 )
                 self.ui(
-                    self.loaded_ad_ref_path_var.set,
-                    self.ad_ref_path_var.get(),
+                    self._finish_erta_ad_reload,
+                    selected_path,
+                    None,
                 )
-                cache_status = self.ad_calculator.last_cache_status or "AD cache status unavailable."
-                self.set_status(f"AD fitted. kNN 95% mean-distance threshold={self.ad_calculator.threshold:.4f}, Similarity cutoff={self.ad_calculator.similarity_threshold:.2f}. {cache_status}")
-                self.ui(messagebox.showinfo, "AD fitted", f"AD reference fitted.\nkNN 95% mean-distance threshold: {self.ad_calculator.threshold:.4f}\nSimilarity cutoff: {self.ad_calculator.similarity_threshold:.2f}\n\n{cache_status}")
             except Exception as e:
-                self.show_error("AD fitting failed", e)
+                self.ui(
+                    self._finish_erta_ad_reload,
+                    selected_path,
+                    e,
+                )
         self.run_threaded(job)
+
+    def _finish_erta_ad_reload(
+        self,
+        selected_path: str,
+        error: Exception | None,
+    ) -> None:
+        self._set_erta_reload_active(False)
+        if error is not None:
+            message = str(error)
+            messagebox.showerror("AD fitting failed", message)
+            self.set_status(f"AD fitting failed: {message}")
+            return
+        self.loaded_ad_ref_path_var.set(selected_path)
+        self._reset_erta_batch_presentation()
+        cache_status = (
+            self.ad_calculator.last_cache_status
+            or "AD cache status unavailable."
+        )
+        status = (
+            "AD fitted. "
+            f"kNN 95% mean-distance threshold={self.ad_calculator.threshold:.4f}, "
+            f"Similarity cutoff={self.ad_calculator.similarity_threshold:.2f}. "
+            f"{cache_status}"
+        )
+        self.set_status(status)
+        messagebox.showinfo(
+            "AD fitted",
+            "AD reference fitted.\n"
+            f"kNN 95% mean-distance threshold: {self.ad_calculator.threshold:.4f}\n"
+            f"Similarity cutoff: {self.ad_calculator.similarity_threshold:.2f}\n\n"
+            f"{cache_status}",
+        )
 
     def pubchem_clicked(self):
         cas = self.cas_var.get()
@@ -1242,33 +1473,106 @@ class MainWindow(tk.Tk):
 
     def _set_batch_controls_active(self, active: bool):
         self._batch_active = active
-        state = "disabled" if active else "normal"
+        batch_state = "disabled" if active else "normal"
         for control in (
             self.batch_input_button,
             self.download_template_button,
-            self.run_batch_button,
         ):
-            control.configure(state=state)
+            control.configure(state=batch_state)
+        self.run_batch_button.configure(
+            state=(
+                "disabled"
+                if active or self.__dict__.get("_erta_reload_in_flight", False)
+                else "normal"
+            )
+        )
+        configuration_state = (
+            "disabled"
+            if active or self.__dict__.get("_erta_reload_in_flight", False)
+            else "normal"
+        )
+        for name in (
+            "model_entry",
+            "model_browse_button",
+            "model_reload_button",
+            "ad_entry",
+            "ad_browse_button",
+            "ad_reload_button",
+        ):
+            control = self.__dict__.get(name)
+            if control is not None:
+                control.configure(state=configuration_state)
 
-    def _set_batch_progress(self, stage: str, current: int, total: int, percent: int):
+    def _batch_update_is_current(self, request_id: int) -> bool:
+        return request_id == self.__dict__.get("_active_batch_request_id")
+
+    def _set_batch_progress(
+        self,
+        request_id: int | None,
+        stage: str,
+        current: int,
+        total: int,
+        percent: int,
+    ):
+        if request_id is not None and not self._batch_update_is_current(request_id):
+            return
         self.batch_progress_value.set(max(0, min(100, int(percent))))
-        self.batch_progress_var.set(f"{percent}% - {current}/{total} - {stage}")
+        self.batch_progress_var.set(
+            batch_progress_text(stage, current, total, percent)
+        )
 
-    def _batch_progress_from_worker(self, stage: str, current: int, total: int, percent: int):
-        self.after(0, lambda: self._set_batch_progress(stage, current, total, percent))
+    def _batch_progress_from_worker(
+        self,
+        request_id: int,
+        stage: str,
+        current: int,
+        total: int,
+        percent: int,
+    ):
+        self.after(
+            0,
+            lambda: self._set_batch_progress(
+                request_id,
+                stage,
+                current,
+                total,
+                percent,
+            ),
+        )
 
-    def _finish_batch(self, success: bool, message: str):
+    def _batch_status_from_worker(self, request_id: int, message: str) -> None:
+        self.after(0, lambda: self._set_batch_status(request_id, message))
+
+    def _set_batch_status(self, request_id: int, message: str) -> None:
+        if self._batch_update_is_current(request_id):
+            self.set_status(message)
+
+    def _finish_batch(self, request_id: int, success: bool, message: str):
+        if not self._batch_update_is_current(request_id):
+            return
         self._set_batch_controls_active(False)
         total = max(0, int(self._active_batch_total))
         if success:
-            self._set_batch_progress("Complete", total, total, 100)
+            self._set_batch_progress(request_id, "Completed", total, total, 100)
         else:
-            self._set_batch_progress("Failed", 0, total, 100)
+            self._set_batch_progress(request_id, "Failed", 0, total, 100)
         self._active_batch_total = 0
+        self._active_batch_request_id = None
         self.set_status(message)
 
     def batch_predict_clicked(self):
         if self._batch_active:
+            return
+        if self.__dict__.get("_erta_reload_in_flight", False):
+            message = (
+                "Batch prediction cannot start while model or AD reload is running."
+            )
+            self._set_batch_progress(None, "Failed", 0, 0, 100)
+            self._set_erta_batch_result(
+                f"Batch prediction failed.\n\nTechnical details: {message}"
+            )
+            self.set_status(batch_run_status("failed", message))
+            messagebox.showerror("Batch prediction failed", message)
             return
         input_path = self.batch_input_var.get().strip()
         self.batch_destination_var.set(batch_destination_display(input_path))
@@ -1289,19 +1593,32 @@ class MainWindow(tk.Tk):
                 f"Details: {error}"
             )
             self._active_batch_total = 0
-            self._set_batch_progress("Failed", 0, 0, 100)
+            self._set_batch_progress(None, "Failed", 0, 0, 100)
             self._set_erta_batch_result(
                 "Batch prediction failed.\n\n"
                 f"Technical details: {friendly_error}"
             )
-            self.show_error("Batch prediction failed", friendly_error)
-            self.set_status(f"Batch prediction failed: {friendly_error}")
+            self.set_status(batch_run_status("failed", str(friendly_error)))
+            messagebox.showerror("Batch prediction failed", str(friendly_error))
             return
         input_path = str(source)
         self.batch_destination_var.set(out_dir)
+        request_id = self.__dict__.get("_batch_request_id", 0) + 1
+        self._batch_request_id = request_id
+        self._active_batch_request_id = request_id
         self._active_batch_total = 0
+        self._last_batch_ad_error = ""
+        self._last_batch_graph_error = ""
         self._set_batch_controls_active(True)
-        self._set_batch_progress("Starting", 0, 1, 0)
+        self._set_erta_batch_result(BATCH_RUNNING_RESULT)
+        self._set_batch_progress(
+            request_id,
+            "Reading input workbook",
+            0,
+            0,
+            0,
+        )
+        self.set_status(batch_run_status("started"))
 
         def job():
             try:
@@ -1309,31 +1626,101 @@ class MainWindow(tk.Tk):
                     self.predictor.load_model(self.model_path_var.get())
                 if not os.path.exists(input_path):
                     raise FileNotFoundError(input_path)
-                self._batch_progress_from_worker("Reading input", 0, 1, 10)
-                self.set_status("Reading batch input...")
                 df = pd.read_excel(input_path)
+                if df.empty:
+                    raise ValueError(
+                        "ERTA batch input has no rows; no output was published."
+                    )
                 self._active_batch_total = len(df)
 
-                self._batch_progress_from_worker("Resolving CAS/SMILES", 0, len(df), 30)
-                df = self.prepare_batch_input(df)
+                self._batch_progress_from_worker(
+                    request_id,
+                    "Resolving CAS/SMILES",
+                    0,
+                    len(df),
+                    10,
+                )
+                df = self.prepare_batch_input(
+                    df,
+                    status_callback=lambda message: self._batch_status_from_worker(
+                        request_id,
+                        message,
+                    ),
+                    progress_callback=lambda stage, current, total, percent: (
+                        self._batch_progress_from_worker(
+                            request_id,
+                            stage,
+                            current,
+                            total,
+                            percent,
+                        )
+                    ),
+                )
+                self._batch_status_from_worker(
+                    request_id,
+                    batch_run_status("started"),
+                )
 
-                self._batch_progress_from_worker("Preprocessing and prediction", 0, len(df), 55)
-                self.set_status("Running batch prediction...")
+                self._batch_progress_from_worker(
+                    request_id,
+                    "Preprocessing and prediction",
+                    0,
+                    len(df),
+                    35,
+                )
                 result_df, fp_df = self.predictor.predict_dataframe(df, smiles_col="SMILES")
-                if not self.ad_calculator.fitted and self.ad_ref_path_var.get() and os.path.exists(self.ad_ref_path_var.get()):
-                    self.set_status("Loading AD reference...")
-                    self.ensure_ad_fitted(self.ad_ref_path_var.get())
-                if self.ad_calculator.fitted:
-                    z, mean_distance, in_domain, max_similarity, distance_in_domain, similarity_in_domain = self.ad_calculator.transform_with_similarity(fp_df.values.astype(float))
-                    result_df["AD"] = ["In-domain" if x else "Out-of-domain" for x in in_domain]
-                    result_df["AD_MeanDistance"] = mean_distance
-                    result_df["AD_DistanceThreshold"] = self.ad_calculator.threshold
-                    result_df["AD_Distance_InDomain"] = distance_in_domain
-                    result_df["AD_SimilarityMax"] = max_similarity
-                    result_df["AD_SimilarityThreshold"] = self.ad_calculator.similarity_threshold
-                    result_df["AD_Similarity_InDomain"] = similarity_in_domain
-                    result_df["AD_PC1"] = z[:, 0]
-                    result_df["AD_PC2"] = z[:, 1]
+                ad_error = ""
+                try:
+                    ad_path = self.ad_ref_path_var.get()
+                    if (
+                        not self.ad_calculator.fitted
+                        and ad_path
+                        and os.path.exists(ad_path)
+                    ):
+                        self.ensure_ad_fitted(ad_path)
+                    if self.ad_calculator.fitted:
+                        (
+                            z,
+                            mean_distance,
+                            in_domain,
+                            max_similarity,
+                            distance_in_domain,
+                            similarity_in_domain,
+                        ) = self.ad_calculator.transform_with_similarity(
+                            fp_df.values.astype(float)
+                        )
+                        result_df["AD"] = [
+                            "In-domain" if value else "Out-of-domain"
+                            for value in in_domain
+                        ]
+                        result_df["AD_MeanDistance"] = mean_distance
+                        result_df["AD_DistanceThreshold"] = self.ad_calculator.threshold
+                        result_df["AD_Distance_InDomain"] = distance_in_domain
+                        result_df["AD_SimilarityMax"] = max_similarity
+                        result_df["AD_SimilarityThreshold"] = (
+                            self.ad_calculator.similarity_threshold
+                        )
+                        result_df["AD_Similarity_InDomain"] = similarity_in_domain
+                        result_df["AD_PC1"] = z[:, 0]
+                        result_df["AD_PC2"] = z[:, 1]
+                    else:
+                        ad_error = (
+                            "Optional applicability-domain results were not generated "
+                            "because an AD reference was not available."
+                        )
+                except Exception as error:
+                    ad_error = (
+                        "Optional applicability-domain results were not generated: "
+                        f"{error}"
+                    )
+                self._last_batch_ad_error = ad_error
+                self._batch_progress_from_worker(
+                    request_id,
+                    "Preprocessing and prediction",
+                    len(result_df),
+                    len(result_df),
+                    88,
+                )
                 # Preserve PubChem status if generated.
                 for col in ["PubChem_CID", "PubChem_status"]:
                     if col in df.columns and col not in result_df.columns:
@@ -1343,7 +1730,13 @@ class MainWindow(tk.Tk):
                 out_path = allocate_erta_output_path(input_path, model_name)
                 temp_name = None
                 try:
-                    self._batch_progress_from_worker("Writing workbook", len(result_df), len(result_df), 85)
+                    self._batch_progress_from_worker(
+                        request_id,
+                        "Writing workbook",
+                        len(result_df),
+                        len(result_df),
+                        90,
+                    )
                     temp_fd, temp_name = tempfile.mkstemp(
                         suffix=".xlsx",
                         dir=str(out_path.parent),
@@ -1358,29 +1751,98 @@ class MainWindow(tk.Tk):
                     raise
                 self.last_batch_result = result_df
                 self.last_batch_fp = fp_df
-                graph_paths = self.generate_batch_graphs(show_errors=True, output_dir=out_dir)
+                graph_paths = self.generate_batch_graphs(output_dir=out_dir)
+                graph_error = self.__dict__.get("_last_batch_graph_error", "")
                 self.ui(
-                    self.update_batch_result_summary,
+                    self._complete_erta_batch,
+                    request_id,
                     result_df,
                     str(out_path),
                     graph_paths,
+                    ad_error,
+                    graph_error,
                 )
-                if graph_paths:
-                    status = f"Batch prediction saved: {out_path} / Graphs: {len(graph_paths)}"
-                    message = f"Saved:\n{out_path}\n\nGraphs generated:\n{os.path.join(out_dir, 'graphs')}"
-                else:
-                    status = f"Batch prediction saved: {out_path} / No graphs generated"
-                    message = f"Saved:\n{out_path}\n\nGraphs were not generated. Check the status/error message."
-                self.ui(self._finish_batch, True, status)
-                self.ui(messagebox.showinfo, "Batch prediction done", message)
             except Exception as e:
-                self.ui(
-                    self._set_erta_batch_result,
-                    f"Batch prediction failed.\n\nTechnical details: {type(e).__name__}: {e}",
-                )
-                self.ui(self._finish_batch, False, "Batch prediction failed")
-                self.show_error("Batch prediction failed", e)
+                self.ui(self._fail_erta_batch, request_id, e)
         self.run_threaded(job)
+
+    def _complete_erta_batch(
+        self,
+        request_id: int,
+        result_df: pd.DataFrame,
+        out_path: str,
+        graph_paths: list[str] | None,
+        ad_error: str,
+        graph_error: str,
+    ) -> None:
+        if not self._batch_update_is_current(request_id):
+            return
+        self._last_batch_ad_error = ad_error
+        self._last_batch_graph_error = graph_error
+        self.update_batch_result_summary(result_df, out_path, graph_paths)
+
+        counts = _erta_batch_counts(result_df)
+        ad_in_domain, ad_out_of_domain, ad_unavailable = _erta_ad_counts(
+            result_df,
+            counts["predicted_mask"],
+        )
+        details = [
+            ERTA_LEGACY_VALID_COUNT_NOTE,
+            f"AD In-domain: {ad_in_domain}",
+            f"AD Out-of-domain: {ad_out_of_domain}",
+            f"AD Unavailable: {ad_unavailable}",
+            PREDICTED_AD_COUNT_NOTE,
+        ]
+        if ad_error:
+            details.append(f"Applicability-domain details: {ad_error}")
+        if graph_error or not graph_paths:
+            details.append(
+                "Graph details: "
+                + (
+                    graph_error
+                    or "Optional graph files were not generated."
+                )
+            )
+        graph_directory = (
+            Path(graph_paths[0]).parent if graph_paths else None
+        )
+        dialog_title, dialog_message = batch_success_dialog(
+            destination=out_path,
+            total_count=counts["total_count"],
+            predicted_count=counts["predicted_count"],
+            not_predicted_count=counts["not_predicted_count"],
+            outcome_counts=(
+                ("Positive", counts["positive_count"]),
+                ("Negative", counts["negative_count"]),
+            ),
+            graph_paths=graph_paths,
+            graph_directory=graph_directory,
+            detail_lines=tuple(details),
+        )
+        self._finish_batch(
+            request_id,
+            True,
+            batch_run_status("completed", out_path),
+        )
+        messagebox.showinfo(dialog_title, dialog_message)
+
+    def _fail_erta_batch(self, request_id: int, error: Exception | str) -> None:
+        if not self._batch_update_is_current(request_id):
+            return
+        technical = (
+            f"{type(error).__name__}: {error}"
+            if isinstance(error, Exception)
+            else str(error)
+        )
+        self._set_erta_batch_result(
+            f"Batch prediction failed.\n\nTechnical details: {technical}"
+        )
+        self._finish_batch(
+            request_id,
+            False,
+            batch_run_status("failed", str(error)),
+        )
+        messagebox.showerror("Batch prediction failed", str(error))
 
     def _set_erta_batch_result(self, text: str):
         self.batch_result.configure(state="normal")
@@ -1394,44 +1856,62 @@ class MainWindow(tk.Tk):
         out_path: str,
         graph_paths: list[str] | None = None,
     ):
-        total = int(len(df))
-        pred_counts = (
-            df["Prediction_label"].value_counts()
-            if "Prediction_label" in df.columns
-            else pd.Series(dtype=int)
+        counts = _erta_batch_counts(df)
+        ad_in_domain, ad_out_of_domain, ad_unavailable = _erta_ad_counts(
+            df,
+            counts["predicted_mask"],
         )
         lines = [
-            "Batch prediction completed.",
+            "Batch job completed and workbook saved.",
             "",
-            f"Total rows: {total}",
-            f"Positive: {int(pred_counts.get('Positive', 0))}",
-            f"Negative: {int(pred_counts.get('Negative', 0))}",
+            f"Total rows: {counts['total_count']}",
+            f"Predicted: {counts['predicted_count']}",
+            f"Not predicted: {counts['not_predicted_count']}",
+            f"Positive: {counts['positive_count']}",
+            f"Negative: {counts['negative_count']}",
+            "",
+            batch_prediction_availability(
+                counts["total_count"],
+                counts["predicted_count"],
+                counts["not_predicted_count"],
+            ),
+            ERTA_LEGACY_VALID_COUNT_NOTE,
+            "",
+            f"AD In-domain: {ad_in_domain}",
+            f"AD Out-of-domain: {ad_out_of_domain}",
+            f"AD Unavailable: {ad_unavailable}",
+            PREDICTED_AD_COUNT_NOTE,
         ]
-        if "AD" in df.columns:
-            ad_counts = df["AD"].value_counts()
-            lines.extend(
-                [
-                    f"AD In-domain: {int(ad_counts.get('In-domain', 0))}",
-                    f"AD Out-of-domain: {int(ad_counts.get('Out-of-domain', 0))}",
-                ]
-            )
-        lines.extend(["", f"Output workbook: {out_path}"])
+        ad_error = self.__dict__.get("_last_batch_ad_error", "")
+        if ad_error:
+            lines.append(f"Applicability-domain details: {ad_error}")
+        lines.extend(("", f"Output workbook: {out_path}"))
         if graph_paths:
             lines.extend(
-                [
-                    f"AD graph files: {len(graph_paths)}",
-                    f"Graph directory: {os.path.dirname(graph_paths[0])}",
-                ]
+                (
+                    f"Graph files: {len(graph_paths)}",
+                    f"Graph directory: {Path(graph_paths[0]).parent}",
+                )
             )
         else:
-            lines.append("AD graph files: Not generated")
+            lines.extend(("Graph files: 0", "Graph directory: Not generated"))
+        graph_error = self.__dict__.get("_last_batch_graph_error", "")
+        if graph_error or not graph_paths:
+            lines.append(
+                "Graph details: "
+                + (
+                    graph_error
+                    or "Optional graph files were not generated."
+                )
+            )
         lines.append("")
         lines.append(
-            "Detailed predictions and applicability-domain results are available in the output workbook."
+            "Detailed row results are available in the output workbook."
         )
         self._set_erta_batch_result("\n".join(lines))
 
-    def generate_batch_graphs(self, show_errors: bool = True, output_dir: str | None = None):
+    def generate_batch_graphs(self, output_dir: str | None = None):
+        self._last_batch_graph_error = ""
         try:
             if self.last_batch_result is None:
                 raise ValueError("Run batch prediction first.")
@@ -1442,14 +1922,10 @@ class MainWindow(tk.Tk):
                 )
             )
             out_dir = os.path.join(destination, "graphs")
-            self.set_status("Generating graphs...")
             paths = save_all_batch_graphs(self.last_batch_result, out_dir, self.ad_calculator, self.last_batch_fp)
-            if paths:
-                self.set_status(f"Graphs generated: {len(paths)}")
             return paths
         except Exception as e:
-            if show_errors:
-                self.show_error("Graph generation failed", e)
+            self._last_batch_graph_error = str(e)
             return []
 
 

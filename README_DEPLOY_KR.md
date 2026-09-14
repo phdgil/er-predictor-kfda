@@ -88,13 +88,39 @@ installer\ER_Predictor_Setup_x64.exe
   시작합니다. 같은 이름이 있으면 확장자 앞에 `_2`, `_3`을 붙입니다.
 - ERalpha batch AD 그래프는 ERalpha 경로의 AD 데이터와 Binding/Non-binding 의미만 사용하고, 결과 workbook 옆의 충돌 방지 폴더 `<workbook-stem>_graphs`에 저장됩니다. 같은 이름이 이미 있으면 `_2`, `_3` 접미사를 사용하여 이전 그래프 폴더를 덮어쓰지 않습니다.
 - ERalpha batch 완료 요약은 ERTA와 같은 `Prediction result` 영역에 표시되며 전체 행, Binding, Non-binding, 예측하지 못한 행, AD In-domain/Out-of-domain 수, 정확한 workbook 경로, 그래프 수/폴더 및 내부 평가 근거의 한계를 포함합니다.
-- 모든 행을 정상 예측하고 게시하면 두 endpoint 모두
-  `Batch prediction done` 정보 팝업을 표시합니다. 시작 전 거부나
-  읽기/예측/게시 실패는 `Batch prediction failed` 오류 팝업을 표시하고
+- 두 endpoint 모두 새 batch를 시작하면 이전 완료 요약을 즉시
+  `Batch prediction is running.`으로 교체합니다. `Run batch` 아래의 집계
+  진행 표시는 `<percent>% - <current>/<total> - <stage>` 형식이며
+  `Reading input workbook`(0%), `Resolving CAS/SMILES`(10–35%),
+  `Preprocessing and prediction`(35–88%), `Writing workbook`(90%),
+  `Completed` 또는 `Failed`(100%)를 동일하게 사용합니다. 실제 PubChem
+  행 조회 상세
+  `Fetching SMILES from PubChem: <index> / <total> (<CAS>)`는 집계 진행
+  표시가 아니라 두 화면의 같은 하단 상태 줄에만 표시됩니다.
+- 결과 workbook이 원자적으로 게시되었으면 예측하지 못한 행이나 선택 항목인
+  AD/graph의 누락이 있어도 두 endpoint 모두 파란
+  `Batch prediction done` 정보 팝업을 표시합니다. 공통 팝업에는 정확한
+  저장 경로, 전체/예측/`Not predicted` 행 수, endpoint별 결과 수,
+  graph 수/폴더와 AD/graph 상세가 빠짐없이 표시됩니다. 모든 행을 예측하지
+  못했으면 `No rows could be predicted.`라고 명시하며 모든 행이 예측됐다고
+  표현하지 않습니다. 지원하지 않는 입력 행이나 선택 산출물 누락에는 일반
+  노란 경고 팝업을 사용하지 않습니다.
+- 시작 전 거부나 읽기/모델 실행/workbook 저장·게시 실패로 결과 파일이
+  생성되지 않으면 빨간 `Batch prediction failed` 오류 팝업을 표시하고
   입력·template·실행 컨트롤을 다시 활성화하며 성공 팝업을 표시하지
-  않습니다. ERalpha가 workbook을 게시했지만 일부 행을 예측하지 못했으면
-  성공으로 가장하지 않고 `Batch prediction completed with warnings` 경고
-  팝업을 표시합니다.
+  않습니다. 하단 상태 줄은 두 endpoint 모두
+  `Batch prediction started.`, `Batch prediction completed: <path>` 또는
+  `Batch prediction failed: <details>` 형식을 사용합니다.
+- ERTA는 기존 workbook schema와 0-fingerprint 추론을 변경하지 않습니다.
+  화면과 팝업의 Predicted/Positive/Negative 수는 `Mol_valid=True`인 행만
+  포함하며, `Mol_valid=False` 행에 legacy 호환을 위해 남은 workbook/graph
+  라벨은 사용 가능한 예측이 아님을 명시합니다. 두 endpoint의 AD
+  In-domain/Out-of-domain/Unavailable 수는 predicted 행만 분모로 사용하고
+  `Not predicted` 행은 제외합니다.
+- ERTA batch 실행 중에는 model/AD 경로 변경과 reload가 잠기며, 반대로
+  model/AD reload 중에는 batch를 시작할 수 없습니다. 성공한 reload는 이전
+  batch 완료 요약과 진행 상태를 초기화하므로 다른 model/AD 결과로 오인하지
+  않습니다.
 - 무인 native QA는 원본/기본 파일 옆에 결과를 쓰지 않고 QA 전용 폴더의
   바이트 동일 복사본 두 개를 사용합니다. 네트워크 변동을 제거하기 위해
   25개 CAS의 PubChem 응답을 동일한 유효 SMILES `C=O`로 대체하며 이
